@@ -35,6 +35,7 @@ Required packages / components:
 - Python 3
 - `chromium`
 - `cage`
+- `gh` for private GitHub repo login over HTTPS
 - a working `systemd` environment
 - a valid `XDG_RUNTIME_DIR` for the service user
 
@@ -43,11 +44,18 @@ Python dependencies used by the client:
 - `websocket-client`
 - `psutil` (optional but recommended for status metrics)
 
+Install source used by bootstrap:
+
+- `requirements.txt`
+
 ## Files Required On Each Pi
 
 Required project files:
 
 - `piframe_client.py`
+- `browser_renderer_template.py`
+- `requirements.txt`
+- `scripts/bootstrap_pi.sh`
 - `README.md`
 - `requirements.md`
 - `idle.jpg`
@@ -104,6 +112,43 @@ Recommended project layout:
 
 - keep the Python runtime inside the client folder
 - current path: `/home/woozleton/piframe_client/api-env`
+
+## Bootstrap Workflow
+
+Recommended replication path on another Pi:
+
+1. if the repo is private, authenticate GitHub first:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y gh
+gh auth login --hostname github.com --git-protocol https
+gh auth status
+```
+
+2. clone the repo into `/home/<user>/piframe_client`
+3. run:
+
+```bash
+git clone https://github.com/woozleton/piframe-client.git /home/<user>/piframe_client
+cd /home/<user>/piframe_client
+sudo ./scripts/bootstrap_pi.sh --user <user> --server ws://<manager-ip>:8080/ws
+```
+
+The bootstrap script will:
+
+- install `gh` so later repo updates on the Pi keep using HTTPS auth cleanly
+- install apt packages
+- create the in-project `api-env`
+- install Python dependencies from `requirements.txt`
+- write the systemd service
+- enable and restart `piframe-client`
+
+Useful flags:
+
+- `--nas-root /mnt/nas`
+- `--mount-unit mnt-nas.mount`
+- `--skip-apt`
 
 ## Environment Variables
 

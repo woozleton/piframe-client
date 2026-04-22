@@ -13,6 +13,9 @@ This client now uses one browser-based renderer for:
 ## Files
 
 - [piframe_client.py](/home/woozleton/piframe_client/piframe_client.py)
+- [browser_renderer_template.py](/home/woozleton/piframe_client/browser_renderer_template.py)
+- [requirements.txt](/home/woozleton/piframe_client/requirements.txt)
+- [scripts/bootstrap_pi.sh](/home/woozleton/piframe_client/scripts/bootstrap_pi.sh)
 - [idle.jpg](/home/woozleton/piframe_client/idle.jpg)
 - [piframe-client.service](/etc/systemd/system/piframe-client.service)
 
@@ -110,6 +113,47 @@ sudo systemctl restart piframe-client
 sudo systemctl status piframe-client --no-pager
 journalctl -u piframe-client -f
 ```
+
+## Replicating To Another Pi
+
+The easiest path is:
+
+1. authenticate GitHub on the target Pi if this repo is private
+2. run the bootstrap script:
+
+Private repo auth:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y gh
+gh auth login --hostname github.com --git-protocol https
+gh auth status
+```
+
+Then clone and bootstrap:
+
+```bash
+git clone https://github.com/woozleton/piframe-client.git /home/<user>/piframe_client
+cd /home/<user>/piframe_client
+sudo ./scripts/bootstrap_pi.sh --user <user> --server ws://<manager-ip>:8080/ws
+```
+
+What it does:
+
+- installs `gh` too, so later pulls on the Pi can use the same GitHub login
+- installs required apt packages
+- creates `/home/<user>/piframe_client/api-env`
+- installs Python requirements from `requirements.txt`
+- writes `/etc/systemd/system/piframe-client.service`
+- enables and restarts the service
+
+Useful flags:
+
+- `--nas-root /mnt/nas`
+- `--mount-unit mnt-nas.mount`
+- `--skip-apt`
+
+If the repo is already present locally, the bootstrap script will also warn if GitHub auth is missing for an HTTPS GitHub remote.
 
 ## Logging
 
