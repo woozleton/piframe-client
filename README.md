@@ -116,18 +116,9 @@ journalctl -u piframe-client -f
 
 ## Replicating To Another Pi
 
-The easiest path is:
-
-1. authenticate GitHub on the target Pi if this repo is private
-2. run the bootstrap script:
-
-Private repo auth:
-
 ```bash
 sudo apt-get update
-sudo apt-get install -y gh
-gh auth login --hostname github.com --git-protocol https
-gh auth status
+sudo apt-get install -y gh git
 ```
 
 Then clone and bootstrap:
@@ -140,7 +131,7 @@ sudo ./scripts/bootstrap_pi.sh --user <user> --server ws://<manager-ip>:8080/ws
 
 What it does:
 
-- installs `gh` too, so later pulls on the Pi can use the same GitHub login
+- installs `gh` and `git`
 - installs required apt packages
 - installs and enables `seatd`
 - installs `wlrctl` for compositor-level cursor parking
@@ -154,8 +145,6 @@ Useful flags:
 - `--nas-root /mnt/nas`
 - `--mount-unit mnt-nas.mount`
 - `--skip-apt`
-
-If the repo is already present locally, the bootstrap script will also warn if GitHub auth is missing for an HTTPS GitHub remote.
 
 ## Logging
 
