@@ -710,7 +710,6 @@ def render_browser_html(
       }}
     }}
 
-    hideCursor();
     window.addEventListener("resize", () => {{
       const activeStage = getActiveStage();
       if (activeStage.video.style.display === "block") {{
@@ -729,6 +728,7 @@ def render_browser_html(
     window.addEventListener("pointermove", hideCursor, {{ passive: true }});
     window.addEventListener("focus", hideCursor);
     window.setInterval(hideCursor, 1000);
+    hideCursor();
     pollState();
     window.setInterval(pollState, {poll_ms});
   </script>

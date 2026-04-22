@@ -56,7 +56,7 @@ Current browser renderer features include:
 - 270-degree rotation for portrait-mounted displays
 - crossfade-style transitions using double-buffered stages
 - mixed-media playlist support
-- hidden cursor
+- hidden cursor via compositor-level pointer parking with `wlrctl`
 - idle fallback image when nothing is playing
 - top-of-screen rotated status banner for runtime issues
 - bottom OSD for pause / volume / mute state
@@ -142,6 +142,8 @@ What it does:
 
 - installs `gh` too, so later pulls on the Pi can use the same GitHub login
 - installs required apt packages
+- installs and enables `seatd`
+- installs `wlrctl` for compositor-level cursor parking
 - creates `/home/<user>/piframe_client/api-env`
 - installs Python requirements from `requirements.txt`
 - writes `/etc/systemd/system/piframe-client.service`

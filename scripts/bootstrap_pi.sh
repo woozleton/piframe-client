@@ -81,6 +81,8 @@ if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then
   apt-get install -y \
     chromium \
     cage \
+    seatd \
+    wlrctl \
     gh \
     python3 \
     python3-venv \
@@ -137,6 +139,7 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
 

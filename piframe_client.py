@@ -15,6 +15,8 @@ import argparse
 import json
 import os
 import random
+import shlex
+import shutil
 import socket
 import subprocess
 import threading
@@ -40,6 +42,7 @@ SERVER_DEFAULT = os.environ.get("PIFRAME_SERVER", "ws://192.168.100.100:8080/ws"
 NAS_ROOT = os.environ.get("PIFRAME_NAS_ROOT", "/mnt/nas").rstrip("/") or "/mnt/nas"
 CHROMIUM_BIN = os.environ.get("PIFRAME_CHROMIUM_BIN", "chromium").strip() or "chromium"
 CAGE_BIN = os.environ.get("PIFRAME_CAGE_BIN", "cage").strip() or "cage"
+WLRCTL_BIN = os.environ.get("PIFRAME_WLRCTL_BIN", "wlrctl").strip() or "wlrctl"
 BROWSER_ROTATION_DEGREES = 270
 BROWSER_STATE_FILE = Path("/tmp/piframe_browser_state.json")
 BROWSER_HTML_FILE = Path("/tmp/piframe_browser.html")
@@ -428,10 +431,7 @@ class BrowserController:
             max_bytes=BROWSER_LOG_MAX_BYTES,
             backups=BROWSER_LOG_BACKUPS,
         )
-        args = [
-            CAGE_BIN,
-            "-d",
-            "--",
+        chromium_args = [
             CHROMIUM_BIN,
             "--kiosk",
             "--ozone-platform=wayland",
@@ -460,6 +460,26 @@ class BrowserController:
             "--autoplay-policy=no-user-gesture-required",
             BROWSER_HTML_FILE.as_uri(),
         ]
+        wlrctl_path = shutil.which(WLRCTL_BIN)
+        if wlrctl_path:
+            park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])
+            launcher_script = "\n".join(
+                [
+                    "set -eu",
+                    f"{shlex.join(chromium_args)} &",
+                    "pid=$!",
+                    "(",
+                    "  sleep 1",
+                    f"  {park_cursor_cmd} >/dev/null 2>&1 || true",
+                    "  sleep 2",
+                    f"  {park_cursor_cmd} >/dev/null 2>&1 || true",
+                    ") &",
+                    "wait \"$pid\"",
+                ]
+            )
+            args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
+        else:
+            args = [CAGE_BIN, "-d", "--", *chromium_args]
         try:
             child_env = os.environ.copy()
             child_env["XDG_RUNTIME_DIR"] = runtime_dir

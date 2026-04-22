@@ -35,6 +35,8 @@ Required packages / components:
 - Python 3
 - `chromium`
 - `cage`
+- `seatd`
+- `wlrctl`
 - `gh` for private GitHub repo login over HTTPS
 - a working `systemd` environment
 - a valid `XDG_RUNTIME_DIR` for the service user
@@ -139,6 +141,8 @@ The bootstrap script will:
 
 - install `gh` so later repo updates on the Pi keep using HTTPS auth cleanly
 - install apt packages
+- install and enable `seatd`
+- install `wlrctl` for compositor-level cursor parking
 - create the in-project `api-env`
 - install Python dependencies from `requirements.txt`
 - write the systemd service
@@ -229,6 +233,11 @@ The renderer also includes a transient bottom OSD for:
 - pause
 - volume
 - mute
+
+Cursor handling:
+
+- the stable path uses `wlrctl` pointer parking under `cage`
+- this avoids depending only on browser CSS cursor hiding
 
 ## Logging / Debugging
 
