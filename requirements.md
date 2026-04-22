@@ -51,6 +51,7 @@ Required project files:
 - `README.md`
 - `requirements.md`
 - `idle.jpg`
+- `client_settings.json` is created automatically at runtime
 
 Optional to keep:
 
@@ -132,6 +133,12 @@ Notes:
 - `blurred_fill` was explored, but the stable path right now is `contain`
 - `cover` is available if you intentionally want cropping
 
+Audio notes:
+
+- HDMI audio is supported
+- ALSA default must point at the active HDMI output on each Pi
+- this may require a per-device `.asoundrc` or equivalent ALSA config
+
 ## NAS / Media Assumptions
 
 - media paths are normalized to a local NAS mount
@@ -150,6 +157,15 @@ The client will create runtime artifacts in `/tmp`, including:
 
 These do not need to be copied between devices.
 
+The client also creates a small persisted settings file in the project folder:
+
+- `/home/woozleton/piframe_client/client_settings.json`
+
+This stores:
+
+- `volume`
+- `muted`
+
 ## On-Screen Status Behavior
 
 The Chromium renderer includes a rotated top banner for runtime issues.
@@ -162,6 +178,12 @@ Current banner messages:
 - `Server disconnected`
 
 This is useful on unattended displays because failures no longer look like a silent black screen.
+
+The renderer also includes a transient bottom OSD for:
+
+- pause
+- volume
+- mute
 
 ## Logging / Debugging
 
@@ -184,6 +206,7 @@ Recommended media profile for this hardware:
 - `1080p`
 - `H.264`
 - moderate bitrate
+- HDMI audio on the active ALSA default device
 
 Known limitation:
 

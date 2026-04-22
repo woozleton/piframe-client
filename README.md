@@ -1,6 +1,6 @@
 # PiFrame Client
 
-`piframe_client.py` is the client that connects to the PiFrame server over WebSocket and renders all media through a single Chromium kiosk session running under `cage`.
+`piframe_client.py` is the client that connects to the PiFrame Manager server over WebSocket and renders all media through a single Chromium kiosk session running under `cage`.
 
 This client now uses one browser-based renderer for:
 
@@ -9,14 +9,6 @@ This client now uses one browser-based renderer for:
 - image slideshows
 - mixed image/video playlists
 - idle fallback media
-
-That browser-first approach replaced the older `mpv`-based path because it gave better behavior on this Raspberry Pi 5 setup:
-
-- smoother image timing
-- better mixed-media support
-- cleaner transitions
-- easier visual styling
-- low enough CPU and memory usage to be practical in production
 
 ## Files
 
@@ -64,6 +56,7 @@ Current browser renderer features include:
 - hidden cursor
 - idle fallback image when nothing is playing
 - top-of-screen rotated status banner for runtime issues
+- bottom OSD for pause / volume / mute state
 
 ## Media Guidance
 
@@ -72,7 +65,7 @@ For this Raspberry Pi 5 browser renderer, the practical house format is:
 - `1080p`
 - `H.264`
 - moderate bitrate
-- muted or unnecessary audio removed when possible
+- audio supported through the Pi's active HDMI ALSA output
 
 What we observed in testing:
 
@@ -147,6 +140,33 @@ Default rotation settings:
 - max size: `5 MB`
 - backups kept: `3`
 
+## Audio
+
+The client now uses live HDMI audio output again.
+
+Important note for this Pi:
+
+- ALSA default output must point at the active HDMI device
+- current working setup uses `/home/woozleton/.asoundrc`
+- on this Pi, the active output was corrected to `plughw:0,0`
+
+If video is playing but audio is missing, verify the ALSA default before changing Chromium or client code.
+
+## Persisted Client Settings
+
+The client remembers the most recent local volume/mute state across service restarts and reboots.
+
+Persisted settings file:
+
+- `/home/woozleton/piframe_client/client_settings.json`
+
+Currently persisted:
+
+- `volume`
+- `muted`
+
+Explicit manager volume commands still override the saved value.
+
 ## Git / GitHub
 
 This project folder is intended to be self-contained for source control:
@@ -185,6 +205,22 @@ Behavior:
 - the banner overlays current content
 - it clears automatically when valid content resumes
 - it is sized and rotated for the portrait-mounted display
+
+## On-Screen Display
+
+The browser renderer also shows a transient bottom OSD for playback controls.
+
+Current OSD cases include:
+
+- pause
+- volume changes
+- mute
+
+Behavior:
+
+- uses inline SVG icons
+- animates in/out
+- auto-hides after about 1 second
 
 ## Important Environment Variables
 
@@ -254,7 +290,3 @@ tail -f /tmp/piframe_browser.log
 ```bash
 sudo systemctl restart piframe-client
 ```
-
-## Current Status
-
-This client is now using the browser renderer as the single playback method for all supported media types. That is the intended architecture going forward.
