@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Configuration defaults (env overrides where noted)
 # ---------------------------------------------------------------------------
-STATUS_UPDATE_INTERVAL = 5  # seconds
+STATUS_UPDATE_INTERVAL = 2  # seconds; periodic backstop in case events are lost
 SERVER_DEFAULT = os.environ.get("PIFRAME_SERVER", "ws://192.168.100.100:8080/ws")
 NAS_ROOT = os.environ.get("PIFRAME_NAS_ROOT", "/mnt/nas").rstrip("/") or "/mnt/nas"
 CHROMIUM_BIN = os.environ.get("PIFRAME_CHROMIUM_BIN", "chromium").strip() or "chromium"
@@ -780,23 +780,31 @@ class BrowserController:
 class _BrowserEventState:
     """Thread-safe holder for the latest events the browser pushes back to
     Python. Tracks slideshow index + paused flag so the status payload to
-    the manager reflects the kiosk's actual on-screen state."""
+    the manager reflects the kiosk's actual on-screen state. Owns a
+    wakeup Event the status loop waits on so state changes propagate to
+    the manager within ~one round-trip instead of waiting for the next
+    periodic tick."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._slideshow_index: Optional[int] = None
         self._slideshow_index_at: float = 0.0
         self._paused: bool = False
+        self.wakeup = threading.Event()
 
     def set_slideshow_index(self, index: int) -> None:
         with self._lock:
+            changed = self._slideshow_index != int(index)
             self._slideshow_index = int(index)
             self._slideshow_index_at = time.time()
+        if changed:
+            self.wakeup.set()
 
     def clear_slideshow_index(self) -> None:
         with self._lock:
             self._slideshow_index = None
             self._slideshow_index_at = 0.0
+        self.wakeup.set()
 
     def slideshow_index(self) -> Optional[int]:
         with self._lock:
@@ -804,7 +812,10 @@ class _BrowserEventState:
 
     def set_paused(self, paused: bool) -> None:
         with self._lock:
+            changed = self._paused != bool(paused)
             self._paused = bool(paused)
+        if changed:
+            self.wakeup.set()
 
     def is_paused(self) -> bool:
         with self._lock:
@@ -1178,6 +1189,9 @@ class PiFrameClient:
 
     def _stop_status_updates(self) -> None:
         self.status_running = False
+        # Kick the loop out of its wakeup.wait() instead of letting it
+        # idle for up to STATUS_UPDATE_INTERVAL seconds.
+        BROWSER_EVENT_STATE.wakeup.set()
         if self.status_thread and self.status_thread.is_alive():
             self.status_thread.join(timeout=2.0)
         self.status_thread = None
@@ -1218,7 +1232,12 @@ class PiFrameClient:
 
     def _status_loop(self) -> None:
         while self.status_running:
-            time.sleep(STATUS_UPDATE_INTERVAL)
+            # Wake on either the periodic tick OR an explicit event from
+            # the browser (pause toggle, slide change). Lets state changes
+            # land on the manager within ~one network round-trip instead
+            # of waiting up to STATUS_UPDATE_INTERVAL seconds.
+            BROWSER_EVENT_STATE.wakeup.wait(timeout=STATUS_UPDATE_INTERVAL)
+            BROWSER_EVENT_STATE.wakeup.clear()
             if not self.status_running or not self.ws_connection:
                 continue
             # If the browser reports paused, surface that to the manager
