@@ -314,6 +314,7 @@ def render_browser_html(
     let lastVolume = null;
     let lastMuted = null;
     let lastReportedSlideIndex = -1;
+    let lastReportedPaused = null;
     function notifySlideChange(idx) {{
       if (!eventEndpoint || idx === lastReportedSlideIndex) return;
       lastReportedSlideIndex = idx;
@@ -322,6 +323,19 @@ def render_browser_html(
           method: "POST",
           headers: {{"Content-Type": "application/json"}},
           body: JSON.stringify({{type: "slideshow_index", index: idx}}),
+          keepalive: true,
+        }}).catch(() => {{}});
+      }} catch (_) {{ /* ignore */ }}
+    }}
+    function notifyPauseState(paused) {{
+      const flag = !!paused;
+      if (!eventEndpoint || flag === lastReportedPaused) return;
+      lastReportedPaused = flag;
+      try {{
+        fetch(eventEndpoint, {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify({{type: "pause_state", paused: flag}}),
           keepalive: true,
         }}).catch(() => {{}});
       }} catch (_) {{ /* ignore */ }}
@@ -661,12 +675,14 @@ def render_browser_html(
       stopTimers();
       if (!state.items || !state.items.length) {{
         showIdle(state.idle_item);
+        notifyPauseState(false);
         return;
       }}
       showBanner(state.banner ? state.banner.message : "", state.banner ? state.banner.level : "warning");
       const perItemSeconds = state.interval || 5.0;
       renderItem(state.items[activeIndex], state, perItemSeconds);
       notifySlideChange(activeIndex);
+      notifyPauseState(false);
     }}
 
     function applyControl(control) {{
@@ -683,17 +699,21 @@ def render_browser_html(
           if (activeStage.video.paused) {{
             activeStage.video.play().catch(() => {{}});
             hideOsd();
+            notifyPauseState(false);
           }} else {{
             activeStage.video.pause();
             showOsd("pause", "", "", null, 1000);
+            notifyPauseState(true);
           }}
         }} else {{
           if (intervalHandle) {{
             stopTimers();
             showOsd("pause", "", "", null, 1000);
+            notifyPauseState(true);
           }} else {{
             scheduleImageAdvance(activeState ? (activeState.interval || 5.0) : 5.0);
             hideOsd();
+            notifyPauseState(false);
           }}
         }}
       }}

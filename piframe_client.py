@@ -778,14 +778,15 @@ class BrowserController:
 
 
 class _BrowserEventState:
-    """Thread-safe holder for the latest event the browser pushes back to
-    Python. Today we only track the slideshow index; structured this way so
-    additional event kinds can land alongside without a new server."""
+    """Thread-safe holder for the latest events the browser pushes back to
+    Python. Tracks slideshow index + paused flag so the status payload to
+    the manager reflects the kiosk's actual on-screen state."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._slideshow_index: Optional[int] = None
         self._slideshow_index_at: float = 0.0
+        self._paused: bool = False
 
     def set_slideshow_index(self, index: int) -> None:
         with self._lock:
@@ -800,6 +801,14 @@ class _BrowserEventState:
     def slideshow_index(self) -> Optional[int]:
         with self._lock:
             return self._slideshow_index
+
+    def set_paused(self, paused: bool) -> None:
+        with self._lock:
+            self._paused = bool(paused)
+
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._paused
 
 
 # Module-level singleton so the HTTP handler (which has no app context)
@@ -851,6 +860,8 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
                 idx = -1
             if idx >= 0:
                 BROWSER_EVENT_STATE.set_slideshow_index(idx)
+        elif kind == "pause_state":
+            BROWSER_EVENT_STATE.set_paused(bool(payload.get("paused")))
         # Always return 204; CORS header lets the browser stop spamming
         # console errors when it crosses the file:// -> http:// boundary.
         self.send_response(204)
@@ -1031,13 +1042,17 @@ class PiFrameClient:
             # slideshow timer null for video playback.
             self.slideshow_started_at = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
+            BROWSER_EVENT_STATE.set_paused(False)
             self._send_render_command()
 
     def _handle_pause(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
         _log("pause_command", playlist=playlist_name or "", playlist_id=playlist_id or "")
+        # Toggle is browser-side; the real paused/playing state comes back
+        # via the /browser-event channel and overrides playback_state in
+        # the next status_update. self.playback_state stays as the
+        # underlying media kind (slideshow / playing / stopped).
         self.renderer.toggle_pause()
-        self.playback_state = "playing"  # minimal toggle; not querying paused state
         self._send_render_command(action="pause")
 
     def _handle_next(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -1063,6 +1078,7 @@ class PiFrameClient:
         self.playback_state = "stopped"
         self.slideshow_started_at = None
         BROWSER_EVENT_STATE.clear_slideshow_index()
+        BROWSER_EVENT_STATE.set_paused(False)
 
     def _handle_slideshow(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
@@ -1105,6 +1121,7 @@ class PiFrameClient:
             # it shows the first slide, so the manager doesn't lock onto
             # the previous slideshow's last-known index during the gap.
             BROWSER_EVENT_STATE.clear_slideshow_index()
+            BROWSER_EVENT_STATE.set_paused(False)
             self._send_render_command()
 
     def _handle_volume(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -1204,12 +1221,22 @@ class PiFrameClient:
             time.sleep(STATUS_UPDATE_INTERVAL)
             if not self.status_running or not self.ws_connection:
                 continue
+            # If the browser reports paused, surface that to the manager
+            # while leaving the underlying media kind in self.playback_state
+            # untouched. Stopped state is never overridden (a paused flag
+            # left over from a prior slideshow shouldn't mask "stopped").
+            reported_paused = BROWSER_EVENT_STATE.is_paused()
+            effective_state = (
+                "paused"
+                if reported_paused and self.playback_state in ("playing", "slideshow")
+                else self.playback_state
+            )
             status: Dict[str, Any] = {
                 "current_video": self.current_video,
                 "current_slideshow": self.current_slideshow,
                 "current_playlist": self.current_playlist_name,
                 "current_playlist_id": self.current_playlist_id,
-                "playback_state": self.playback_state,
+                "playback_state": effective_state,
                 "shuffle": self.current_shuffle,
                 "slideshow_active": self.renderer.slideshow_active,
                 "last_render_cmd": self.renderer.last_command or None,
