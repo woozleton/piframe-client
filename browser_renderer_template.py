@@ -14,6 +14,7 @@ def render_browser_html(
     state_file_uri: str,
     nas_root: str,
     poll_ms: int,
+    event_endpoint: str = "",
 ) -> str:
     """Render the self-contained Chromium kiosk page."""
     show_hud_css = "block" if show_hud else "none"
@@ -274,6 +275,7 @@ def render_browser_html(
   </div>
   <script>
     const stateUrl = {json.dumps(state_file_uri)};
+    const eventEndpoint = {json.dumps(event_endpoint)};
     const hiddenCursor = getComputedStyle(document.documentElement)
       .getPropertyValue('--hidden-cursor')
       .trim() || 'none';
@@ -311,6 +313,19 @@ def render_browser_html(
     let osdTimer = null;
     let lastVolume = null;
     let lastMuted = null;
+    let lastReportedSlideIndex = -1;
+    function notifySlideChange(idx) {{
+      if (!eventEndpoint || idx === lastReportedSlideIndex) return;
+      lastReportedSlideIndex = idx;
+      try {{
+        fetch(eventEndpoint, {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify({{type: "slideshow_index", index: idx}}),
+          keepalive: true,
+        }}).catch(() => {{}});
+      }} catch (_) {{ /* ignore */ }}
+    }}
 
     function showBanner(message, level = "warning") {{
       if (!message) {{
@@ -631,11 +646,13 @@ def render_browser_html(
       activeIndex = nextIndex;
       const perItemSeconds = activeState.interval || 5.0;
       renderItem(activeState.items[activeIndex], activeState, perItemSeconds);
+      notifySlideChange(activeIndex);
     }}
 
     function startFromState(state) {{
       activeState = state;
       activeIndex = 0;
+      lastReportedSlideIndex = -1;
       hideOsd();
       stopTimers();
       if (!state.items || !state.items.length) {{
@@ -645,6 +662,7 @@ def render_browser_html(
       showBanner(state.banner ? state.banner.message : "", state.banner ? state.banner.level : "warning");
       const perItemSeconds = state.interval || 5.0;
       renderItem(state.items[activeIndex], state, perItemSeconds);
+      notifySlideChange(activeIndex);
     }}
 
     function applyControl(control) {{

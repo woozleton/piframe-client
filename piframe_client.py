@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -56,6 +57,10 @@ BROWSER_LOG_MAX_BYTES = int(
 BROWSER_LOG_BACKUPS = max(1, int(os.environ.get("PIFRAME_BROWSER_LOG_BACKUPS", "3")))
 BROWSER_MIN_ITEM_DURATION = 1.0
 BROWSER_STATE_POLL_MS = 250
+# Loopback channel the browser POSTs to when it advances a slide. Status
+# loop reads the latest reported index and forwards it to the manager.
+BROWSER_EVENT_HOST = "127.0.0.1"
+BROWSER_EVENT_PORT = int(os.environ.get("PIFRAME_BROWSER_EVENT_PORT", "18888"))
 BROWSER_TRANSITION = os.environ.get("PIFRAME_BROWSER_TRANSITION", "fade").strip() or "fade"
 BROWSER_TRANSITION_DURATION_MS = max(
     0,
@@ -411,6 +416,7 @@ class BrowserController:
             state_file_uri=BROWSER_STATE_FILE.as_uri(),
             nas_root=NAS_ROOT,
             poll_ms=BROWSER_STATE_POLL_MS,
+            event_endpoint=f"http://{BROWSER_EVENT_HOST}:{BROWSER_EVENT_PORT}/browser-event",
         )
         BROWSER_HTML_FILE.write_text(html, encoding="utf-8")
 
@@ -771,6 +777,88 @@ class BrowserController:
         self._persist_audio_state()
 
 
+class _BrowserEventState:
+    """Thread-safe holder for the latest event the browser pushes back to
+    Python. Today we only track the slideshow index; structured this way so
+    additional event kinds can land alongside without a new server."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._slideshow_index: Optional[int] = None
+        self._slideshow_index_at: float = 0.0
+
+    def set_slideshow_index(self, index: int) -> None:
+        with self._lock:
+            self._slideshow_index = int(index)
+            self._slideshow_index_at = time.time()
+
+    def clear_slideshow_index(self) -> None:
+        with self._lock:
+            self._slideshow_index = None
+            self._slideshow_index_at = 0.0
+
+    def slideshow_index(self) -> Optional[int]:
+        with self._lock:
+            return self._slideshow_index
+
+
+# Module-level singleton so the HTTP handler (which has no app context)
+# can stash events for the PiFrameClient instance to read.
+BROWSER_EVENT_STATE = _BrowserEventState()
+
+
+class _BrowserEventHandler(BaseHTTPRequestHandler):
+    """Tiny POST endpoint the kiosk fetch()es on every slide change."""
+
+    # Quiet the default access log; chatty at 1+ POST/sec per slide.
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: D401
+        return
+
+    def _send(self, status: int = 204) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
+        # CORS preflight - browser fetch() to a different origin (file:// page
+        # to http://127.0.0.1) treats this as cross-origin.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self) -> None:  # noqa: N802
+        if self.path != "/browser-event":
+            self._send(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = 0
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        kind = (payload.get("type") or "").strip()
+        if kind == "slideshow_index":
+            try:
+                idx = int(payload.get("index"))
+            except (TypeError, ValueError):
+                idx = -1
+            if idx >= 0:
+                BROWSER_EVENT_STATE.set_slideshow_index(idx)
+        # Always return 204; CORS header lets the browser stop spamming
+        # console errors when it crosses the file:// -> http:// boundary.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
 class PiFrameClient:
     """Minimal WebSocket-to-browser bridge with basic status/volume updates."""
 
@@ -792,6 +880,10 @@ class PiFrameClient:
         self.playback_state: str = "stopped"
         self.status_thread: Optional[threading.Thread] = None
         self.status_running = False
+        # Loopback HTTP server the kiosk POSTs slide-change events to.
+        # Started alongside the status loop in _start_status_updates().
+        self.browser_event_server: Optional[HTTPServer] = None
+        self.browser_event_thread: Optional[threading.Thread] = None
         self.system_info = get_system_info()
 
     def run(self) -> None:
@@ -938,6 +1030,7 @@ class PiFrameClient:
             # per-video tile previews from the playlist - leave the
             # slideshow timer null for video playback.
             self.slideshow_started_at = None
+            BROWSER_EVENT_STATE.clear_slideshow_index()
             self._send_render_command()
 
     def _handle_pause(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -969,6 +1062,7 @@ class PiFrameClient:
         self.current_slideshow = []
         self.playback_state = "stopped"
         self.slideshow_started_at = None
+        BROWSER_EVENT_STATE.clear_slideshow_index()
 
     def _handle_slideshow(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
@@ -1007,6 +1101,10 @@ class PiFrameClient:
             self.current_interval = float(interval)
             self.current_shuffle = shuffle_flag
             self.slideshow_started_at = time.time()
+            # Reset to None - browser will POST the actual index as soon as
+            # it shows the first slide, so the manager doesn't lock onto
+            # the previous slideshow's last-known index during the gap.
+            BROWSER_EVENT_STATE.clear_slideshow_index()
             self._send_render_command()
 
     def _handle_volume(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -1031,6 +1129,7 @@ class PiFrameClient:
     def shutdown(self) -> None:
         self.renderer.shutdown()
         self._stop_status_updates()
+        self._stop_browser_event_server()
 
     @staticmethod
     def _get_idle_media() -> str:
@@ -1055,6 +1154,7 @@ class PiFrameClient:
     def _start_status_updates(self) -> None:
         if self.status_thread and self.status_thread.is_alive():
             return
+        self._start_browser_event_server()
         self.status_running = True
         self.status_thread = threading.Thread(target=self._status_loop, daemon=True)
         self.status_thread.start()
@@ -1064,6 +1164,40 @@ class PiFrameClient:
         if self.status_thread and self.status_thread.is_alive():
             self.status_thread.join(timeout=2.0)
         self.status_thread = None
+
+    def _start_browser_event_server(self) -> None:
+        if getattr(self, "browser_event_server", None) is not None:
+            return
+        try:
+            server = HTTPServer((BROWSER_EVENT_HOST, BROWSER_EVENT_PORT), _BrowserEventHandler)
+        except OSError as exc:
+            _log("browser_event_server_bind_failed", error=str(exc), port=BROWSER_EVENT_PORT)
+            self.browser_event_server = None
+            self.browser_event_thread = None
+            return
+        self.browser_event_server = server
+        self.browser_event_thread = threading.Thread(
+            target=server.serve_forever, daemon=True, name="browser-event-server"
+        )
+        self.browser_event_thread.start()
+        _log("browser_event_server_started", host=BROWSER_EVENT_HOST, port=BROWSER_EVENT_PORT)
+
+    def _stop_browser_event_server(self) -> None:
+        server = getattr(self, "browser_event_server", None)
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        self.browser_event_server = None
+        thread = getattr(self, "browser_event_thread", None)
+        if thread and thread.is_alive():
+            thread.join(timeout=2.0)
+        self.browser_event_thread = None
 
     def _status_loop(self) -> None:
         while self.status_running:
@@ -1087,6 +1221,11 @@ class PiFrameClient:
                     else None
                 ),
                 "current_interval": self.current_interval if self.current_interval > 0 else None,
+                # Authoritative index reported by the browser via the local
+                # event server; manager UI prefers this over its own
+                # time-based projection. None when browser hasn't pushed
+                # yet (older kiosk template, or no slideshow active).
+                "slideshow_index": BROWSER_EVENT_STATE.slideshow_index(),
             }
             metrics = _collect_system_metrics()
             if metrics:
