@@ -544,6 +544,10 @@ def render_browser_html(
     }}
 
     function prepareStage(stage, item, state, perItemSeconds) {{
+      if (stage.resetHandle) {{
+        window.clearTimeout(stage.resetHandle);
+        stage.resetHandle = null;
+      }}
       resetStage(stage);
       if (item.kind === "video") {{
         const isSingleRepeatingPlaylist =
@@ -601,7 +605,11 @@ def render_browser_html(
       prepareStage(targetStage, item, state, perItemSeconds);
       activateStage(targetStage);
       const previousStage = getInactiveStage();
-      window.setTimeout(() => {{
+      if (previousStage.resetHandle) {{
+        window.clearTimeout(previousStage.resetHandle);
+      }}
+      previousStage.resetHandle = window.setTimeout(() => {{
+        previousStage.resetHandle = null;
         resetStage(previousStage);
       }}, {reset_delay_ms});
       if (item.kind === "video") {{
