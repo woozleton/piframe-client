@@ -366,6 +366,9 @@ def render_browser_html(
       if (kind === "pause") {{
         return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="4" width="4" height="16" rx="1.5"></rect><rect x="14" y="4" width="4" height="16" rx="1.5"></rect></svg>';
       }}
+      if (kind === "play") {{
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 4.5a1 1 0 0 1 1.5-.87l11 6.5a1 1 0 0 1 0 1.74l-11 6.5A1 1 0 0 1 7 17.5v-13Z"></path></svg>';
+      }}
       if (kind === "mute") {{
         return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a1 1 0 0 1 1.7.7v13.6a1 1 0 0 1-1.7.7L9.7 15H6a2 2 0 0 1-2-2V11a2 2 0 0 1 2-2h3.7l4.8-4.5ZM18.2 8.4l1.4 1.4-2.1 2.2 2.1 2.2-1.4 1.4-2.2-2.1-2.2 2.1-1.4-1.4 2.1-2.2-2.1-2.2 1.4-1.4 2.2 2.1 2.2-2.1Z"></path></svg>';
       }}
@@ -663,6 +666,10 @@ def render_browser_html(
       const perItemSeconds = state.interval || 5.0;
       renderItem(state.items[activeIndex], state, perItemSeconds);
       notifySlideChange(activeIndex);
+      // Fresh playback (new items signature) - flash the play overlay so
+      // the on-screen viewer sees the manager's command land. Resume from
+      // pause is handled by applyControl's pause branch directly.
+      showOsd("play", "", "", null, 1000);
     }}
 
     function applyControl(control) {{
@@ -678,7 +685,7 @@ def render_browser_html(
         if (activeStage.video.style.display === "block") {{
           if (activeStage.video.paused) {{
             activeStage.video.play().catch(() => {{}});
-            hideOsd();
+            showOsd("play", "", "", null, 1000);
           }} else {{
             activeStage.video.pause();
             showOsd("pause", "", "", null, 1000);
@@ -689,7 +696,7 @@ def render_browser_html(
             showOsd("pause", "", "", null, 1000);
           }} else {{
             scheduleImageAdvance(activeState ? (activeState.interval || 5.0) : 5.0);
-            hideOsd();
+            showOsd("play", "", "", null, 1000);
           }}
         }}
       }}
