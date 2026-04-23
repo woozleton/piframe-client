@@ -28,8 +28,15 @@ At startup, the client:
 3. writes a local HTML renderer to `/tmp/piframe_browser.html`
 4. writes browser state to `/tmp/piframe_browser_state.json`
 5. updates that state whenever the server sends a playback command
+6. binds a tiny loopback HTTP server on `127.0.0.1:18888` (configurable via
+   `PIFRAME_BROWSER_EVENT_PORT`) that the kiosk JS POSTs to whenever it
+   advances a slide or toggles pause - lets the manager UI reflect the
+   actual on-screen state instead of guessing from playback timestamps
 
-The browser polls the state file and renders media fullscreen on the attached display.
+The browser polls the state file and renders media fullscreen on the
+attached display. State changes (pause / resume / slide rotation) wake
+the status loop immediately so the manager sees them within ~one network
+round-trip instead of the periodic 2-second backstop.
 
 ## Supported Commands
 
@@ -277,6 +284,9 @@ These can be set in the service file or shell environment.
 - `PIFRAME_BROWSER_VIDEO_FILL_MODE`
 - `PIFRAME_BROWSER_LOG_MAX_BYTES`
 - `PIFRAME_BROWSER_LOG_BACKUPS`
+- `PIFRAME_BROWSER_EVENT_PORT` (default `18888`) - loopback port the
+  kiosk JS POSTs slide-change and pause events to so they reach the
+  manager in real time
 
 ### Current Useful Values
 
