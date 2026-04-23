@@ -784,6 +784,11 @@ class PiFrameClient:
         self.current_slideshow: List[str] = []
         self.current_interval: float = 0.0
         self.current_shuffle: bool = False
+        # Wall-clock timestamp (epoch seconds, float) when the current
+        # slideshow started rotating. Manager UI uses this + current_interval
+        # to project which slide is on screen right now without needing the
+        # browser to push per-rotation events.
+        self.slideshow_started_at: Optional[float] = None
         self.playback_state: str = "stopped"
         self.status_thread: Optional[threading.Thread] = None
         self.status_running = False
@@ -929,6 +934,10 @@ class PiFrameClient:
             self.current_slideshow = list(items)
             self.current_video = items[0] if len(items) == 1 else ""
             self.playback_state = "playing" if len(items) == 1 else "slideshow"
+            # Video playlists rotate too, but the manager doesn't render
+            # per-video tile previews from the playlist - leave the
+            # slideshow timer null for video playback.
+            self.slideshow_started_at = None
             self._send_render_command()
 
     def _handle_pause(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -959,6 +968,7 @@ class PiFrameClient:
         self.current_video = ""
         self.current_slideshow = []
         self.playback_state = "stopped"
+        self.slideshow_started_at = None
 
     def _handle_slideshow(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
@@ -996,6 +1006,7 @@ class PiFrameClient:
             self.playback_state = "slideshow"
             self.current_interval = float(interval)
             self.current_shuffle = shuffle_flag
+            self.slideshow_started_at = time.time()
             self._send_render_command()
 
     def _handle_volume(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -1068,6 +1079,14 @@ class PiFrameClient:
                 "shuffle": self.current_shuffle,
                 "slideshow_active": self.renderer.slideshow_active,
                 "last_render_cmd": self.renderer.last_command or None,
+                # Manager UI projects the current slide locally from these
+                # two fields: index = floor((now - started_at) / interval) % length
+                "slideshow_started_at": (
+                    int(self.slideshow_started_at * 1000)
+                    if self.slideshow_started_at is not None
+                    else None
+                ),
+                "current_interval": self.current_interval if self.current_interval > 0 else None,
             }
             metrics = _collect_system_metrics()
             if metrics:
