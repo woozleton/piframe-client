@@ -383,6 +383,10 @@ def render_browser_html(
       osdIconEl.innerHTML = osdIconSvg(kind);
       osdValueEl.textContent = value || "";
       osdLabelEl.textContent = label || "";
+      // Hide empty slots so the flex gap doesn't push the icon off-center
+      // when only the icon is shown (pause / play overlays).
+      osdValueEl.style.display = value ? "" : "none";
+      osdLabelEl.style.display = label ? "" : "none";
       const hasBar = typeof percent === "number";
       osdBarEl.style.display = hasBar ? "block" : "none";
       if (hasBar) {{
