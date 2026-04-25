@@ -345,6 +345,11 @@ def render_browser_html(
     let lastMuted = null;
     let lastReportedSlideIndex = -1;
     let lastReportedPaused = null;
+    // Sources we've already determined to be unplayable on this device.
+    // Cleared when a state update brings a different items list, so a
+    // legitimate retry (new content) gets a fresh attempt.
+    const failedSrcs = new Set();
+    const failedSrcReasons = new Map();
     function notifySlideChange(idx) {{
       if (!eventEndpoint || idx === lastReportedSlideIndex) return;
       lastReportedSlideIndex = idx;
@@ -441,6 +446,12 @@ def render_browser_html(
     }}
 
     function showOsd(kind, value = "", label = "", percent = null, durationMs = 1000) {{
+      // An active error OSD is sticky — routine pause / volume / mute
+      // toasts must not displace it, otherwise the user loses the
+      // explanation for why playback stopped.
+      if (osdEl.classList.contains("error") && kind !== "error") {{
+        return;
+      }}
       if (osdTimer) {{
         window.clearTimeout(osdTimer);
         osdTimer = null;
@@ -536,9 +547,9 @@ def render_browser_html(
     }}
 
     function resetStage(stage) {{
-      if (stage.metadataWatchdog) {{
-        window.clearTimeout(stage.metadataWatchdog);
-        stage.metadataWatchdog = null;
+      if (stage.firstFrameWatchdog) {{
+        window.clearTimeout(stage.firstFrameWatchdog);
+        stage.firstFrameWatchdog = null;
       }}
       if (stage.progressWatchdog) {{
         window.clearInterval(stage.progressWatchdog);
@@ -551,6 +562,7 @@ def render_browser_html(
       stage.bgImage.onload = null;
       stage.image.onload = null;
       stage.video.onloadedmetadata = null;
+      stage.video.onloadeddata = null;
       stage.video.onended = null;
       stage.video.onerror = null;
       stage.bgImage.classList.remove("ready");
@@ -640,17 +652,21 @@ def render_browser_html(
             // already failing — don't double-trigger
             return;
           }}
-          if (stage.metadataWatchdog) {{
-            window.clearTimeout(stage.metadataWatchdog);
-            stage.metadataWatchdog = null;
+          if (stage.firstFrameWatchdog) {{
+            window.clearTimeout(stage.firstFrameWatchdog);
+            stage.firstFrameWatchdog = null;
           }}
           if (stage.progressWatchdog) {{
             window.clearInterval(stage.progressWatchdog);
             stage.progressWatchdog = null;
           }}
           stage.video.pause();
-          // durationMs=0 → persists; cleared when a healthy item reaches
-          // .ready, when new state arrives, or when another OSD displaces it.
+          if (item && item.src) {{
+            failedSrcs.add(item.src);
+            failedSrcReasons.set(item.src, reason);
+          }}
+          // durationMs=0 → persists; cleared only by an explicit user
+          // action or a state update that brings new content.
           showOsd("error", reason, "", null, 0);
           stage.errorTimer = window.setTimeout(() => {{
             stage.errorTimer = null;
@@ -664,22 +680,27 @@ def render_browser_html(
           }}, 3500);
         }};
         stage.video.onloadedmetadata = () => {{
-          if (stage.metadataWatchdog) {{
-            window.clearTimeout(stage.metadataWatchdog);
-            stage.metadataWatchdog = null;
-          }}
+          // Metadata is necessary for fit calculations, but it isn't proof
+          // that the codec actually decodes — Chromium fires this for
+          // HEVC even though no frame will ever appear. Don't add .ready
+          // here; wait for loadeddata.
           const foregroundMode = fillMode === "cover" ? "cover" : "contain";
           fitMedia(stage.video, stage.video.videoWidth || 1, stage.video.videoHeight || 1, foregroundMode);
+        }};
+        stage.video.onloadeddata = () => {{
+          // First frame was actually decoded — the codec works.
+          if (stage.firstFrameWatchdog) {{
+            window.clearTimeout(stage.firstFrameWatchdog);
+            stage.firstFrameWatchdog = null;
+          }}
           stage.video.classList.add("ready");
-          // A healthy item is on screen — clear any lingering error card,
-          // unless we're sitting on the idle fallback after a failure.
           if (state.mode !== "idle" && osdEl.classList.contains("error")) {{
             hideOsd();
           }}
-          // Progress watchdog — catches videos that load but never decode a
-          // frame (e.g. 4K H.264 saturating CPU on the Pi 5). Sample every
-          // 1.5s; if currentTime hasn't advanced for 3 consecutive checks
-          // while the video is supposed to be playing, give up.
+          // Progress watchdog — catches videos that decode their first
+          // frame but then can't keep up (e.g. 4K H.264 saturating CPU
+          // on the Pi 5). Sample every 1.5s; two consecutive stalls →
+          // give up (~3s).
           let lastSampledTime = stage.video.currentTime;
           let stalledChecks = 0;
           stage.progressWatchdog = window.setInterval(() => {{
@@ -695,7 +716,7 @@ def render_browser_html(
               return;
             }}
             stalledChecks += 1;
-            if (stalledChecks >= 3) {{
+            if (stalledChecks >= 2) {{
               failVideo(describeVideoError(v, item));
             }}
           }}, 1500);
@@ -713,15 +734,16 @@ def render_browser_html(
           }}
           advancePlaylist(1);
         }};
-        // Metadata watchdog — if onloadedmetadata never fires within 8s
-        // (Chromium silently rejecting the codec, or rpivid never opening
-        // the device), treat it as unsupported.
-        stage.metadataWatchdog = window.setTimeout(() => {{
-          stage.metadataWatchdog = null;
-          if (!stage.video.classList.contains("ready")) {{
+        // First-frame watchdog — if no frame is decoded within 7s
+        // (Chromium silently rejecting the codec, decoder hung, etc.),
+        // treat it as unsupported. readyState < HAVE_CURRENT_DATA (2)
+        // means nothing has actually been decoded yet.
+        stage.firstFrameWatchdog = window.setTimeout(() => {{
+          stage.firstFrameWatchdog = null;
+          if (stage.video.readyState < 2) {{
             failVideo(describeVideoError(stage.video, item));
           }}
-        }}, 8000);
+        }}, 7000);
         stage.video.src = item.src;
         stage.video.currentTime = 0;
       }} else {{
@@ -820,10 +842,27 @@ def render_browser_html(
     }}
 
     function startFromState(state) {{
+      // Drop the failed-src cache when the items list itself changes, so
+      // a genuinely new piece of content always gets a fresh attempt.
+      const newItemSrcs = (state.items || []).map(i => i && i.src).join("|");
+      if (newItemSrcs !== startFromState.lastItemSrcs) {{
+        failedSrcs.clear();
+        failedSrcReasons.clear();
+        startFromState.lastItemSrcs = newItemSrcs;
+      }}
       activeState = state;
       activeIndex = 0;
       lastReportedSlideIndex = -1;
-      hideOsd();
+      // Preserve a sticky error across benign re-renders (banner change,
+      // volume change, etc.) — it'll only clear via user action or
+      // genuinely new content above.
+      const startingOnFailedVideo =
+        state.items && state.items.length === 1 &&
+        state.items[0].kind === "video" &&
+        failedSrcs.has(state.items[0].src);
+      if (!osdEl.classList.contains("error")) {{
+        hideOsd();
+      }}
       stopTimers();
       if (!state.items || !state.items.length) {{
         showIdle(state.idle_item);
@@ -831,11 +870,23 @@ def render_browser_html(
         return;
       }}
       showBanner(state.banner ? state.banner.message : "", state.banner ? state.banner.level : "warning");
+      if (startingOnFailedVideo) {{
+        // Re-show the cached error message so it survives even if some
+        // intervening OSD cleared it (defensive — sticky guard should
+        // already prevent that).
+        const reason = failedSrcReasons.get(state.items[0].src)
+          || "This video can't be played on this display";
+        showOsd("error", reason, "", null, 0);
+        showIdle(state.idle_item);
+        notifyPauseState(false);
+        return;
+      }}
       const perItemSeconds = state.interval || 5.0;
       renderItem(state.items[activeIndex], state, perItemSeconds);
       notifySlideChange(activeIndex);
       notifyPauseState(false);
     }}
+    startFromState.lastItemSrcs = null;
 
     function applyControl(control) {{
       if (!control) {{
