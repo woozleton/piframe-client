@@ -583,7 +583,11 @@ def render_browser_html(
     }}
 
     function showIdle(item) {{
-      hideOsd();
+      // Preserve a visible error message across the fall-back to idle so
+      // the user still sees why playback stopped.
+      if (!osdEl.classList.contains("error")) {{
+        hideOsd();
+      }}
       if (!item) {{
         for (const stage of stages) {{
           resetStage(stage);
@@ -645,10 +649,14 @@ def render_browser_html(
             stage.progressWatchdog = null;
           }}
           stage.video.pause();
-          showOsd("error", reason, "", null, 4000);
+          // durationMs=0 → persists; cleared when a healthy item reaches
+          // .ready, when new state arrives, or when another OSD displaces it.
+          showOsd("error", reason, "", null, 0);
           stage.errorTimer = window.setTimeout(() => {{
             stage.errorTimer = null;
-            if (state.mode === "single" && !state.loop) {{
+            // Looping a fundamentally unplayable single video would just
+            // retry forever, so always fall back to idle in single mode.
+            if (state.mode === "single") {{
               showIdle(state.idle_item);
             }} else {{
               advancePlaylist(1);
@@ -663,6 +671,11 @@ def render_browser_html(
           const foregroundMode = fillMode === "cover" ? "cover" : "contain";
           fitMedia(stage.video, stage.video.videoWidth || 1, stage.video.videoHeight || 1, foregroundMode);
           stage.video.classList.add("ready");
+          // A healthy item is on screen — clear any lingering error card,
+          // unless we're sitting on the idle fallback after a failure.
+          if (state.mode !== "idle" && osdEl.classList.contains("error")) {{
+            hideOsd();
+          }}
           // Progress watchdog — catches videos that load but never decode a
           // frame (e.g. 4K H.264 saturating CPU on the Pi 5). Sample every
           // 1.5s; if currentTime hasn't advanced for 3 consecutive checks
@@ -716,6 +729,9 @@ def render_browser_html(
         stage.image.onload = () => {{
           fitMedia(stage.image, stage.image.naturalWidth || 1, stage.image.naturalHeight || 1, "contain");
           stage.image.classList.add("ready");
+          if (state.mode !== "idle" && osdEl.classList.contains("error")) {{
+            hideOsd();
+          }}
         }};
         stage.image.onerror = () => {{
           showBanner(itemErrorMessage(item), "error");
