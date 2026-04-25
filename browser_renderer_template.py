@@ -176,6 +176,36 @@ def render_browser_html(
       box-shadow: 0 0 18px rgba(224, 179, 91, 0.28);
       transition: width 140ms ease-out;
     }}
+    .osd.error {{
+      background:
+        linear-gradient(180deg, rgba(48, 18, 14, 0.88), rgba(28, 10, 8, 0.84));
+      border-color: rgba(255, 140, 120, 0.38);
+      box-shadow:
+        0 18px 42px rgba(0, 0, 0, 0.4),
+        inset 0 1px 0 rgba(255, 200, 190, 0.08);
+    }}
+    .osd.error .osd-icon {{
+      color: #ffb39c;
+      width: 38px;
+      height: 38px;
+    }}
+    .osd.error .osd-head {{
+      white-space: normal;
+      flex-wrap: nowrap;
+      align-items: center;
+      text-align: left;
+      gap: 16px;
+    }}
+    .osd.error .osd-value {{
+      font-size: 19px;
+      font-weight: 500;
+      letter-spacing: 0.01em;
+      line-height: 1.35;
+      white-space: normal;
+      text-align: left;
+      max-width: 44vh;
+      color: #fff1ec;
+    }}
     .stage {{
       position: absolute;
       inset: 0;
@@ -368,6 +398,27 @@ def render_browser_html(
       return "Content unavailable";
     }}
 
+    function describeVideoError(video, item) {{
+      const err = video && video.error;
+      const code = err ? err.code : 0;
+      // MEDIA_ERR_SRC_NOT_SUPPORTED — codec/container the browser flat-out
+      // refuses (e.g. HEVC on stock Chromium).
+      if (code === 4) {{
+        return "This video format isn't supported on this display";
+      }}
+      // MEDIA_ERR_DECODE — accepted the source but the decoder gave up
+      // partway (e.g. 4K H.264 saturating CPU on the Pi 5).
+      if (code === 3) {{
+        return "This video can't be decoded on this display";
+      }}
+      // MEDIA_ERR_NETWORK — file became unreachable mid-load.
+      if (code === 2) {{
+        return itemErrorMessage(item);
+      }}
+      // MEDIA_ERR_ABORTED or no error object (watchdog path) — generic.
+      return "This video can't be played on this display";
+    }}
+
     function hideOsd() {{
       if (osdTimer) {{
         window.clearTimeout(osdTimer);
@@ -382,6 +433,9 @@ def render_browser_html(
       }}
       if (kind === "mute") {{
         return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a1 1 0 0 1 1.7.7v13.6a1 1 0 0 1-1.7.7L9.7 15H6a2 2 0 0 1-2-2V11a2 2 0 0 1 2-2h3.7l4.8-4.5ZM18.2 8.4l1.4 1.4-2.1 2.2 2.1 2.2-1.4 1.4-2.2-2.1-2.2 2.1-1.4-1.4 2.1-2.2-2.1-2.2 1.4-1.4 2.2 2.1 2.2-2.1Z"></path></svg>';
+      }}
+      if (kind === "error") {{
+        return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.4c.62 0 1.2.34 1.5.88l8.7 15.4c.6 1.07-.16 2.4-1.5 2.4H3.3c-1.34 0-2.1-1.33-1.5-2.4L10.5 3.28c.3-.54.88-.88 1.5-.88Zm0 5.6a1.05 1.05 0 0 0-1.05 1.05v5.1a1.05 1.05 0 1 0 2.1 0v-5.1A1.05 1.05 0 0 0 12 8Zm0 9.1a1.3 1.3 0 1 0 0 2.6 1.3 1.3 0 0 0 0-2.6Z"></path></svg>';
       }}
       return '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 4.5a1 1 0 0 1 1.7.7v13.6a1 1 0 0 1-1.7.7L9.7 15H6a2 2 0 0 1-2-2V11a2 2 0 0 1 2-2h3.7l4.8-4.5Zm3.9 1.8a1 1 0 0 1 1.4 0 8 8 0 0 1 0 11.4 1 1 0 1 1-1.4-1.4 6 6 0 0 0 0-8.6 1 1 0 0 1 0-1.4Zm-2.8 2.8a1 1 0 0 1 1.4 0 4 4 0 0 1 0 5.7 1 1 0 0 1-1.4-1.4 2 2 0 0 0 0-2.9 1 1 0 0 1 0-1.4Z"></path></svg>';
     }}
@@ -398,6 +452,7 @@ def render_browser_html(
       // when only the icon is shown (pause / play overlays).
       osdValueEl.style.display = value ? "" : "none";
       osdLabelEl.style.display = label ? "" : "none";
+      osdEl.classList.toggle("error", kind === "error");
       const hasBar = typeof percent === "number";
       osdBarEl.style.display = hasBar ? "block" : "none";
       if (hasBar) {{
@@ -481,10 +536,23 @@ def render_browser_html(
     }}
 
     function resetStage(stage) {{
+      if (stage.metadataWatchdog) {{
+        window.clearTimeout(stage.metadataWatchdog);
+        stage.metadataWatchdog = null;
+      }}
+      if (stage.progressWatchdog) {{
+        window.clearInterval(stage.progressWatchdog);
+        stage.progressWatchdog = null;
+      }}
+      if (stage.errorTimer) {{
+        window.clearTimeout(stage.errorTimer);
+        stage.errorTimer = null;
+      }}
       stage.bgImage.onload = null;
       stage.image.onload = null;
       stage.video.onloadedmetadata = null;
       stage.video.onended = null;
+      stage.video.onerror = null;
       stage.bgImage.classList.remove("ready");
       stage.image.classList.remove("ready");
       stage.video.classList.remove("ready");
@@ -563,13 +631,64 @@ def render_browser_html(
         stage.video.volume = Math.max(0, Math.min(1, (state.volume || 0) / 100));
         stage.video.loop = state.mode === "single" ? !!state.loop : isSingleRepeatingPlaylist;
         stage.video.preload = "auto";
+        const failVideo = (reason) => {{
+          if (stage.errorTimer) {{
+            // already failing — don't double-trigger
+            return;
+          }}
+          if (stage.metadataWatchdog) {{
+            window.clearTimeout(stage.metadataWatchdog);
+            stage.metadataWatchdog = null;
+          }}
+          if (stage.progressWatchdog) {{
+            window.clearInterval(stage.progressWatchdog);
+            stage.progressWatchdog = null;
+          }}
+          stage.video.pause();
+          showOsd("error", reason, "", null, 4000);
+          stage.errorTimer = window.setTimeout(() => {{
+            stage.errorTimer = null;
+            if (state.mode === "single" && !state.loop) {{
+              showIdle(state.idle_item);
+            }} else {{
+              advancePlaylist(1);
+            }}
+          }}, 3500);
+        }};
         stage.video.onloadedmetadata = () => {{
+          if (stage.metadataWatchdog) {{
+            window.clearTimeout(stage.metadataWatchdog);
+            stage.metadataWatchdog = null;
+          }}
           const foregroundMode = fillMode === "cover" ? "cover" : "contain";
           fitMedia(stage.video, stage.video.videoWidth || 1, stage.video.videoHeight || 1, foregroundMode);
           stage.video.classList.add("ready");
+          // Progress watchdog — catches videos that load but never decode a
+          // frame (e.g. 4K H.264 saturating CPU on the Pi 5). Sample every
+          // 1.5s; if currentTime hasn't advanced for 3 consecutive checks
+          // while the video is supposed to be playing, give up.
+          let lastSampledTime = stage.video.currentTime;
+          let stalledChecks = 0;
+          stage.progressWatchdog = window.setInterval(() => {{
+            const v = stage.video;
+            if (v.paused || v.ended) {{
+              lastSampledTime = v.currentTime;
+              stalledChecks = 0;
+              return;
+            }}
+            if (v.currentTime > lastSampledTime + 0.05) {{
+              lastSampledTime = v.currentTime;
+              stalledChecks = 0;
+              return;
+            }}
+            stalledChecks += 1;
+            if (stalledChecks >= 3) {{
+              failVideo(describeVideoError(v, item));
+            }}
+          }}, 1500);
         }};
         stage.video.onerror = () => {{
-          showBanner(itemErrorMessage(item), "error");
+          failVideo(describeVideoError(stage.video, item));
         }};
         stage.video.onended = () => {{
           if (state.mode === "single" && !state.loop) {{
@@ -581,6 +700,15 @@ def render_browser_html(
           }}
           advancePlaylist(1);
         }};
+        // Metadata watchdog — if onloadedmetadata never fires within 8s
+        // (Chromium silently rejecting the codec, or rpivid never opening
+        // the device), treat it as unsupported.
+        stage.metadataWatchdog = window.setTimeout(() => {{
+          stage.metadataWatchdog = null;
+          if (!stage.video.classList.contains("ready")) {{
+            failVideo(describeVideoError(stage.video, item));
+          }}
+        }}, 8000);
         stage.video.src = item.src;
         stage.video.currentTime = 0;
       }} else {{
