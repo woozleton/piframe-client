@@ -268,6 +268,36 @@ def _log(event: str, **fields: Any) -> None:
     print(" | ".join(parts), flush=True)
 
 
+LAST_UPDATE_FILE = Path(
+    os.environ.get("PIFRAME_LAST_UPDATE_FILE", "/tmp/piframe_last_update.json")
+)
+
+
+def _read_and_consume_last_update() -> Optional[Dict[str, Any]]:
+    """Read the marker file dropped by update.sh after a successful
+    pull, then delete it so the same record isn't re-reported every
+    boot. Returned dict is shipped home in the next status_update
+    heartbeat so the server's System tab can confirm a restart took
+    and show what changed.
+
+    Returns None if the file is missing, malformed, or unreadable. We
+    swallow errors aggressively here - this is a nice-to-have signal,
+    not a correctness requirement."""
+    try:
+        if not LAST_UPDATE_FILE.exists():
+            return None
+        data = json.loads(LAST_UPDATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    finally:
+        try:
+            if LAST_UPDATE_FILE.exists():
+                LAST_UPDATE_FILE.unlink()
+        except OSError:
+            pass
+    return data if isinstance(data, dict) else None
+
+
 def _read_client_version() -> Optional[str]:
     """Best-effort: short git SHA of the running checkout. Surfaced in
     status_update heartbeats so the server's System tab can show the
@@ -936,6 +966,12 @@ class PiFrameClient:
         # update_self -> systemctl restart, the new SHA shows up
         # automatically on the next reconnect.
         self.client_version: Optional[str] = _read_client_version()
+        # Marker file written by update.sh after a successful pull.
+        # Read once and consumed (deleted) so we don't keep reporting
+        # the same update across every restart - it should only land
+        # in the heartbeat once, on the boot that immediately follows
+        # the update.
+        self.last_update: Optional[Dict[str, Any]] = _read_and_consume_last_update()
 
     def run(self) -> None:
         _log(
@@ -1331,6 +1367,7 @@ class PiFrameClient:
                 # yet (older kiosk template, or no slideshow active).
                 "slideshow_index": BROWSER_EVENT_STATE.slideshow_index(),
                 "client_version": self.client_version,
+                "last_update": self.last_update,
             }
             metrics = _collect_system_metrics()
             if metrics:
