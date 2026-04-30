@@ -12,12 +12,14 @@ This client now uses one browser-based renderer for:
 
 ## Files
 
-- [piframe_client.py](/home/woozleton/piframe_client/piframe_client.py)
-- [browser_renderer_template.py](/home/woozleton/piframe_client/browser_renderer_template.py)
-- [requirements.txt](/home/woozleton/piframe_client/requirements.txt)
-- [scripts/bootstrap_pi.sh](/home/woozleton/piframe_client/scripts/bootstrap_pi.sh)
-- [idle.jpg](/home/woozleton/piframe_client/idle.jpg)
-- [piframe-client.service](/etc/systemd/system/piframe-client.service)
+- `piframe_client.py` - WebSocket client + browser orchestrator
+- `browser_renderer_template.py` - Chromium kiosk HTML/JS template
+- `update.sh` - in-place self-updater (see Self-update below)
+- `.gitattributes` - pins shell + Python files to LF endings
+- `requirements.txt`
+- `scripts/bootstrap_pi.sh`
+- `idle.jpg`
+- `/etc/systemd/system/piframe-client.service` (installed by bootstrap)
 
 ## How It Works
 
@@ -50,6 +52,7 @@ The client currently handles these server-side commands:
 - `previous`
 - `stop`
 - `volume`
+- `update_self` (see Self-update below)
 
 Single-video note:
 
@@ -121,6 +124,73 @@ sudo systemctl status piframe-client --no-pager
 journalctl -u piframe-client -f
 ```
 
+## Self-update
+
+The server's System tab has a "Client updates" card that pushes
+`git pull` + service restart to any connected Pi over the existing
+WebSocket. There is no SSH or per-Pi credential involved - the Pi
+authenticates to GitHub directly to fetch from `origin/main`.
+
+Flow:
+
+1. operator clicks Update in the manager UI
+2. server sends an `update_self` WebSocket command
+3. client spawns `update.sh` detached and continues running until
+   systemd restarts it
+4. `update.sh` runs `git fetch origin main && git reset --hard
+   origin/main`, writes a marker file describing what changed, then
+   `exec sudo systemctl restart piframe-client`
+5. systemd respawns the client; on boot it reads the marker file,
+   ships it home in the next status heartbeat, and deletes it
+
+The marker carries:
+
+- from/to short SHAs
+- list of changed files
+- one-line subjects for each new commit
+- `noop=true` flag if before==after (skips the restart entirely)
+
+Marker location:
+
+- `/tmp/piframe_last_update.json` (consumed by client on first read)
+
+Update script log (every run, even silent failures):
+
+- `/tmp/piframe_update.log`
+
+Heartbeat fields the server cares about:
+
+- `client_version` - short SHA, computed once at boot
+- `last_update` - whatever the marker contained, echoed every tick
+  until the server's TTL clears the result UI-side
+
+### Sudoers prerequisite
+
+`update.sh` ends with `exec sudo /bin/systemctl restart
+piframe-client`, so the service user needs passwordless sudo for that
+command. The simplest setup (already in place on existing devices)
+is `/etc/sudoers.d/010_pi-nopasswd`:
+
+```
+woozleton ALL=(ALL) NOPASSWD: ALL
+```
+
+A tighter alternative scoped just to the restart:
+
+```
+woozleton ALL=NOPASSWD: /bin/systemctl restart piframe-client
+```
+
+### Line-ending guard
+
+`.gitattributes` pins `*.sh` and `*.py` to LF. Without it, a commit
+from a Windows checkout (where `core.autocrlf=true` is the default)
+rewrites the script with CRLF on commit; the Pi checks it back out
+with LF and `git status --porcelain` then reports `update.sh` as
+permanently "modified," tripping `update.sh`'s own dirty-tree guard
+on every subsequent self-update. The script also runs `git config
+--local core.autocrlf input` defensively on each invocation.
+
 ## Replicating To Another Pi
 
 ```bash
@@ -182,6 +252,14 @@ Default rotation settings:
 - max size: `5 MB`
 - backups kept: `3`
 
+Self-update output (every run, append-only):
+
+- `/tmp/piframe_update.log`
+
+Useful when an update appears to silently fail - the client spawns
+`update.sh` with stdout/stderr piped to `/dev/null`, so this is the
+only place to see what the script actually did.
+
 ## Audio
 
 The client now uses live HDMI audio output again.
@@ -217,19 +295,23 @@ This project folder is intended to be self-contained for source control:
 - the local Python runtime also lives in this folder as `api-env/`
 - `api-env/` should not be committed
 
-Recommended tracked files:
+Tracked files:
 
 - `piframe_client.py`
-- `piframe_client_backup.py`
-- `README.md`
-- `requirements.md`
+- `browser_renderer_template.py`
+- `update.sh`
+- `.gitattributes`
+- `requirements.txt`, `requirements.md`
+- `scripts/bootstrap_pi.sh`
 - `idle.jpg`
+- `README.md`
 
-Current ignore targets:
+Ignored:
 
-- `api-env/`
-- `__pycache__/`
-- Python bytecode and local log files
+- `api-env/` (local Python venv)
+- `client_settings.json` (per-device runtime state)
+- `__pycache__/` and Python bytecode
+- local `*.log` files
 
 ## On-Screen Status Banner
 
@@ -275,6 +357,13 @@ These can be set in the service file or shell environment.
 - `PIFRAME_IDLE_MEDIA`
 - `PIFRAME_CHROMIUM_BIN`
 - `PIFRAME_CAGE_BIN`
+
+### Self-update
+
+- `PIFRAME_SERVICE_NAME` (default `piframe-client`) - the systemd
+  unit `update.sh` restarts after a successful pull
+- `PIFRAME_LAST_UPDATE_FILE` (default `/tmp/piframe_last_update.json`)
+- `PIFRAME_UPDATE_LOG` (default `/tmp/piframe_update.log`)
 
 ### Browser Renderer
 
