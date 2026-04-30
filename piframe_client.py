@@ -1334,6 +1334,18 @@ class PiFrameClient:
             BROWSER_EVENT_STATE.wakeup.clear()
             if not self.status_running or not self.ws_connection:
                 continue
+            # Pick up an update marker dropped by update.sh while we're
+            # running. The boot path already reads + consumes the file
+            # in __init__, but the noop case (before==after) doesn't
+            # restart the service, so the only way the marker reaches
+            # the server is for the running process to notice it. Once
+            # we've stashed a value, leave it in place - the server has
+            # its own TTL/auto-clear and we want every heartbeat to keep
+            # echoing the same record until then.
+            if self.last_update is None:
+                marker = _read_and_consume_last_update()
+                if marker is not None:
+                    self.last_update = marker
             # If the browser reports paused, surface that to the manager
             # while leaving the underlying media kind in self.playback_state
             # untouched. Stopped state is never overridden (a paused flag
