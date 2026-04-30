@@ -617,8 +617,21 @@ def render_browser_html(
     }}
 
     function scheduleImageAdvance(perItemSeconds) {{
-      const token = pendingAdvanceToken;
       window.clearInterval(intervalHandle);
+      intervalHandle = null;
+      // A 1-item repeating playlist has nothing to advance to - the
+      // image is already painted. Re-arming the interval would just
+      // re-render the same item every tick and the cross-fade between
+      // stages reads as a barely-visible flicker.
+      if (
+        activeState &&
+        Array.isArray(activeState.items) &&
+        activeState.items.length === 1 &&
+        activeState.repeat
+      ) {{
+        return;
+      }}
+      const token = pendingAdvanceToken;
       intervalHandle = window.setInterval(() => {{
         if (token !== pendingAdvanceToken) {{
           return;
