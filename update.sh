@@ -23,18 +23,38 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE_NAME="${PIFRAME_SERVICE_NAME:-piframe-client}"
 LAST_UPDATE_FILE="${PIFRAME_LAST_UPDATE_FILE:-/tmp/piframe_last_update.json}"
+LOG_FILE="${PIFRAME_UPDATE_LOG:-/tmp/piframe_update.log}"
+
+# Mirror everything from here on into a known logfile. The client spawns
+# this script with stdout/stderr -> /dev/null so a silent failure leaves
+# nothing in journalctl; this gives us something to read after the fact.
+exec > >(tee -a "$LOG_FILE") 2>&1
+echo "==== $(date -u '+%Y-%m-%dT%H:%M:%SZ') update.sh start ===="
 
 cd "$REPO_DIR"
+
+# Pin LF for tracked text on this checkout so a Windows-side commit
+# (where core.autocrlf=true rewrites *.sh to CRLF) doesn't leave the
+# Pi's working tree permanently "modified" after checkout. Idempotent.
+git config --local core.autocrlf input
 
 before_full="$(git rev-parse HEAD)"
 before_short="$(git rev-parse --short HEAD)"
 echo "[update] repo=$REPO_DIR service=$SERVICE_NAME"
 echo "[update] before: $before_short"
 
-# Fail fast on dirty working tree - we don't want to silently nuke local
-# debugging changes. Operator can resolve manually via SSH.
-if [ -n "$(git status --porcelain)" ]; then
+# Refresh the index so files that look "modified" only because of stat
+# drift (mtime, mode, EOL settings just changed) reset to clean. After
+# this, `git status --porcelain` reflects genuine content drift only.
+git update-index --refresh >/dev/null 2>&1 || true
+
+dirty="$(git status --porcelain)"
+if [ -n "$dirty" ]; then
+  # Real content drift remains after refresh. Don't silently nuke local
+  # debugging changes - the operator should resolve via SSH. Spell out
+  # what's dirty so the logfile actually helps.
   echo "[update] working tree is dirty - aborting"
+  echo "$dirty"
   exit 2
 fi
 
@@ -45,41 +65,41 @@ after_full="$(git rev-parse HEAD)"
 after_short="$(git rev-parse --short HEAD)"
 echo "[update] after:  $after_short"
 
-# Already up to date - no restart needed and nothing useful to record.
-# Still drop a marker file so the UI can show "checked X, no change"
-# rather than implying we never got the click.
+# Already up to date - no restart needed. Drop a marker so the UI can
+# show "already up to date" instead of implying we never got the click.
 if [ "$before_full" = "$after_full" ]; then
   echo "[update] already up to date, skipping restart"
-  python3 - <<PY
-import json, time
+  BEFORE_SHORT="$before_short" AFTER_SHORT="$after_short" LAST_UPDATE_FILE="$LAST_UPDATE_FILE" python3 - <<'PY'
+import json, os, time
 payload = {
     "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "from": "$before_short",
-    "to": "$after_short",
+    "from": os.environ["BEFORE_SHORT"],
+    "to": os.environ["AFTER_SHORT"],
     "files": [],
     "commits": [],
     "noop": True,
 }
-with open("$LAST_UPDATE_FILE", "w", encoding="utf-8") as f:
+with open(os.environ["LAST_UPDATE_FILE"], "w", encoding="utf-8") as f:
     json.dump(payload, f)
 PY
   exit 0
 fi
 
-# Collect changed files + commit subjects across the range. Using NUL
-# separators so paths or commit subjects with embedded newlines/spaces
-# don't tear up the JSON.
+# Collect changed files + commit subjects across the range. NUL
+# separators so paths or subjects with embedded whitespace don't tear up
+# the JSON encoding step downstream.
 export FILES_NUL="$(git diff --name-only -z "$before_full" "$after_full" || true)"
 export COMMITS_NUL="$(git log --reverse --format=%h%x09%s%x00 "$before_full..$after_full" || true)"
+export BEFORE_SHORT="$before_short"
+export AFTER_SHORT="$after_short"
+export LAST_UPDATE_FILE
 
-# Hand off to python3 for JSON encoding - bash heredoc + json.dump is
-# more robust than hand-rolled escaping, and python3 ships on every Pi
-# that runs this client anyway.
-python3 - <<PY
+# Hand off to python3 for JSON encoding - safer than hand-rolled
+# escaping, and python3 ships on every Pi that runs this client.
+# Heredoc is single-quoted so $vars inside are read from python's
+# os.environ, not bash-interpolated at heredoc expansion time.
+python3 - <<'PY'
 import json, os, time
-
-before_short = "$before_short"
-after_short = "$after_short"
 
 raw_files = os.environ.get("FILES_NUL", "")
 files = [p for p in raw_files.split("\x00") if p]
@@ -98,16 +118,17 @@ for chunk in raw_commits.split("\x00"):
 
 payload = {
     "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    "from": before_short,
-    "to": after_short,
+    "from": os.environ["BEFORE_SHORT"],
+    "to": os.environ["AFTER_SHORT"],
     "files": files,
     "commits": commits,
     "noop": False,
 }
-with open("$LAST_UPDATE_FILE", "w", encoding="utf-8") as f:
+with open(os.environ["LAST_UPDATE_FILE"], "w", encoding="utf-8") as f:
     json.dump(payload, f)
 PY
 
+echo "[update] handing off to systemctl restart"
 # `exec` so the script's PID is replaced; systemctl will fire the
 # restart and our parent process (the running client) gets killed.
 exec sudo /bin/systemctl restart "$SERVICE_NAME"

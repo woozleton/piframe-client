@@ -1,0 +1,9 @@
+# Lock shell scripts to LF regardless of the local core.autocrlf
+# setting. Without this, a commit from a Windows checkout (autocrlf=true)
+# rewrites *.sh with CRLF on commit; the Pi checks them out with LF and
+# `git status` then shows them as permanently "modified," tripping the
+# dirty-tree guard in update.sh and silently aborting self-updates.
+*.sh text eol=lf
+
+# Same logic for any future text formats whose tooling assumes LF.
+*.py text eol=lf
