@@ -268,6 +268,30 @@ def _log(event: str, **fields: Any) -> None:
     print(" | ".join(parts), flush=True)
 
 
+def _read_client_version() -> Optional[str]:
+    """Best-effort: short git SHA of the running checkout. Surfaced in
+    status_update heartbeats so the server's System tab can show the
+    operator which commit each Pi is running. Returns None when git
+    isn't available or the directory isn't a checkout (e.g. unzipped
+    tarball install)."""
+    repo_dir = Path(__file__).resolve().parent
+    git_bin = shutil.which("git")
+    if not git_bin:
+        return None
+    try:
+        result = subprocess.run(
+            [git_bin, "-C", str(repo_dir), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = (result.stdout or "").strip()
+    return sha or None
+
+
 def _load_client_settings(path: Path) -> Dict[str, Any]:
     """Load small persisted client settings from disk."""
     try:
@@ -907,6 +931,11 @@ class PiFrameClient:
         self.browser_event_server: Optional[HTTPServer] = None
         self.browser_event_thread: Optional[threading.Thread] = None
         self.system_info = get_system_info()
+        # Computed once at boot; surfaced in the status heartbeat so the
+        # server's System tab can show per-device git SHA. After an
+        # update_self -> systemctl restart, the new SHA shows up
+        # automatically on the next reconnect.
+        self.client_version: Optional[str] = _read_client_version()
 
     def run(self) -> None:
         _log(
@@ -978,6 +1007,7 @@ class PiFrameClient:
             "stop": self._handle_stop,
             "slideshow": self._handle_slideshow,
             "volume": self._handle_volume,
+            "update_self": self._handle_update_self,
         }.get(cmd)
         if handler:
             handler(data, params)
@@ -1144,6 +1174,34 @@ class PiFrameClient:
         _log("volume_command", level=level)
         self.renderer.set_volume(level)
 
+    def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
+        """Server-pushed in-place update. Spawns `update.sh` from the
+        repo root (which does git fetch + reset --hard origin/main, then
+        execs `sudo systemctl restart piframe-client`). The current
+        process gets killed by the restart and systemd respawns us with
+        the new code. If `update.sh` is missing or git is dirty the
+        script exits non-zero; we log it and stay running on the old
+        version."""
+        repo_dir = Path(__file__).resolve().parent
+        script = repo_dir / "update.sh"
+        if not script.exists():
+            _log("update_self_missing_script", path=str(script))
+            return
+        _log("update_self_starting", repo=str(repo_dir))
+        try:
+            # Detached so we don't block the WS reader thread, and so
+            # the systemctl restart doesn't have to kill our parent
+            # before it can exec.
+            subprocess.Popen(
+                ["/bin/bash", str(script)],
+                cwd=str(repo_dir),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            _log("update_self_spawn_failed", error=exc)
+
     def on_close(self, ws, close_status_code, close_msg) -> None:  # pylint: disable=unused-argument
         _log("websocket_closed", code=close_status_code, message=close_msg)
         self.ws_connection = None
@@ -1272,6 +1330,7 @@ class PiFrameClient:
                 # time-based projection. None when browser hasn't pushed
                 # yet (older kiosk template, or no slideshow active).
                 "slideshow_index": BROWSER_EVENT_STATE.slideshow_index(),
+                "client_version": self.client_version,
             }
             metrics = _collect_system_metrics()
             if metrics:
