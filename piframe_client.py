@@ -391,6 +391,28 @@ def _rotate_log(path: Path, *, max_bytes: int, backups: int) -> None:
         pass
 
 
+def _clear_stale_wayland_sockets(runtime_dir: str) -> None:
+    """Remove leftover wayland-N / wayland-N.lock from a prior crashed cage.
+
+    wlroots fails with "Unable to open Wayland socket: Invalid argument" when
+    a stale lockfile is present, so cage exits 1 on every restart until the
+    runtime dir is cleaned up.
+    """
+    try:
+        entries = list(Path(runtime_dir).glob("wayland-*"))
+    except OSError:
+        return
+    removed = []
+    for entry in entries:
+        try:
+            entry.unlink()
+            removed.append(entry.name)
+        except OSError:
+            continue
+    if removed:
+        _log("wayland_sockets_cleared", runtime_dir=runtime_dir, removed=",".join(removed))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -502,6 +524,7 @@ class BrowserController:
         )
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         _log("browser_runtime", xdg_runtime_dir=runtime_dir)
+        _clear_stale_wayland_sockets(runtime_dir)
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         BROWSER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         _rotate_log(
