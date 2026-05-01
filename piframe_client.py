@@ -75,7 +75,25 @@ BROWSER_SHOW_HUD = (
 )
 IDLE_MEDIA_ENV = "PIFRAME_IDLE_MEDIA"
 # Bundled locally so idle display doesn't depend on the NAS being reachable.
-IDLE_MEDIA_DEFAULT = str(Path(__file__).resolve().parent / "idle.jpg")
+# Prefer an animated idle.mp4 if present, otherwise fall back to a still image.
+_IDLE_MEDIA_DIR = Path(__file__).resolve().parent
+IDLE_MEDIA_DEFAULT_CANDIDATES = (
+    str(_IDLE_MEDIA_DIR / "idle.mp4"),
+    str(_IDLE_MEDIA_DIR / "idle.jpg"),
+    str(_IDLE_MEDIA_DIR / "idle.png"),
+)
+
+
+def _default_idle_media() -> str:
+    for candidate in IDLE_MEDIA_DEFAULT_CANDIDATES:
+        try:
+            if Path(candidate).exists():
+                return candidate
+        except OSError:
+            continue
+    return IDLE_MEDIA_DEFAULT_CANDIDATES[1]
+
+
 IMAGE_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -751,7 +769,7 @@ class BrowserController:
             repeat=loop,
             loop=loop,
             shuffle=False,
-            idle_media=self._pick_existing_idle_media(IDLE_MEDIA_DEFAULT),
+            idle_media=self._pick_existing_idle_media(_default_idle_media()),
         ):
             return False
         self.slideshow_active = False
@@ -775,7 +793,7 @@ class BrowserController:
             repeat=True,
             loop=False,
             shuffle=shuffle,
-            idle_media=self._pick_existing_idle_media(IDLE_MEDIA_DEFAULT),
+            idle_media=self._pick_existing_idle_media(_default_idle_media()),
         ):
             return False
         self.slideshow_active = True
@@ -801,7 +819,7 @@ class BrowserController:
             repeat=repeat,
             loop=False,
             shuffle=False,
-            idle_media=self._pick_existing_idle_media(IDLE_MEDIA_DEFAULT),
+            idle_media=self._pick_existing_idle_media(_default_idle_media()),
         ):
             return False
         self.slideshow_active = True
@@ -1255,7 +1273,7 @@ class PiFrameClient:
 
     @staticmethod
     def _get_idle_media() -> str:
-        idle_media = os.environ.get(IDLE_MEDIA_ENV, IDLE_MEDIA_DEFAULT)
+        idle_media = os.environ.get(IDLE_MEDIA_ENV) or _default_idle_media()
         return _normalize_media_url(idle_media) or idle_media
 
     def _send_render_command(self, action: Optional[str] = None) -> None:
