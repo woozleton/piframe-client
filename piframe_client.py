@@ -107,6 +107,7 @@ IMAGE_EXTENSIONS = {
     ".avif",
 }
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 
 
 # ---------------------------------------------------------------------------
@@ -629,8 +630,28 @@ class BrowserController:
 
     @staticmethod
     def _item_kind(path_str: str) -> str:
+        # Audio files are tagged as "video" for the browser-side
+        # renderer because Chromium's <video> element plays mp3/m4a/
+        # flac/etc just fine - the audio routes through ALSA to HDMI
+        # the same way embedded video audio does, and the existing
+        # video-branch logic (onended -> advancePlaylist, repeat,
+        # next/previous) works unchanged. The browser doesn't need to
+        # know the file is audio-only; v1 ships with the default
+        # black-frame visual and Phase 11 layers on a "now playing"
+        # overlay. The orchestrator-side kind is still tracked
+        # separately for status reporting.
         ext = Path(path_str.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
-        return "video" if ext in VIDEO_EXTENSIONS else "image"
+        if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
+            return "video"
+        return "image"
+
+    @staticmethod
+    def _is_audio_only(path_str: str) -> bool:
+        """True when the path is an audio-only file. Used by status
+        reporting to distinguish 'audio_playing' from 'playing' (video)
+        - the browser renderer treats them the same."""
+        ext = Path(path_str.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
+        return ext in AUDIO_EXTENSIONS
 
     @staticmethod
     def _is_web_url(path_str: str) -> bool:
@@ -1078,6 +1099,7 @@ class PiFrameClient:
         handler = {
             "play": self._handle_play,
             "video_playlist": self._handle_video_playlist,
+            "audio_playlist": self._handle_audio_playlist,
             "pause": self._handle_pause,
             "next": self._handle_next,
             "previous": self._handle_previous,
@@ -1158,6 +1180,52 @@ class PiFrameClient:
             # Video playlists rotate too, but the manager doesn't render
             # per-video tile previews from the playlist - leave the
             # slideshow timer null for video playback.
+            self.slideshow_started_at = None
+            BROWSER_EVENT_STATE.clear_slideshow_index()
+            BROWSER_EVENT_STATE.set_paused(False)
+            self._send_render_command()
+
+    def _handle_audio_playlist(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:
+        """Audio playlist dispatch. Treats audio files the same way
+        the video-playlist path treats videos - the renderer's
+        play_video_playlist accepts any media URL Chromium can play
+        through its <video> element, which includes the common audio
+        formats. The orchestrator-side `target` field (default "hdmi")
+        is reserved for future per-target audio routing; v1 always
+        plays through the browser's default ALSA -> HDMI audio path.
+        """
+        playlist_name, playlist_id = self._playlist_context(data, params)
+        items = self._normalized_items(
+            params.get("items"),
+            data.get("items"),
+        )
+        repeat = _coerce_bool(params.get("repeat", data.get("repeat", True)), default=True)
+        target = (params.get("target") or data.get("target") or "hdmi")
+        self.current_playlist_name = playlist_name
+        self.current_playlist_id = playlist_id
+        _log(
+            "audio_playlist_command",
+            items=len(items),
+            repeat=repeat,
+            target=target,
+            playlist=playlist_name or "",
+            playlist_id=playlist_id or "",
+        )
+        handled = False
+        if len(items) == 1:
+            handled = self.renderer.play_single_video(items[0], loop=repeat)
+        elif items:
+            handled = self.renderer.play_video_playlist(items, repeat=repeat)
+        if handled:
+            self.current_slideshow = list(items)
+            self.current_video = items[0] if len(items) == 1 else ""
+            # Distinct playback_state value so the orchestrator can
+            # distinguish "currently playing audio" from "currently
+            # playing video" without sniffing the file extension. The
+            # browser renderer doesn't need to know the difference.
+            self.playback_state = "audio_playing"
             self.slideshow_started_at = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
             BROWSER_EVENT_STATE.set_paused(False)
