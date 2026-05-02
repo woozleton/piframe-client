@@ -1025,6 +1025,25 @@ def render_browser_html(
         return !!(window.butterchurn && window.butterchurnPresets);
       }}
 
+      // Friendly display names for the curated presets - the raw
+      // filenames from the bundle are author-prefixed and ugly.
+      // Mirrors the orchestrator-side visualizerDisplayName().
+      function prettyPresetName(raw) {{
+        if (!raw) return "";
+        const PRETTY = [
+          ["martin - witchcraft reloaded", "Witchcraft"],
+          ["martin - reflections on black tiles", "Reflections"],
+          ["flexi + amandio c - organic12-3d-2", "Organic"],
+          ["martin - chain breaker", "Chain Breaker"],
+          ["martin [shadow harlequins shape code] - fata morgana", "Fata Morgana"],
+        ];
+        const low = String(raw).toLowerCase();
+        for (const [match, label] of PRETTY) {{
+          if (low.includes(match)) return label;
+        }}
+        return raw;
+      }}
+
       function vizDiag(stage, detail) {{
         // Surface visualizer init / runtime status to the parent
         // process so we can diagnose blue-screen failures over the
@@ -1224,7 +1243,7 @@ def render_browser_html(
           // like the same dissolving mush.
           viz.loadPreset(preset, 0.6);
           if (presetNameEl) {{
-            presetNameEl.textContent = name;
+            presetNameEl.textContent = prettyPresetName(name);
             presetNameEl.classList.add("is-visible");
           }}
           // Start sampling AFTER the blend completes so the blend
