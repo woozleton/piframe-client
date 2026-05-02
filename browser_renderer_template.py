@@ -1279,13 +1279,54 @@ def render_browser_html(
       function startAnalyser(src) {{
         if (!analyserAudio) return;
         try {{
-          if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+          if (audioCtx && audioCtx.state === "suspended") {{
+            audioCtx.resume().then(
+              () => vizDiag("audio_ctx_resumed", "state=" + audioCtx.state),
+              (e) => vizDiag("audio_ctx_resume_failed", e && e.message)
+            );
+          }}
           if (analyserAudio.src !== src) {{
             analyserAudio.src = src;
             analyserAudio.load();
           }}
-          analyserAudio.play().catch(() => {{}});
-        }} catch (_) {{}}
+          analyserAudio.play().then(
+            () => vizDiag("analyser_playing", "src=" + (src || "").slice(-40)),
+            (err) => vizDiag("analyser_play_rejected", err && err.message || "(unknown)")
+          );
+        }} catch (err) {{
+          vizDiag("analyser_start_threw", err && err.message);
+        }}
+      }}
+
+      // Diag heartbeat: while active, every 2s log whether the
+      // silent analyser is actually feeding non-zero FFT bins. If
+      // every byte is 0 we know reactivity is broken even though
+      // butterchurn is happily painting its idle animation.
+      function startReactivityHeartbeat() {{
+        if (startReactivityHeartbeat.handle) {{
+          window.clearInterval(startReactivityHeartbeat.handle);
+        }}
+        const probe = audioCtx ? audioCtx.createAnalyser() : null;
+        if (!probe || !analyserSrc) return;
+        probe.fftSize = 256;
+        analyserSrc.connect(probe);
+        const data = new Uint8Array(probe.frequencyBinCount);
+        startReactivityHeartbeat.handle = window.setInterval(() => {{
+          if (!active) return;
+          probe.getByteFrequencyData(data);
+          let max = 0;
+          let sum = 0;
+          for (let i = 0; i < data.length; i++) {{
+            if (data[i] > max) max = data[i];
+            sum += data[i];
+          }}
+          const avg = sum / data.length;
+          vizDiag("reactivity_heartbeat",
+            "max=" + max + " avg=" + avg.toFixed(1)
+            + " analyser_paused=" + (analyserAudio ? analyserAudio.paused : "?")
+            + " analyser_t=" + (analyserAudio && Number.isFinite(analyserAudio.currentTime)
+              ? analyserAudio.currentTime.toFixed(2) : "?"));
+        }}, 2000);
       }}
 
       function stopAnalyser() {{
@@ -1376,6 +1417,7 @@ def render_browser_html(
         presetCycleHandle = window.setInterval(nextPreset, PRESET_CYCLE_MS);
         if (start.syncTimer) window.clearInterval(start.syncTimer);
         start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
+        startReactivityHeartbeat();
         if (rafHandle == null) {{
           rafHandle = window.requestAnimationFrame(render);
         }}
@@ -1399,6 +1441,10 @@ def render_browser_html(
         if (presetCycleHandle) {{
           window.clearInterval(presetCycleHandle);
           presetCycleHandle = null;
+        }}
+        if (startReactivityHeartbeat.handle) {{
+          window.clearInterval(startReactivityHeartbeat.handle);
+          startReactivityHeartbeat.handle = null;
         }}
         if (rafHandle != null) {{
           window.cancelAnimationFrame(rafHandle);
