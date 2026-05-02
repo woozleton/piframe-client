@@ -414,6 +414,79 @@ def _detect_audio_server() -> str:
     return "alsa-only"
 
 
+def _set_chromium_sink_input_mute(mute: bool) -> None:
+    """Mute (or unmute) Chromium's audio at the PipeWire/PulseAudio
+    sink-input level so the companion mpv is audible underneath.
+
+    Why: setting <video>.muted in the renderer only silences that
+    element's contribution to Chromium's per-process audio node.
+    Chromium's PipeWire node stays connected to the sink and can
+    still emit decoded samples, which compete with mpv's stream in
+    the mixer (companion audio gets drowned out). Muting at the
+    sink-input level cuts Chromium out of the mix cleanly.
+
+    Uses pactl (works against either real PulseAudio or
+    pipewire-pulse). Best-effort - returns silently if pactl is
+    missing or no Chromium sink-input is found (e.g. nothing is
+    playing yet)."""
+    pactl = shutil.which("pactl")
+    if not pactl:
+        return
+    try:
+        result = subprocess.run(
+            [pactl, "list", "sink-inputs", "short"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if result.returncode != 0:
+        return
+    chromium_ids: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        # `pactl list sink-inputs short` is whitespace-separated and
+        # doesn't include the application.process.binary name. We
+        # need the verbose listing to identify which input is
+        # Chromium - fall through to the long form.
+        pass
+    try:
+        long_result = subprocess.run(
+            [pactl, "list", "sink-inputs"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if long_result.returncode != 0:
+        return
+    current_id: Optional[str] = None
+    for raw in (long_result.stdout or "").splitlines():
+        line = raw.strip()
+        if line.startswith("Sink Input #"):
+            current_id = line.split("#", 1)[1].strip()
+            continue
+        # Match either application.name = "Chromium" or
+        # application.process.binary = "chromium" or node.name with
+        # a Chromium prefix (covers chromium / chromium-browser /
+        # chrome forks).
+        lower = line.lower()
+        if current_id is not None and (
+            'application.name = "chromium' in lower
+            or 'application.process.binary = "chromium' in lower
+            or 'node.name = "chromium' in lower
+        ):
+            chromium_ids.append(current_id)
+            current_id = None  # avoid double-matching the same block
+    flag = "1" if mute else "0"
+    for sid in chromium_ids:
+        try:
+            subprocess.run(
+                [pactl, "set-sink-input-mute", sid, flag],
+                capture_output=True, timeout=2, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+    _log("companion_chromium_mute", count=len(chromium_ids), muted=bool(mute))
+
+
 def _load_client_settings(path: Path) -> Dict[str, Any]:
     """Load small persisted client settings from disk."""
     try:
@@ -973,10 +1046,16 @@ class BrowserController:
 
     def set_video_mute_override(self, mute: bool) -> None:
         """Surface the override-mute flag for the renderer's <video>
-        element. The actual companion audio is played by the
-        MpvCompanion sidecar (separate process, separate audio
-        stream, mixed by PulseAudio/PipeWire/dmix at the OS level)
-        - this method only handles the visual side of the override.
+        element AND mute Chromium's PipeWire/PulseAudio stream
+        directly so the companion mpv is audible underneath.
+
+        Why both: setting <video>.muted in JS only stops Chromium
+        from sending samples FROM that element, but Chromium's
+        per-process audio node stays connected to the PA sink and
+        whatever it's playing (including the muted-but-still-decoded
+        audio track) competes with mpv's stream. Muting at the
+        sink-input level cuts Chromium out of the mix cleanly so the
+        companion is audible.
 
         state.muted is the user mute toggle and shouldn't be touched
         here. video_mute_override is its own flag, ORed onto state.
@@ -986,6 +1065,10 @@ class BrowserController:
         with self._state_lock:
             self._state["video_mute_override"] = bool(mute)
             self._write_state()
+        try:
+            _set_chromium_sink_input_mute(bool(mute))
+        except Exception as exc:
+            _log("companion_chromium_mute_failed", error=str(exc))
 
 
 class MpvCompanion:
