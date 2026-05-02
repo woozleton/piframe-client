@@ -119,14 +119,22 @@ chown -R "${USER_UID}:${USER_GID}" "${VENV_DIR}"
 cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=PiFrame Client
+# Soft dependencies (Wants/After only) so a flaky network or NAS
+# mount at boot doesn't block the service indefinitely. The client
+# itself reconnects to the WS server on its own retry loop and
+# tolerates a briefly-unavailable NAS - hard-requiring those units
+# meant any boot-time failure put the service in failed state and
+# kept it down until a manual systemctl start.
 After=network-online.target ${MOUNT_UNIT}
-Requires=network-online.target ${MOUNT_UNIT}
-Wants=network-online.target
+Wants=network-online.target ${MOUNT_UNIT}
 
 [Service]
 User=${SERVICE_USER}
 WorkingDirectory=${REPO_DIR}
 ExecStart=${VENV_DIR}/bin/python ${REPO_DIR}/piframe_client.py
+# Keep restarting on any failure so a transient boot-order race
+# (XDG_RUNTIME_DIR not yet created by logind, NAS mount slow, etc)
+# resolves itself within one or two retries.
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -137,6 +145,13 @@ Environment=PIFRAME_NAS_ROOT=${NAS_ROOT}
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Enable user lingering so /run/user/<uid> exists at boot without an
+# interactive login. Cage + Chromium need that directory for the
+# Wayland socket, and without lingering it only appears after the
+# user logs in - so the service starts at multi-user.target before
+# the runtime dir is created and chromium fails to open a window.
+loginctl enable-linger "${SERVICE_USER}"
 
 systemctl daemon-reload
 systemctl enable --now seatd
