@@ -1041,19 +1041,18 @@ def render_browser_html(
       // Visual mute: when the companion is active AND mute_visual
       // is set (override-embedded-audio path), force the visual
       // <video> elements muted so the companion audio is the only
-      // thing the user hears. When inactive, restore the user/state-
-      // configured mute (state.muted is the canonical user toggle,
-      // dataset.desiredMuted carries that through transitions).
+      // thing the user hears. When inactive, do NOTHING - the
+      // existing applyLiveAudioState already restores muted state
+      // every poll from state.muted, and double-touching here was
+      // racing with the load path's own muted setup (the new video
+      // was getting muted because dataset.desiredMuted hadn't been
+      // refreshed yet by startFromState).
       const muteVisual = !!(comp && comp.mute_visual && wantActive);
-      stages.forEach((stage) => {{
-        if (!stage.video) return;
-        if (muteVisual) {{
-          stage.video.muted = true;
-        }} else {{
-          // Restore the user/state-configured mute state.
-          stage.video.muted = stage.video.dataset.desiredMuted === "true" || !!state.muted;
-        }}
-      }});
+      if (muteVisual) {{
+        stages.forEach((stage) => {{
+          if (stage.video) stage.video.muted = true;
+        }});
+      }}
 
       // Volume: companion follows the surface's volume + user mute,
       // so the volume slider on the operator's UI always controls
