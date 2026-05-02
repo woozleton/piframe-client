@@ -324,28 +324,40 @@ companion implementation silent in mid-stream toggles. mpv opens
 its own audio stream which the OS audio server mixes with
 Chromium's at the kernel level.
 
-### OS-level audio mixer requirement
+### Required: PipeWire + pipewire-pulse
 
-**Bare ALSA is single-stream**: whichever process opens the audio
-device first holds it exclusive, the second gets silence. For
-companion playback to work alongside a Chromium `<video>`, the Pi
-needs a userspace mixer:
-
-- **PipeWire** (recommended, modern default on Raspberry Pi OS):
+The companion path requires three pieces that work together:
 
 ```bash
-sudo apt install pipewire pipewire-pulse wireplumber
+sudo apt install pipewire pipewire-pulse wireplumber pulseaudio-utils
 systemctl --user --now enable pipewire pipewire-pulse wireplumber
 ```
 
-- **PulseAudio** also works.
+What each piece does:
 
-- **ALSA dmix** as a last resort - configure `~/.asoundrc` with a
-  dmix plugin pointing at the HDMI device.
+- `pipewire` + `wireplumber` - the actual audio server that mixes
+  multiple streams into one HDMI output. Without this, bare ALSA
+  is single-stream and the second process opening the device gets
+  silence.
+- `pipewire-pulse` - the PulseAudio compatibility layer. mpv is
+  configured to use `--ao=pulse` so it goes through this layer
+  (which auto-routes the stream to the default sink). Without it
+  mpv connects to PipeWire as a "raw" producer that isn't routed
+  to any sink and the companion stays inaudible.
+- `pulseaudio-utils` - provides `pactl`, used by the client to
+  mute Chromium's sink-input when the override-embedded-audio
+  toggle is on. Without `pactl` the helper bails silently and
+  Chromium's video audio drowns out the companion.
+
+PulseAudio classic also works as a substitute for `pipewire +
+pipewire-pulse + wireplumber`, but PipeWire is the modern default
+on Raspberry Pi OS.
 
 The client logs the detected mixer on startup under `audio_server=`.
-If it logs `audio_server=alsa-only`, an `audio_mixer_warning` event
-follows explaining what to install.
+If it logs `audio_server=alsa-only`, an `audio_mixer_warning`
+follows explaining what to install. `pactl` availability is
+checked at mute time; missing-pactl shows up as
+`companion_chromium_mute_failed` events.
 
 ### Companion mpv
 
@@ -355,6 +367,32 @@ follows explaining what to install.
 - log: `/tmp/piframe_companion_mpv.log`
 - volume: tracks the surface volume the operator sets via the
   manager UI (forwarded on every `volume` command)
+- audio output: `--ao=pulse` so PipeWire's auto-router connects
+  it to the default HDMI sink. Without this flag mpv decodes
+  audio but it's not wired to any sink (visible in `pw-link -l`
+  - mpv's output ports show no `|->` connection)
+
+### Override-embedded-audio path
+
+When the operator toggles "Companion replaces video sound":
+
+1. server marks the surface with `override_embedded_audio: true`,
+   re-evaluates the routing, sends `audio_playlist` with
+   `is_companion: true, mute_visual: true`
+2. Pi-side `_set_companion_state` writes `video_mute_override`
+   to the renderer state (so `<video>.muted` becomes true) AND
+   calls `_set_chromium_sink_input_mute(true)` which runs
+   `pactl set-sink-input-mute` against Chromium's PipeWire stream
+3. companion mpv plays into HDMI via the same mixer
+
+Both mute actions are needed:
+
+- `<video>.muted = true` alone isn't enough because Chromium's
+  PipeWire node stays connected to the sink and emits decoded
+  samples that compete with mpv in the mixer
+- `pactl set-sink-input-mute` alone isn't enough because future
+  videos load with their own audio that competes until the next
+  re-evaluation runs
 
 ### Per-Pi setup
 
@@ -370,6 +408,24 @@ state in this order:
 systemctl --user status pipewire pipewire-pulse 2>&1 | head
 pactl info 2>&1 | head
 aplay -l
+```
+
+If the audio companion is silent while video plays:
+
+```bash
+# Is mpv's stream wired into the HDMI sink?
+pw-link -l | grep -E "mpv|hdmi"
+# Expected: mpv:output_FL/FR have |-> arrows pointing at
+# alsa_output...hdmi.hdmi-stereo:playback_FL/FR
+
+# Is mpv's stream muted at the PA layer?
+pactl list sink-inputs | grep -B 2 -A 10 -i "mpv" | head -30
+# Look for Volume:/Mute: lines
+
+# Is pactl finding Chromium when override is on?
+journalctl -u piframe-client -b | grep companion_chromium_mute
+# Expected: count=1 muted=True (when override on),
+#           count=1 muted=False (when override off / cleared)
 ```
 
 ## Persisted Client Settings
