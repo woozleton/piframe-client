@@ -840,10 +840,17 @@ class BrowserController:
         return None
 
     def _make_item(self, path_str: str) -> Dict[str, Any]:
+        ext = Path(path_str.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
         return {
             "src": Path(path_str).as_uri(),
             "label": Path(path_str).name,
             "kind": self._item_kind(path_str),
+            # is_audio is the renderer's hook for the audio visualization
+            # overlay. The kind stays "video" so playback / next-prev /
+            # repeat logic works unchanged through the existing
+            # <video> path; this flag just tells the browser to paint
+            # the audio overlay on top of the (otherwise blank) video.
+            "is_audio": ext in AUDIO_EXTENSIONS,
         }
 
     def _write_state(self) -> None:

@@ -293,6 +293,36 @@ def render_browser_html(
       font-size: 12px;
       line-height: 1.3;
     }}
+    /* Audio visualizer overlay (Phase 11 skeleton).
+       Fullscreen layer above the stages, only shown while the active
+       item carries is_audio=true. Painted via <canvas> at 30fps - the
+       deliberate cap keeps Pi 5 well under thermal throttle even on
+       cheap board chassis. The actual visualization is intentionally
+       minimal (sweeping playhead over a soft gradient) so we can
+       measure render headroom before layering on FFT-driven bars. */
+    .audio-vis {{
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .35s ease;
+      z-index: 4;
+      background:
+        radial-gradient(
+          ellipse at center,
+          rgba(70, 50, 110, 0.55) 0%,
+          rgba(20, 14, 35, 0.88) 60%,
+          rgba(8, 5, 14, 1) 100%
+        );
+    }}
+    .audio-vis.is-active {{
+      opacity: 1;
+    }}
+    .audio-vis canvas {{
+      display: block;
+      width: 100%;
+      height: 100%;
+    }}
   </style>
 </head>
 <body>
@@ -316,6 +346,14 @@ def render_browser_html(
          loading or autoplay on display:none media elements. -->
     <audio id="companionAudio" preload="auto"
            style="position:absolute; left:-9999px; width:1px; height:1px;"></audio>
+    <!-- Audio visualizer overlay. Hidden by default; the renderer
+         flips .is-active when the current item is_audio=true. The
+         canvas is sized 1:1 with the frame in JS via the resize
+         observer so the device-pixel-ratio scale matches the
+         drawing surface. -->
+    <div id="audioVis" class="audio-vis" aria-hidden="true">
+      <canvas id="audioVisCanvas"></canvas>
+    </div>
   </div>
   <div id="banner" class="banner"></div>
   <div id="osd" class="osd">
@@ -834,6 +872,136 @@ def render_browser_html(
       setHud(item, state, perItemSeconds);
     }}
 
+    /* =================================================================
+       Audio visualizer (Phase 11 skeleton).
+       ----------------------------------------------------------------
+       Owns the #audioVis canvas. Activates when the current item is
+       is_audio=true. The skeleton renders a sweeping playhead +
+       gentle gradient sweep at 30fps - enough to validate Pi 5 paint
+       cost before layering on FFT-driven bars / OSD.
+       ----------------------------------------------------------------
+       Pi 5 cost notes:
+         - Canvas redraw is the dominant cost. We cap to 30fps via a
+           manual frame-time gate (rAF skips alternate frames).
+         - The canvas is sized to the device-pixel-ratio of the
+           viewport, NOT the display's full resolution - on a 4K Pi
+           that would be 8MP per frame which is absurd. window dpr
+           gives us the actual rendered pixels.
+         - Gradient strokes are computed once per resize and cached;
+           per-frame work is just `clearRect` + a few `fillRect`s
+           and one `strokeStyle` change. ~0.5ms on a Pi 5 GPU.
+       ================================================================= */
+    const audioVis = (() => {{
+      const root = document.getElementById("audioVis");
+      const canvas = document.getElementById("audioVisCanvas");
+      const ctx = canvas ? canvas.getContext("2d", {{ alpha: true }}) : null;
+      let active = false;
+      let videoEl = null;
+      let item = null;
+      let rafHandle = null;
+      let lastFrame = 0;
+      const frameMinMs = 1000 / 30;  // 30fps cap
+      let cssW = 0;
+      let cssH = 0;
+
+      function resize() {{
+        if (!canvas || !ctx) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const rect = root.getBoundingClientRect();
+        cssW = Math.max(1, Math.round(rect.width));
+        cssH = Math.max(1, Math.round(rect.height));
+        canvas.width = Math.round(cssW * dpr);
+        canvas.height = Math.round(cssH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      }}
+
+      function render(now) {{
+        if (!active || !ctx) return;
+        if (now - lastFrame < frameMinMs) {{
+          rafHandle = window.requestAnimationFrame(render);
+          return;
+        }}
+        lastFrame = now;
+        // Background-only - the gradient lives in CSS so this just
+        // paints the moving foreground over a transparent canvas.
+        ctx.clearRect(0, 0, cssW, cssH);
+
+        // Track progress derived from the playing <video> element.
+        // currentTime / duration are NaN until metadata loads, so
+        // fall back to a slow 30s sweep if we don't have it yet.
+        let progress = 0;
+        if (videoEl
+            && Number.isFinite(videoEl.duration)
+            && videoEl.duration > 0
+            && Number.isFinite(videoEl.currentTime)) {{
+          progress = videoEl.currentTime / videoEl.duration;
+        }} else {{
+          progress = ((now / 1000) % 30) / 30;
+        }}
+
+        // Centerline pulse: a soft horizontal band that breathes with
+        // a sine driven by the wall clock. Cheap and gives the surface
+        // a sense of "alive" without any FFT.
+        const breathPhase = (now / 1500) % (Math.PI * 2);
+        const breath = 0.5 + 0.5 * Math.sin(breathPhase);
+        const bandH = cssH * (0.10 + 0.06 * breath);
+        const bandY = (cssH - bandH) / 2;
+        const grd = ctx.createLinearGradient(0, bandY, 0, bandY + bandH);
+        grd.addColorStop(0, "rgba(196, 168, 235, 0)");
+        grd.addColorStop(0.5, "rgba(196, 168, 235, " + (0.16 + 0.10 * breath).toFixed(3) + ")");
+        grd.addColorStop(1, "rgba(196, 168, 235, 0)");
+        ctx.fillStyle = grd;
+        ctx.fillRect(0, bandY, cssW, bandH);
+
+        // Sweeping playhead: a vertical line tracking the track's
+        // progress. Width tapers via three layered fillRects (cheap
+        // glow alternative to shadowBlur, which is expensive on Pi).
+        const x = Math.round(progress * cssW);
+        ctx.fillStyle = "rgba(196, 168, 235, 0.15)";
+        ctx.fillRect(x - 6, 0, 12, cssH);
+        ctx.fillStyle = "rgba(196, 168, 235, 0.30)";
+        ctx.fillRect(x - 2, 0, 4, cssH);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+        ctx.fillRect(x - 1, 0, 2, cssH);
+
+        rafHandle = window.requestAnimationFrame(render);
+      }}
+
+      function start(itemRef, video) {{
+        if (!root || !ctx) return;
+        item = itemRef;
+        videoEl = video;
+        active = true;
+        root.classList.add("is-active");
+        root.setAttribute("aria-hidden", "false");
+        resize();
+        if (rafHandle == null) {{
+          rafHandle = window.requestAnimationFrame(render);
+        }}
+      }}
+
+      function stop() {{
+        active = false;
+        item = null;
+        videoEl = null;
+        if (root) {{
+          root.classList.remove("is-active");
+          root.setAttribute("aria-hidden", "true");
+        }}
+        if (rafHandle != null) {{
+          window.cancelAnimationFrame(rafHandle);
+          rafHandle = null;
+        }}
+        if (ctx) ctx.clearRect(0, 0, cssW, cssH);
+      }}
+
+      window.addEventListener("resize", () => {{
+        if (active) resize();
+      }});
+
+      return {{ start, stop }};
+    }})();
+
     function renderItem(item, state, perItemSeconds) {{
       if (!item) {{
         return;
@@ -841,6 +1009,13 @@ def render_browser_html(
       const targetStage = getInactiveStage();
       prepareStage(targetStage, item, state, perItemSeconds);
       activateStage(targetStage);
+      // Audio items: paint the visualizer over the (otherwise blank)
+      // <video>. Video / image items: kill the visualizer.
+      if (item && item.is_audio) {{
+        audioVis.start(item, targetStage.video);
+      }} else {{
+        audioVis.stop();
+      }}
       const previousStage = getInactiveStage();
       if (previousStage.resetHandle) {{
         window.clearTimeout(previousStage.resetHandle);
