@@ -375,6 +375,34 @@ def render_browser_html(
           rgba(6, 4, 16, 0) 82%,
           rgba(6, 4, 16, 0.85) 100%);
     }}
+    /* Preset-name overlay. Bottom-anchored, semi-transparent dark
+       pill. Fades on each preset change so the name reads as a
+       label rather than a permanent UI chrome strip. Mono font for
+       legibility against busy plasma backgrounds. */
+    .audio-vis__preset-name {{
+      position: absolute;
+      left: 50%;
+      bottom: 6%;
+      transform: translateX(-50%);
+      max-width: 90%;
+      padding: 8px 16px;
+      background: rgba(0, 0, 0, 0.55);
+      color: rgba(255, 255, 255, 0.92);
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      font-size: 14px;
+      letter-spacing: 0.02em;
+      border-radius: 6px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .4s ease;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      max-width: min(86%, 720px);
+    }}
+    .audio-vis__preset-name.is-visible {{
+      opacity: 1;
+    }}
   </style>
 </head>
 <body>
@@ -407,6 +435,7 @@ def render_browser_html(
       <div id="audioVisArt" class="audio-vis__art"></div>
       <canvas id="audioVisCanvas"></canvas>
       <div class="audio-vis__vignette"></div>
+      <div id="audioVisPresetName" class="audio-vis__preset-name" aria-hidden="true"></div>
     </div>
   </div>
   <div id="banner" class="banner"></div>
@@ -957,6 +986,7 @@ def render_browser_html(
       const root = document.getElementById("audioVis");
       const canvas = document.getElementById("audioVisCanvas");
       const artEl = document.getElementById("audioVisArt");
+      const presetNameEl = document.getElementById("audioVisPresetName");
 
       let audioCtx = null;
       let analyserAudio = null;
@@ -966,7 +996,7 @@ def render_browser_html(
       let presetNames = [];
       let presetIdx = 0;
       let presetCycleHandle = null;
-      const PRESET_CYCLE_MS = 45000;
+      const PRESET_CYCLE_MS = 5000;
 
       let active = false;
       let videoEl = null;
@@ -1222,7 +1252,14 @@ def render_browser_html(
         const name = presetNames[presetIdx];
         const preset = presets[name];
         if (preset) {{
-          viz.loadPreset(preset, 1.5);
+          // Shorter blend (0.6s) since the cycle interval is short -
+          // a longer dissolve makes consecutive presets all look
+          // like the same dissolving mush.
+          viz.loadPreset(preset, 0.6);
+          if (presetNameEl) {{
+            presetNameEl.textContent = name;
+            presetNameEl.classList.add("is-visible");
+          }}
           // Start sampling AFTER the blend completes so the blend
           // dissolve doesn't get charged against the new preset's
           // FPS budget.
@@ -1231,7 +1268,7 @@ def render_browser_html(
             if (!active) return;
             presetSampleStart = performance.now();
             presetFrameCount = 0;
-          }}, 1700);
+          }}, 800);
         }}
       }}
 
@@ -1353,6 +1390,7 @@ def render_browser_html(
           root.setAttribute("aria-hidden", "true");
         }}
         if (artEl) artEl.classList.remove("is-loaded");
+        if (presetNameEl) presetNameEl.classList.remove("is-visible");
         stopAnalyser();
         if (start.syncTimer) {{
           window.clearInterval(start.syncTimer);
