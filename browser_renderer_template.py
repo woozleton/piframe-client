@@ -869,15 +869,35 @@ def render_browser_html(
       video.play().catch(() => {{}});
     }}
 
+    let lastForceMute = false;
     function applyLiveAudioState(state) {{
       const forceMute = !!state.video_mute_override;
       const userMuted = !!state.muted;
       const userVol = Math.max(0, Math.min(1, (state.volume || 0) / 100));
+      const forceMuteJustChanged = forceMute !== lastForceMute;
+      lastForceMute = forceMute;
       for (const stage of stages) {{
         stage.video.dataset.desiredMuted = userMuted.toString();
         stage.video.dataset.desiredVolume = userVol.toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : userVol;
+        // ALSA on Pi often won't release the audio device when a
+        // <video> just goes muted - the decoder stays open and the
+        // companion <audio> element can't claim HDMI. Force a quick
+        // pause + currentTime nudge + resume when forceMute toggles
+        // mid-playback so the audio pipeline resets cleanly.
+        if (forceMuteJustChanged && stage.video.style.display === "block") {{
+          const wasPlaying = !stage.video.paused;
+          if (wasPlaying) {{
+            try {{
+              stage.video.pause();
+              const t = stage.video.currentTime;
+              stage.video.currentTime = t;
+              // Resume next tick so the pause/seek lands first.
+              setTimeout(() => {{ stage.video.play().catch(() => {{}}); }}, 0);
+            }} catch (_) {{ /* best-effort */ }}
+          }}
+        }}
       }}
       const nextVolume = Number(state.volume || 0);
       const nextMuted = !!state.muted;
