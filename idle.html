@@ -5,15 +5,17 @@
 <title>WoozleScape - Glass</title>
 <style>
   /* ===== USER CONFIG ===== */
-  :root {
-    --interval: 30s;
-    --logo-width: 30%;
-    --horizon: 50%;
-    --gap: 18px;
-    --reflection-opacity: 0.2;
-    --reflection-blur: 1px;
-    --glow-opacity: 0.10;
-    --glow-color: 209;
+	:root {
+	  --cycle: 60s;
+	  --interval: 5s;
+	  --logo-width: 38%;
+	  --horizon: 50%;
+	  --gap: 21px;
+	  --reflection-opacity: 0.2;
+	  --reflection-blur: 1px;
+	  --glow-opacity: 0;
+	  --glow-color: 0;
+
 
     /* o piece geometry — derived from logo PNG, do not change */
     --o1-left: 34.20%;
@@ -181,16 +183,16 @@
   .o-2, .o-2-refl { left: var(--o2-left); }
 
   body.mode-swap .o-1 {
-    animation: swap-1 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-1 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   body.mode-swap .o-2 {
-    animation: swap-2 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-2 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   body.mode-swap .o-1-refl {
-    animation: swap-1-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-1-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   body.mode-swap .o-2-refl {
-    animation: swap-2-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-2-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
 
   @keyframes swap-1 {
@@ -215,16 +217,16 @@
   }
 
   body.mode-swap-3d .o-1 {
-    animation: swap-3d-1 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-3d-1 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   body.mode-swap-3d .o-2 {
-    animation: swap-3d-2 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-3d-2 var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   body.mode-swap-3d .o-1-refl {
-    animation: swap-3d-1-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-3d-1-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   body.mode-swap-3d .o-2-refl {
-    animation: swap-3d-2-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: swap-3d-2-refl var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   @keyframes swap-3d-1 {
     0%, 50%   { transform: translate(0, 0) rotateY(0deg); }
@@ -273,10 +275,10 @@
   /* === MOTION MODES === */
 
   body.mode-pulse .logo-wrap {
-    animation: pulse-glow var(--interval) ease-in-out infinite;
+    animation: pulse-glow var(--interval) ease-in-out 1 forwards;
   }
   body.mode-pulse .pool {
-    animation: pulse-pool var(--interval) ease-in-out infinite;
+    animation: pulse-pool var(--interval) ease-in-out 1 forwards;
   }
   @keyframes pulse-glow {
     0%, 70%, 100% {
@@ -302,7 +304,7 @@
     width: 30%;
     height: 100%;
     transform: translateX(-100vw);
-    animation: drift-glint var(--interval) linear infinite;
+    animation: drift-glint var(--interval) linear 1 forwards;
   }
   @keyframes drift-glint {
     0%   { transform: translateX(-100vw); }
@@ -319,7 +321,7 @@
     background-repeat: no-repeat;
     mix-blend-mode: overlay;
     opacity: 1;
-    animation: shimmer-mask var(--interval) ease-in-out infinite;
+    animation: shimmer-mask var(--interval) ease-in-out 1 forwards;
   }
   @keyframes shimmer-mask {
     0%, 30%   { background-position: 200% 0; }
@@ -338,7 +340,7 @@
     background-repeat: no-repeat;
     mix-blend-mode: screen;
     opacity: 1;
-    animation: scan-mask var(--interval) ease-in-out infinite;
+    animation: scan-mask var(--interval) ease-in-out 1 forwards;
   }
   @keyframes scan-mask {
     0%, 30%   { background-position: 0 -100%; }
@@ -347,7 +349,7 @@
 
   body.mode-spin .logo-real,
   body.mode-spin .refl-animator {
-    animation: spin var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: spin var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
   }
   @keyframes spin {
     0%, 60%   { transform: rotateY(0deg); }
@@ -355,11 +357,11 @@
   }
 
   body.mode-tilt .logo-real {
-    animation: tilt var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: tilt var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
     transform-origin: bottom center;
   }
   body.mode-tilt .refl-animator {
-    animation: tilt var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: tilt var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
     transform-origin: top center;
   }
   @keyframes tilt {
@@ -369,11 +371,11 @@
   }
 
   body.mode-pop .logo-real {
-    animation: pop var(--interval) cubic-bezier(0.34, 1.56, 0.64, 1) infinite;
+    animation: pop var(--interval) cubic-bezier(0.34, 1.56, 0.64, 1) 1 forwards;
     transform-origin: bottom center;
   }
   body.mode-pop .refl-animator {
-    animation: pop var(--interval) cubic-bezier(0.34, 1.56, 0.64, 1) infinite;
+    animation: pop var(--interval) cubic-bezier(0.34, 1.56, 0.64, 1) 1 forwards;
     transform-origin: top center;
   }
   @keyframes pop {
@@ -386,7 +388,7 @@
 
   body.mode-stretch .logo-real,
   body.mode-stretch .refl-animator {
-    animation: stretch var(--interval) cubic-bezier(0.65, 0, 0.35, 1) infinite;
+    animation: stretch var(--interval) cubic-bezier(0.65, 0, 0.35, 1) 1 forwards;
     transform-origin: center;
   }
   @keyframes stretch {
@@ -396,11 +398,11 @@
   }
 
   body.mode-wobble .logo-real {
-    animation: wobble var(--interval) cubic-bezier(0.36, 0, 0.66, -0.56) infinite;
+    animation: wobble var(--interval) cubic-bezier(0.36, 0, 0.66, -0.56) 1 forwards;
     transform-origin: bottom center;
   }
   body.mode-wobble .refl-animator {
-    animation: wobble var(--interval) cubic-bezier(0.36, 0, 0.66, -0.56) infinite;
+    animation: wobble var(--interval) cubic-bezier(0.36, 0, 0.66, -0.56) 1 forwards;
     transform-origin: top center;
   }
   @keyframes wobble {
@@ -417,7 +419,7 @@
   body.mode-hue .logo-reflection-no-o,
   body.mode-hue .o-piece,
   body.mode-hue .o-piece-refl {
-    animation: hue-cycle calc(var(--interval) * 4) linear infinite;
+    animation: hue-cycle calc(var(--interval) * 4) linear 1 forwards;
   }
   @keyframes hue-cycle {
     0%   { filter: hue-rotate(0deg); }
@@ -585,6 +587,11 @@
           <input type="checkbox" id="rotateToggle" checked onchange="toggleRotation()">
           <label for="rotateToggle" style="font-size:11px;color:rgba(255,255,255,0.7);">Random rotation</label>
         </div>
+        <div class="control-row" style="margin-top:8px;">
+          <span class="control-label">Switch every</span>
+          <input type="range" min="10" max="300" step="5" value="60" data-var="--cycle" data-suffix="s">
+          <span class="control-value" data-display="--cycle">60s</span>
+        </div>
       </div>
 
       <div class="section">
@@ -605,9 +612,9 @@
           <button class="mode-btn" data-mode="none" onclick="setMode(this, true)">Still</button>
         </div>
         <div class="control-row" style="margin-top:10px;">
-          <span class="control-label">Cycle</span>
-          <input type="range" min="5" max="120" step="1" value="60" data-var="--interval" data-suffix="s">
-          <span class="control-value" data-display="--interval">60s</span>
+          <span class="control-label">Animation</span>
+          <input type="range" min="2" max="20" step="1" value="5" data-var="--interval" data-suffix="s">
+          <span class="control-value" data-display="--interval">5s</span>
         </div>
       </div>
 
@@ -670,10 +677,11 @@
 
 <script>
   // ===== Mode rotation =====
-  // Reads --interval from CSS :root above. To change the cycle, edit that.
-  function getIntervalMs() {
+  // Reads --cycle from CSS :root (how often to switch modes).
+  // --interval drives the animation duration (how long each effect takes).
+  function getCycleMs() {
     const val = getComputedStyle(document.documentElement)
-      .getPropertyValue('--interval').trim();
+      .getPropertyValue('--cycle').trim();
     const num = parseFloat(val);
     return isNaN(num) ? 60000 : num * 1000;
   }
@@ -704,7 +712,7 @@
   }
 
   function getRotateIntervalMs() {
-    return getIntervalMs();
+    return getCycleMs();
   }
 
   function startRotation() {
@@ -722,10 +730,16 @@
 
   // Wait until DOM is fully ready, then kick off
   function init() {
-    console.log('[woozlescape] Initializing, interval:', getIntervalMs(), 'ms');
+    console.log('[woozlescape] Initializing. Cycle:', getCycleMs(), 'ms');
     applyMode(pickRandomMode());
     startRotation();
   }
+
+  // Re-trigger animation when mode switches by toggling a class.
+  // Otherwise CSS animations only run on initial paint with `1 forwards`.
+  // We do this by removing then re-adding the body class on each switch.
+  // (applyMode already does this via className=, which is enough — the
+  // animation will play because the new class brings new animation rules.)
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
@@ -749,7 +763,7 @@
     root.style.setProperty(varName, val + suffix);
 
     // If the cycle interval changed, restart the rotation timer
-    if (varName === '--interval') {
+    if (varName === '--cycle') {
       startRotation();
     }
     updateCSSOutput();
@@ -790,7 +804,7 @@
     const defaults = {
       '--logo-width': 53, '--horizon': 49, '--gap': 18,
       '--reflection-opacity': 0.3, '--reflection-blur': 1,
-      '--glow-opacity': 0.35, '--glow-color': 209, '--interval': 60
+      '--glow-opacity': 0.35, '--glow-color': 209, '--interval': 5, '--cycle': 60
     };
     Object.entries(defaults).forEach(([key, val]) => {
       const slider = document.querySelector(`[data-var="${key}"]`);
