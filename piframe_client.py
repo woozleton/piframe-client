@@ -353,6 +353,67 @@ def _read_client_version() -> Optional[str]:
     return sha or None
 
 
+def _detect_audio_server() -> str:
+    """Return one of: 'pipewire', 'pulseaudio', 'alsa-only'.
+
+    Bare ALSA is single-stream by default - whichever process opens
+    the audio device first holds it exclusive. The audio companion
+    (mpv sidecar) won't be audible while Chromium's <video> is
+    playing through the same device. PA / PipeWire add a userspace
+    mixer that splits one audio device across N processes.
+
+    Detection order:
+      1. pactl (PA CLI) - succeeds when either real PA or
+         pipewire-pulse is running. Output mentions "PipeWire" when
+         it's the latter.
+      2. pgrep for the daemon names directly.
+      3. /run/user/<uid>/{pulse,pipewire-0} sockets - lighter than
+         spawning subprocesses.
+    """
+    pactl = shutil.which("pactl")
+    if pactl:
+        try:
+            result = subprocess.run(
+                [pactl, "info"],
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+            if result.returncode == 0:
+                if "PipeWire" in (result.stdout or ""):
+                    return "pipewire"
+                return "pulseaudio"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for name in ("pipewire", "pipewire-pulse", "wireplumber"):
+        if shutil.which("pgrep"):
+            try:
+                if subprocess.run(
+                    ["pgrep", "-x", name],
+                    capture_output=True, timeout=2, check=False,
+                ).returncode == 0:
+                    return "pipewire"
+            except (OSError, subprocess.SubprocessError):
+                pass
+    if shutil.which("pgrep"):
+        try:
+            if subprocess.run(
+                ["pgrep", "-x", "pulseaudio"],
+                capture_output=True, timeout=2, check=False,
+            ).returncode == 0:
+                return "pulseaudio"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        uid = os.geteuid()
+        runtime = Path(f"/run/user/{uid}")
+        if (runtime / "pipewire-0").exists():
+            return "pipewire"
+        if (runtime / "pulse" / "native").exists():
+            return "pulseaudio"
+    except Exception:
+        pass
+    return "alsa-only"
+
+
 def _load_client_settings(path: Path) -> Dict[str, Any]:
     """Load small persisted client settings from disk."""
     try:
@@ -1248,6 +1309,7 @@ class PiFrameClient:
 
     def run(self) -> None:
         mpv_found = shutil.which(COMPANION_MPV_BIN)
+        audio_server = _detect_audio_server()
         _log(
             "client_starting",
             client_id=self.config.client_id,
@@ -1255,7 +1317,19 @@ class PiFrameClient:
             server=self.config.server,
             group=self.config.group,
             companion_mpv=mpv_found or "missing",
+            audio_server=audio_server,
         )
+        if audio_server == "alsa-only":
+            _log(
+                "audio_mixer_warning",
+                msg=(
+                    "Neither PulseAudio nor PipeWire detected. Bare ALSA "
+                    "is single-stream: the audio companion will not be "
+                    "audible while a Chromium <video> is playing through "
+                    "the same device. Install pipewire+pipewire-pulse OR "
+                    "configure ~/.asoundrc with a dmix plugin."
+                ),
+            )
         while True:
             try:
                 app = websocket.WebSocketApp(
