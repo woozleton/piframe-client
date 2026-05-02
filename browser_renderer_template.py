@@ -950,7 +950,10 @@ def render_browser_html(
         const kind = nextMuted || nextVolume <= 0 ? "mute" : "volume";
         const value = nextMuted || nextVolume <= 0 ? "" : `${{Math.round(nextVolume)}}%`;
         const label = nextMuted || nextVolume <= 0 ? "Muted" : "";
-        showOsd(kind, value, label, nextMuted ? 0 : nextVolume, 1000);
+        // 2500ms gives a TV-style "I see the change" window without
+        // lingering. Earlier 1000ms was so short rapid +/- presses
+        // would let the OSD vanish between bumps.
+        showOsd(kind, value, label, nextMuted ? 0 : nextVolume, 2500);
       }}
       lastVolume = nextVolume;
       lastMuted = nextMuted;
