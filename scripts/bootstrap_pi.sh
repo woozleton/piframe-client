@@ -87,7 +87,12 @@ if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then
     python3 \
     python3-venv \
     python3-pip \
-    alsa-utils
+    alsa-utils \
+    mpv \
+    pipewire \
+    pipewire-pulse \
+    wireplumber \
+    pulseaudio-utils
 fi
 
 if [[ -n "${ORIGIN_URL}" && "${ORIGIN_URL}" == https://github.com/* ]]; then
@@ -152,6 +157,14 @@ EOF
 # user logs in - so the service starts at multi-user.target before
 # the runtime dir is created and chromium fails to open a window.
 loginctl enable-linger "${SERVICE_USER}"
+
+# Pi's default HDMI sink volume defaults vary (some boards come up at
+# ~40%). Force the user-default sink to 100% so the OVR mute path and
+# companion playback are audible without per-Pi tweaks. Runs as the
+# service user because sinks are per-user under PipeWire.
+sudo -u "${SERVICE_USER}" \
+  XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
+  pactl set-sink-volume @DEFAULT_SINK@ 100% 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable --now seatd
