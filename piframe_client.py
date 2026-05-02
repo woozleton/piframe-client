@@ -730,6 +730,13 @@ class BrowserController:
             "--password-store=basic",
             "--allow-file-access-from-files",
             "--autoplay-policy=no-user-gesture-required",
+            # Force EGL + ignore the GPU blocklist so WebGL works on
+            # the Pi's V3D driver. Without this, Butterchurn's WebGL
+            # context creation silently fails on some Chromium builds
+            # under cage+wayland and the audio visualizer shows blue.
+            "--use-gl=egl",
+            "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization",
             BROWSER_HTML_FILE.as_uri(),
         ]
         wlrctl_path = shutil.which(WLRCTL_BIN)
@@ -1415,6 +1422,18 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
                 BROWSER_EVENT_STATE.set_slideshow_index(idx)
         elif kind == "pause_state":
             BROWSER_EVENT_STATE.set_paused(bool(payload.get("paused")))
+        elif kind == "audio_visualizer_status":
+            # Forward to the regular log so init failures / runtime
+            # warnings show up in journalctl instead of being swallowed
+            # by the kiosk Chromium (which has no console output by
+            # default).
+            _log(
+                "audio_visualizer_status",
+                stage=str(payload.get("stage") or ""),
+                detail=str(payload.get("detail") or "")[:200],
+                has_butterchurn=bool(payload.get("has_butterchurn")),
+                has_presets=bool(payload.get("has_presets")),
+            )
         # Always return 204; CORS header lets the browser stop spamming
         # console errors when it crosses the file:// -> http:// boundary.
         self.send_response(204)

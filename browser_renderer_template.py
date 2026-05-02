@@ -977,6 +977,59 @@ def render_browser_html(
         return !!(window.butterchurn && window.butterchurnPresets);
       }}
 
+      function vizDiag(stage, detail) {{
+        // Surface visualizer init / runtime status to the parent
+        // process so we can diagnose blue-screen failures over the
+        // existing browser-event channel.
+        const payload = {{
+          type: "audio_visualizer_status",
+          stage: String(stage || ""),
+          detail: detail == null ? "" : String(detail),
+          has_butterchurn: !!window.butterchurn,
+          has_presets: !!window.butterchurnPresets,
+          ua: navigator.userAgent,
+        }};
+        try {{ console.log("[audioVis]", payload); }} catch (_) {{}}
+        if (!eventEndpoint) return;
+        try {{
+          fetch(eventEndpoint, {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_) {{}}
+      }}
+
+      function paintVizError(message) {{
+        // When init fails, paint the failure reason onto the canvas
+        // (using its 2D context separately from any GL context that
+        // may already be lost). Operators see it on screen instead
+        // of a silent blue.
+        if (!canvas) return;
+        try {{
+          const c = canvas.getContext("2d");
+          if (!c) return;
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const rot = (({rotation_degrees} % 360) + 360) % 360;
+          const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+          const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+          canvas.width = Math.round(w * dpr);
+          canvas.height = Math.round(h * dpr);
+          c.setTransform(dpr, 0, 0, dpr, 0, 0);
+          c.fillStyle = "#080612";
+          c.fillRect(0, 0, w, h);
+          c.fillStyle = "rgba(255,255,255,0.85)";
+          c.font = "16px system-ui, sans-serif";
+          c.textAlign = "center";
+          c.textBaseline = "middle";
+          c.fillText("Audio visualizer unavailable", w / 2, h / 2 - 14);
+          c.fillStyle = "rgba(255,255,255,0.55)";
+          c.font = "12px monospace";
+          c.fillText(String(message || ""), w / 2, h / 2 + 14);
+        }} catch (_) {{}}
+      }}
+
       function pickPresetNames(allMap) {{
         const all = Object.keys(allMap);
         const curated = all.filter((n) => {{
@@ -995,9 +1048,33 @@ def render_browser_html(
 
       function ensureViz() {{
         if (viz) return true;
-        if (!libAvailable()) return false;
+        if (!libAvailable()) {{
+          vizDiag("lib_missing", "butterchurn or presets bundle didn't load");
+          paintVizError("vendor scripts didn't load");
+          return false;
+        }}
+        // Probe WebGL availability up front so we get a useful error
+        // message instead of "createVisualizer threw."
+        try {{
+          const probe = document.createElement("canvas");
+          const gl = probe.getContext("webgl2") || probe.getContext("webgl");
+          if (!gl) {{
+            vizDiag("webgl_unavailable", "no WebGL context");
+            paintVizError("WebGL unavailable on this device");
+            return false;
+          }}
+        }} catch (probeErr) {{
+          vizDiag("webgl_probe_threw", probeErr && probeErr.message);
+          paintVizError("WebGL probe failed: " + (probeErr && probeErr.message || ""));
+          return false;
+        }}
         try {{
           const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) {{
+            vizDiag("audio_ctx_missing", "no AudioContext constructor");
+            paintVizError("AudioContext unavailable");
+            return false;
+          }}
           audioCtx = new Ctx();
           analyserAudio = document.createElement("audio");
           analyserAudio.crossOrigin = "anonymous";
@@ -1027,10 +1104,13 @@ def render_browser_html(
           presets = window.butterchurnPresets.getPresets();
           presetNames = pickPresetNames(presets);
           loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
+          vizDiag("ready", "preset_count=" + presetNames.length);
           return true;
         }} catch (err) {{
           viz = null;
           audioCtx = null;
+          vizDiag("init_threw", err && (err.stack || err.message) || "(unknown)");
+          paintVizError("init failed: " + (err && err.message || "unknown"));
           return false;
         }}
       }}
