@@ -367,15 +367,7 @@ def render_browser_html(
       height: 100%;
     }}
     .audio-vis__vignette {{
-      position: absolute;
-      inset: 0;
-      pointer-events: none;
-      background:
-        linear-gradient(180deg,
-          rgba(6, 4, 16, 0.85) 0%,
-          rgba(6, 4, 16, 0) 18%,
-          rgba(6, 4, 16, 0) 82%,
-          rgba(6, 4, 16, 0.85) 100%);
+      display: none;
     }}
     /* Track-name OSD. Shown for ~5s when a new audio item starts.
        Soft glassy pill, system serif/sans for a polished look (NOT
@@ -1051,16 +1043,15 @@ def render_browser_html(
       // shader work proportionally to the area ratio. The canvas
       // CSS size still fills the wrapper so the visual is fullscreen.
       const RENDER_SCALE = 0.6;     // 60% of viewport pixels
-      const TARGET_FPS = 30;
+      const TARGET_FPS = 60;
       const FRAME_MIN_MS = 1000 / TARGET_FPS;
       let lastFrameTime = 0;
-      // Auto-skip presets that consistently render below this FPS.
-      // Sampled over a 4-second window after each preset load.
-      const FPS_FLOOR = 18;
+      // FPS sampling - measured over a 4-second window after each
+      // preset load and reported to journalctl. No auto-blacklist;
+      // the operator picks which presets to keep based on the logs.
       const FPS_SAMPLE_MS = 4000;
       let presetSampleStart = 0;
       let presetFrameCount = 0;
-      const blacklistedPresets = new Set();
 
       function libAvailable() {{
         return !!(window.butterchurn && window.butterchurnPresets);
@@ -1248,16 +1239,7 @@ def render_browser_html(
 
       function loadPresetByIdx(idx) {{
         if (!viz || !presets || !presetNames.length) return;
-        // Skip blacklisted presets up to N rounds so we don't loop
-        // forever when most presets are bad on this device.
-        let attempts = 0;
-        let candidate = ((idx % presetNames.length) + presetNames.length) % presetNames.length;
-        while (attempts < presetNames.length
-               && blacklistedPresets.has(presetNames[candidate])) {{
-          candidate = (candidate + 1) % presetNames.length;
-          attempts++;
-        }}
-        presetIdx = candidate;
+        presetIdx = ((idx % presetNames.length) + presetNames.length) % presetNames.length;
         const name = presetNames[presetIdx];
         const preset = presets[name];
         if (preset) {{
@@ -1375,26 +1357,18 @@ def render_browser_html(
         }}
         lastFrameTime = now;
         viz.render();
-        // FPS sampling: if a freshly-loaded preset stays below
-        // FPS_FLOOR over the FPS_SAMPLE_MS window, blacklist it and
-        // jump to the next preset. Some MilkDrop presets do per-pixel
-        // shader work that's just too heavy for a Pi 5 GPU.
+        // FPS measurement only - we report a sample to journalctl so
+        // the operator can decide which presets to keep / drop. No
+        // auto-blacklist; the curated list is small enough that
+        // manual evaluation works better than a heuristic.
         if (presetSampleStart > 0) {{
           presetFrameCount++;
           const elapsed = now - presetSampleStart;
           if (elapsed >= FPS_SAMPLE_MS) {{
             const fps = (presetFrameCount * 1000) / elapsed;
             presetSampleStart = 0;
-            if (fps < FPS_FLOOR && presetNames[presetIdx]) {{
-              const name = presetNames[presetIdx];
-              blacklistedPresets.add(name);
-              vizDiag("preset_blacklisted",
-                "name=" + name + " fps=" + fps.toFixed(1));
-              nextPreset();
-            }} else {{
-              vizDiag("preset_fps_ok",
-                "name=" + (presetNames[presetIdx] || "?") + " fps=" + fps.toFixed(1));
-            }}
+            vizDiag("preset_fps",
+              "name=" + (presetNames[presetIdx] || "?") + " fps=" + fps.toFixed(1));
           }}
         }}
         rafHandle = window.requestAnimationFrame(render);
