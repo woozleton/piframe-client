@@ -1456,10 +1456,7 @@ class PiFrameClient:
             # running. The boot path already reads + consumes the file
             # in __init__, but the noop case (before==after) doesn't
             # restart the service, so the only way the marker reaches
-            # the server is for the running process to notice it. Once
-            # we've stashed a value, leave it in place - the server has
-            # its own TTL/auto-clear and we want every heartbeat to keep
-            # echoing the same record until then.
+            # the server is for the running process to notice it.
             if self.last_update is None:
                 marker = _read_and_consume_last_update()
                 if marker is not None:
@@ -1508,6 +1505,14 @@ class PiFrameClient:
                 self.ws_connection.send(json.dumps(snapshot))
             except Exception:
                 pass
+            else:
+                # One-shot delivery: drop the marker after a successful
+                # send so a second update click doesn't see this stale
+                # record and resolve the new attempt against an old SHA.
+                # The server stamps update_result + last_updated_at on
+                # receipt, so we don't need to keep echoing it.
+                if self.last_update is not None:
+                    self.last_update = None
 
 
 # ---------------------------------------------------------------------------
