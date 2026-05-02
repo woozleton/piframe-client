@@ -1042,8 +1042,13 @@ def render_browser_html(
       // Render at a fixed lower resolution and upscale via CSS - cuts
       // shader work proportionally to the area ratio. The canvas
       // CSS size still fills the wrapper so the visual is fullscreen.
-      const RENDER_SCALE = 0.6;     // 60% of viewport pixels
+      const RENDER_SCALE = 0.4;     // 40% of viewport pixels (~16% of native shader work)
       const TARGET_FPS = 60;
+      // Butterchurn warp/comp mesh density. Default is 48; dropping
+      // to 24 cuts vertex-shader work in half. Plasma presets tolerate
+      // this well; mesh-pattern-heavy presets (rare in our curated
+      // 5) get slightly chunkier warp boundaries but stay smooth.
+      const VIZ_MESH_SIZE = 24;
       const FRAME_MIN_MS = 1000 / TARGET_FPS;
       let lastFrameTime = 0;
       // FPS sampling - measured over a 4-second window after each
@@ -1210,6 +1215,8 @@ def render_browser_html(
             width: canvas.width,
             height: canvas.height,
             pixelRatio: dpr,
+            meshWidth: VIZ_MESH_SIZE,
+            meshHeight: VIZ_MESH_SIZE,
           }});
           viz.connectAudio(analyserSrc);
 
