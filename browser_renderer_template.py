@@ -15,6 +15,8 @@ def render_browser_html(
     nas_root: str,
     poll_ms: int,
     event_endpoint: str = "",
+    butterchurn_lib_uri: str = "",
+    butterchurn_presets_uri: str = "",
 ) -> str:
     """Render the self-contained Chromium kiosk page."""
     show_hud_css = "block" if show_hud else "none"
@@ -24,6 +26,14 @@ def render_browser_html(
         'url("data:image/png;base64,'
         'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s0qK1wAAAAASUVORK5CYII=") 0 0, none'
     )
+    # Butterchurn vendor script tags. Empty when the bundle isn't
+    # deployed; the visualizer JS gracefully no-ops in that case.
+    butterchurn_scripts = ""
+    if butterchurn_lib_uri and butterchurn_presets_uri:
+        butterchurn_scripts = (
+            f'<script src="{butterchurn_lib_uri}"></script>\n'
+            f'  <script src="{butterchurn_presets_uri}"></script>'
+        )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -415,6 +425,11 @@ def render_browser_html(
     <span id="fileName"></span>
     <span id="timing"></span>
   </div>
+  <!-- Vendor scripts: Butterchurn (MilkDrop port) + its preset
+       bundle. Loaded by file:// from /tmp/ alongside the HTML so
+       same-origin same-disk - no CORS, no network. Empty when the
+       vendor bundle isn't deployed; audioVis falls back to disabled. -->
+  {butterchurn_scripts}
   <script>
     const stateUrl = {json.dumps(state_file_uri)};
     const eventEndpoint = {json.dumps(event_endpoint)};
@@ -917,130 +932,131 @@ def render_browser_html(
     }}
 
     /* =================================================================
-       Audio visualizer.
+       Audio visualizer (Butterchurn / MilkDrop port).
        ----------------------------------------------------------------
-       FFT-driven visualization shown in place of the (blank) <video>
-       element while an audio file is playing. Decodes a parallel
-       silent <audio> element through Web Audio's AnalyserNode - the
-       audible audio is still produced by the existing <video>; this
-       second decode path exists purely to feed FFT data.
-
-       Layers (back -> front):
-         art       : procedural gradient backdrop, hue derived from
-                     a hash of the filename (deterministic per file).
-                     Animated via CSS scale (Ken Burns).
-         canvas    : FFT bars + bass pulse ring + breath glow.
-         vignette  : top/bottom soft fade so bars never touch a hard
-                     edge. (CSS only.)
-
-       Rotation: the wrapper is rotated via CSS (.audio-vis transform).
-       JS sizes the wrapper to the post-rotation viewport so the
-       canvas's drawing surface matches the rotated display
-       (e.g. 1080x1920 portrait when the device is 1920x1080 with a
-       90/270deg rotation).
-
-       Pi 5 cost target: ~10-15% CPU total (parallel decode + FFT +
-       canvas paint). Confirmed running: skeleton at 4%; this should
-       land around 12-18%.
+       Drives a WebGL canvas via Butterchurn, fed by a silent <audio>
+       element decoding the same source as the audible <video>. The
+       audible audio is still produced by the existing <video>; the
+       silent decode path exists purely to feed FFT data into
+       Butterchurn's AnalyserNode hookup.
+       ----------------------------------------------------------------
+       Why parallel decode rather than tapping the <video>:
+         createMediaElementSource on a <video> seizes the element's
+         audio output - we'd lose audibility. A second silent decoder
+         is the canonical workaround. Drift between the two streams
+         is <150ms on Pi 5; we resync every 1.5s if it grows.
+       ----------------------------------------------------------------
+       Rotation: the wrapper is rotated via CSS. Butterchurn paints
+       in the wrapper's post-rotation coordinate space, so a portrait
+       Pi gets a portrait visualization with no extra math.
+       ----------------------------------------------------------------
+       Preset cycling: a curated subset of the bundled presets that
+       skips the GPU-heaviest. Cycles every 45s + on track change.
        ================================================================= */
     const audioVis = (() => {{
       const root = document.getElementById("audioVis");
       const canvas = document.getElementById("audioVisCanvas");
       const artEl = document.getElementById("audioVisArt");
-      const ctx = canvas ? canvas.getContext("2d", {{ alpha: true }}) : null;
 
-      // Web Audio context + silent <audio> element for FFT input.
-      // Created lazily on first start() so the renderer doesn't pay
-      // the cost on devices that never play audio. Reused across
-      // tracks - we just swap the `src`.
       let audioCtx = null;
       let analyserAudio = null;
       let analyserSrc = null;
-      let analyser = null;
-      let freqData = null;
-      const FFT_SIZE = 512;        // 256 frequency bins
-      const BAR_COUNT = 48;
-      const SMOOTHING = 0.78;
+      let viz = null;
+      let presets = null;
+      let presetNames = [];
+      let presetIdx = 0;
+      let presetCycleHandle = null;
+      const PRESET_CYCLE_MS = 45000;
 
       let active = false;
       let videoEl = null;
       let item = null;
       let rafHandle = null;
-      let lastFrame = 0;
-      const frameMinMs = 1000 / 30;  // 30fps cap
-      let cssW = 0;
-      let cssH = 0;
-      // Bar peak-decay state: each bar caches its previous value
-      // so peaks fall off smoothly even when the source signal
-      // drops sharply (gives the bars their bouncy feel).
-      const peaks = new Float32Array(BAR_COUNT);
-      const peakDecay = 0.92;
-      const peakRise = 0.55;       // how quickly bars catch up
 
-      // Procedural color from file name.
-      function colorFromName(name) {{
-        if (!name) return {{ hue: 270, sat: 65 }};
-        let h = 0;
-        for (let i = 0; i < name.length; i++) {{
-          h = (h * 31 + name.charCodeAt(i)) | 0;
-        }}
-        const hue = ((h % 360) + 360) % 360;
-        return {{ hue, sat: 70 }};
+      function libAvailable() {{
+        return !!(window.butterchurn && window.butterchurnPresets);
       }}
 
-      function applyArt(itemRef) {{
-        if (!artEl) return;
-        const name = (itemRef && itemRef.label) || "";
-        const {{ hue, sat }} = colorFromName(name);
-        // Two-stop conic so the art reads as a soft colored cloud
-        // rather than a flat fill. CSS blur in .audio-vis__art
-        // smears the seams away.
-        const a = `hsl(${{hue}}, ${{sat}}%, 36%)`;
-        const b = `hsl(${{(hue + 40) % 360}}, ${{sat}}%, 22%)`;
-        const c = `hsl(${{(hue + 200) % 360}}, ${{sat - 15}}%, 14%)`;
-        artEl.style.backgroundImage =
-          `radial-gradient(circle at 30% 35%, ${{a}} 0%, ${{b}} 38%, ${{c}} 80%)`;
-        artEl.classList.add("is-loaded");
+      function pickPresetNames(allMap) {{
+        const all = Object.keys(allMap);
+        const curated = all.filter((n) => {{
+          const low = n.toLowerCase();
+          if (low.includes("extreme")) return false;
+          if (low.includes("royal")) return false;
+          if (low.includes("aurora")) return true;
+          if (low.includes("flexi")) return true;
+          if (low.includes("martin")) return true;
+          if (low.includes("geiss")) return true;
+          if (low.includes("zylot")) return true;
+          return (n.length % 3) === 0;
+        }});
+        return curated.length ? curated : all;
       }}
 
-      function ensureAudio() {{
-        if (audioCtx) return true;
+      function ensureViz() {{
+        if (viz) return true;
+        if (!libAvailable()) return false;
         try {{
           const Ctx = window.AudioContext || window.webkitAudioContext;
-          if (!Ctx) return false;
           audioCtx = new Ctx();
           analyserAudio = document.createElement("audio");
           analyserAudio.crossOrigin = "anonymous";
-          analyserAudio.muted = true;             // silent path
+          analyserAudio.muted = true;
           analyserAudio.volume = 0;
           analyserAudio.preload = "auto";
           analyserAudio.style.display = "none";
           document.body.appendChild(analyserAudio);
           analyserSrc = audioCtx.createMediaElementSource(analyserAudio);
-          analyser = audioCtx.createAnalyser();
-          analyser.fftSize = FFT_SIZE;
-          analyser.smoothingTimeConstant = SMOOTHING;
-          analyserSrc.connect(analyser);
-          // No connect to destination - we never want this audible.
-          freqData = new Uint8Array(analyser.frequencyBinCount);
+
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const rot = (({rotation_degrees} % 360) + 360) % 360;
+          const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+          const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+          root.style.width = w + "px";
+          root.style.height = h + "px";
+          canvas.width = Math.round(w * dpr);
+          canvas.height = Math.round(h * dpr);
+
+          viz = window.butterchurn.createVisualizer(audioCtx, canvas, {{
+            width: canvas.width,
+            height: canvas.height,
+            pixelRatio: dpr,
+          }});
+          viz.connectAudio(analyserSrc);
+
+          presets = window.butterchurnPresets.getPresets();
+          presetNames = pickPresetNames(presets);
+          loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
           return true;
         }} catch (err) {{
-          // Web Audio unavailable (sandboxed iframe etc.) - fall back
-          // to the procedural-only path.
+          viz = null;
           audioCtx = null;
           return false;
         }}
       }}
 
+      function loadPresetByIdx(idx) {{
+        if (!viz || !presets || !presetNames.length) return;
+        presetIdx = ((idx % presetNames.length) + presetNames.length) % presetNames.length;
+        const name = presetNames[presetIdx];
+        const preset = presets[name];
+        if (preset) {{
+          viz.loadPreset(preset, 1.5);
+        }}
+      }}
+
+      function nextPreset() {{
+        loadPresetByIdx(presetIdx + 1);
+      }}
+
       function startAnalyser(src) {{
-        if (!ensureAudio()) return;
+        if (!analyserAudio) return;
         try {{
-          if (audioCtx.state === "suspended") audioCtx.resume();
+          if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
           if (analyserAudio.src !== src) {{
             analyserAudio.src = src;
             analyserAudio.load();
           }}
-          // Best-effort autoplay; muted autoplay is allowed in Chromium.
           analyserAudio.play().catch(() => {{}});
         }} catch (_) {{}}
       }}
@@ -1053,11 +1069,6 @@ def render_browser_html(
       }}
 
       function syncAnalyserToVideo() {{
-        // Best-effort: keep the silent analyzer's currentTime within
-        // ~150ms of the audible <video>. Drift can creep in across
-        // long tracks; nudge if it gets too far. Visual sync doesn't
-        // need to be perfect - the bars are reading the same notes
-        // either way.
         if (!analyserAudio || !videoEl) return;
         if (!Number.isFinite(videoEl.currentTime)) return;
         const drift = Math.abs(analyserAudio.currentTime - videoEl.currentTime);
@@ -1067,142 +1078,44 @@ def render_browser_html(
       }}
 
       function resize() {{
-        if (!canvas || !ctx || !root) return;
-        // Compute post-rotation viewport. The wrapper has rotation in
-        // its transform, but its content-box dimensions need to match
-        // the visual orientation. For 90/270 we swap window w/h.
+        if (!viz || !root || !canvas) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
         const rot = (({rotation_degrees} % 360) + 360) % 360;
         const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
         const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
         root.style.width = w + "px";
         root.style.height = h + "px";
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        cssW = w;
-        cssH = h;
-        canvas.width = Math.round(cssW * dpr);
-        canvas.height = Math.round(cssH * dpr);
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+        viz.setRendererSize(canvas.width, canvas.height);
       }}
 
-      function render(now) {{
-        if (!active || !ctx) return;
-        if (now - lastFrame < frameMinMs) {{
-          rafHandle = window.requestAnimationFrame(render);
-          return;
-        }}
-        lastFrame = now;
-        ctx.clearRect(0, 0, cssW, cssH);
-
-        // Pull FFT data + bass energy.
-        let bass = 0;
-        if (analyser && freqData) {{
-          analyser.getByteFrequencyData(freqData);
-          // Bass = average of the bottom ~6% of bins (~0-180Hz at
-          // 44.1k sample rate with FFT_SIZE=512).
-          const bins = freqData.length;
-          const bassBins = Math.max(2, Math.round(bins * 0.06));
-          let sum = 0;
-          for (let i = 0; i < bassBins; i++) sum += freqData[i];
-          bass = (sum / bassBins) / 255;  // 0..1
-        }}
-
-        // Layout: bars take the middle 70% of the canvas vertically,
-        // anchored so they grow up + down from a centerline.
-        const cx = cssW / 2;
-        const cy = cssH / 2;
-        const barAreaH = cssH * 0.70;   // tallest bar peaks at 35% above + below center
-        const halfH = barAreaH / 2;
-        const barW = (cssW * 0.84) / BAR_COUNT;
-        const gap = barW * 0.18;
-        const drawW = barW - gap;
-        const startX = (cssW - (BAR_COUNT * barW)) / 2;
-
-        // Bass pulse: a soft circle behind the bars whose radius
-        // tracks bass energy. Two layered fillRects-equivalent
-        // ellipses (just stroke + fill ring) is too expensive on
-        // Pi - use one filled circle with a radial gradient.
-        if (bass > 0.05) {{
-          const radius = (cssW * 0.32) + bass * (cssW * 0.18);
-          const ringGrd = ctx.createRadialGradient(
-            cx, cy, radius * 0.6,
-            cx, cy, radius
-          );
-          ringGrd.addColorStop(0, "rgba(255, 255, 255, 0)");
-          ringGrd.addColorStop(0.78, "rgba(255, 255, 255, " + (0.04 + bass * 0.10).toFixed(3) + ")");
-          ringGrd.addColorStop(1, "rgba(255, 255, 255, 0)");
-          ctx.fillStyle = ringGrd;
-          ctx.beginPath();
-          ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-          ctx.fill();
-        }}
-
-        // FFT bars.
-        // Map BAR_COUNT bars onto the lower 70% of the FFT bins
-        // (logarithmic-ish to give bass more visual weight). The
-        // top 30% is mostly dead air on most music.
-        const usableBins = freqData ? Math.floor(freqData.length * 0.70) : BAR_COUNT;
-        for (let i = 0; i < BAR_COUNT; i++) {{
-          // Logarithmic bin pick: bands toward the right end of the
-          // spectrum sample over a wider range so high-frequency
-          // bars don't all flatline at zero.
-          const t = i / (BAR_COUNT - 1);
-          const binStart = Math.floor(Math.pow(t, 1.6) * usableBins);
-          const binEnd = Math.floor(Math.pow((i + 1) / BAR_COUNT, 1.6) * usableBins);
-          let v = 0;
-          if (freqData) {{
-            const lo = Math.max(0, binStart);
-            const hi = Math.max(lo + 1, Math.min(freqData.length, binEnd));
-            let max = 0;
-            for (let b = lo; b < hi; b++) {{
-              if (freqData[b] > max) max = freqData[b];
-            }}
-            v = max / 255;  // 0..1
-          }}
-          // Peak-decay smoothing.
-          const target = v;
-          if (target > peaks[i]) {{
-            peaks[i] = peaks[i] * (1 - peakRise) + target * peakRise;
-          }} else {{
-            peaks[i] = peaks[i] * peakDecay;
-          }}
-          const energy = peaks[i];
-          const barH = energy * halfH;
-
-          // Color: hue shifts a tiny bit by bin index, brightness by
-          // energy. Solid rgba is cheap; createLinearGradient per
-          // bar would tank Pi performance.
-          const hueBase = 270;
-          const hueShift = (i / BAR_COUNT) * 60 - 20;  // ~250..310
-          const hue = hueBase + hueShift;
-          const lightness = 50 + energy * 30;
-          const alpha = 0.55 + energy * 0.40;
-          ctx.fillStyle = `hsla(${{hue}}, 80%, ${{lightness}}%, ${{alpha}})`;
-
-          const x = Math.round(startX + i * barW);
-          // Mirror: top half + bottom half. Round corners are too
-          // expensive on Pi (path stroke); plain rects look fine
-          // at canvas resolution.
-          ctx.fillRect(x, cy - barH, drawW, barH);
-          ctx.fillRect(x, cy, drawW, barH);
-        }}
-
+      function render() {{
+        if (!active || !viz) return;
+        viz.render();
         rafHandle = window.requestAnimationFrame(render);
       }}
 
       function start(itemRef, video) {{
-        if (!root || !ctx) return;
         item = itemRef;
         videoEl = video;
+        if (!ensureViz()) {{
+          if (root) {{
+            root.classList.add("is-active");
+            root.setAttribute("aria-hidden", "false");
+          }}
+          return;
+        }}
         active = true;
-        root.classList.add("is-active");
-        root.setAttribute("aria-hidden", "false");
-        // Reset peaks so a fresh track starts clean.
-        for (let i = 0; i < BAR_COUNT; i++) peaks[i] = 0;
-        applyArt(itemRef);
-        resize();
+        if (root) {{
+          root.classList.add("is-active");
+          root.setAttribute("aria-hidden", "false");
+        }}
+        if (artEl) artEl.classList.add("is-loaded");
         if (itemRef && itemRef.src) startAnalyser(itemRef.src);
-        // Periodically re-sync the silent analyser to the audible
-        // <video>. Cheap setInterval - no rAF needed.
+        if (presetNames.length) loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
+        if (presetCycleHandle) window.clearInterval(presetCycleHandle);
+        presetCycleHandle = window.setInterval(nextPreset, PRESET_CYCLE_MS);
         if (start.syncTimer) window.clearInterval(start.syncTimer);
         start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
         if (rafHandle == null) {{
@@ -1224,11 +1137,14 @@ def render_browser_html(
           window.clearInterval(start.syncTimer);
           start.syncTimer = null;
         }}
+        if (presetCycleHandle) {{
+          window.clearInterval(presetCycleHandle);
+          presetCycleHandle = null;
+        }}
         if (rafHandle != null) {{
           window.cancelAnimationFrame(rafHandle);
           rafHandle = null;
         }}
-        if (ctx) ctx.clearRect(0, 0, cssW, cssH);
       }}
 
       window.addEventListener("resize", () => {{

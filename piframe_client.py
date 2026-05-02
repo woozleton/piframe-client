@@ -650,6 +650,28 @@ class BrowserController:
         return max(0.0, min(100.0, float(level)))
 
     def _write_html(self) -> None:
+        # Butterchurn (audio visualizer) ships as two minified UMD
+        # bundles in vendor/butterchurn/. Copy them next to the HTML
+        # in /tmp/ and reference via file:// - inlining tripped over
+        # f-string brace escapes in the renderer template. Same-
+        # origin file:// loads keep us out of CORS entirely. Missing
+        # files just disable the visualizer at runtime.
+        vendor_dir = Path(__file__).resolve().parent / "vendor" / "butterchurn"
+        bc_lib = vendor_dir / "butterchurn.min.js"
+        bc_presets = vendor_dir / "butterchurnPresets.min.js"
+        bc_lib_uri = ""
+        bc_presets_uri = ""
+        try:
+            if bc_lib.exists():
+                dest = BROWSER_HTML_FILE.parent / "piframe_butterchurn.min.js"
+                shutil.copyfile(bc_lib, dest)
+                bc_lib_uri = dest.as_uri()
+            if bc_presets.exists():
+                dest = BROWSER_HTML_FILE.parent / "piframe_butterchurnPresets.min.js"
+                shutil.copyfile(bc_presets, dest)
+                bc_presets_uri = dest.as_uri()
+        except OSError as exc:
+            _log("butterchurn_vendor_copy_failed", error=str(exc))
         html = render_browser_html(
             rotation_degrees=self.rotation_degrees,
             show_hud=BROWSER_SHOW_HUD,
@@ -658,6 +680,8 @@ class BrowserController:
             nas_root=NAS_ROOT,
             poll_ms=BROWSER_STATE_POLL_MS,
             event_endpoint=f"http://{BROWSER_EVENT_HOST}:{BROWSER_EVENT_PORT}/browser-event",
+            butterchurn_lib_uri=bc_lib_uri,
+            butterchurn_presets_uri=bc_presets_uri,
         )
         BROWSER_HTML_FILE.write_text(html, encoding="utf-8")
 
