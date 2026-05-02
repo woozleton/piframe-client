@@ -1094,14 +1094,35 @@ def render_browser_html(
           canvas.width = Math.round(w * dpr);
           canvas.height = Math.round(h * dpr);
 
-          viz = window.butterchurn.createVisualizer(audioCtx, canvas, {{
+          // The vendored butterchurn UMD wraps its export under
+          // `.default` (webpack's namespace marker). We tolerate
+          // either shape so a future bundle change doesn't break us.
+          const Butterchurn = (window.butterchurn && window.butterchurn.default)
+            || window.butterchurn;
+          if (!Butterchurn || typeof Butterchurn.createVisualizer !== "function") {{
+            vizDiag("api_shape_unexpected",
+              "shape=" + (Butterchurn ? Object.keys(Butterchurn).join(",") : "null"));
+            paintVizError("Butterchurn API mismatch");
+            return false;
+          }}
+          viz = Butterchurn.createVisualizer(audioCtx, canvas, {{
             width: canvas.width,
             height: canvas.height,
             pixelRatio: dpr,
           }});
           viz.connectAudio(analyserSrc);
 
-          presets = window.butterchurnPresets.getPresets();
+          // Presets bundle exports the class directly (CommonJS path)
+          // but we accept either shape for symmetry.
+          const Presets = (window.butterchurnPresets && window.butterchurnPresets.default)
+            || window.butterchurnPresets;
+          if (!Presets || typeof Presets.getPresets !== "function") {{
+            vizDiag("presets_api_shape_unexpected",
+              "shape=" + (Presets ? Object.keys(Presets).join(",") : "null"));
+            paintVizError("Butterchurn presets API mismatch");
+            return false;
+          }}
+          presets = Presets.getPresets();
           presetNames = pickPresetNames(presets);
           loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
           vizDiag("ready", "preset_count=" + presetNames.length);

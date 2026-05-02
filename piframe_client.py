@@ -730,15 +730,12 @@ class BrowserController:
             "--password-store=basic",
             "--allow-file-access-from-files",
             "--autoplay-policy=no-user-gesture-required",
-            # WebGL on Pi under cage+wayland: hardware path via the
-            # V3D Mesa driver works on a properly-equipped Pi 5, but
-            # cage doesn't always forward DRM access into the
-            # sandboxed renderer. Fall back to SwiftShader (software
-            # WebGL) so Butterchurn always gets a context. Software
-            # path runs ~10-15fps with the curated presets - usable.
-            "--use-gl=angle",
-            "--use-angle=swiftshader",
-            "--enable-unsafe-swiftshader",
+            # WebGL flags: the second probe (after the first round of
+            # diagnostics) confirmed Chromium can produce a hardware
+            # WebGL context once we drop --use-gl=egl and let
+            # Chromium's default ANGLE path negotiate. Keep
+            # ignore-gpu-blocklist + gpu-rasterization since the Pi's
+            # V3D driver shows up in the blocklist by default.
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
             BROWSER_HTML_FILE.as_uri(),
