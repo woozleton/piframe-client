@@ -93,6 +93,20 @@ IDLE_MEDIA_DEFAULT_CANDIDATES = (
     str(_IDLE_MEDIA_DIR / "idle.jpg"),
 )
 
+# Audio visualizer presets the bundle ships with. Heartbeat reports
+# this list to the orchestrator so the audio-playlist inspector can
+# offer a per-playlist visualizer dropdown sourced from each Pi's
+# capabilities (vs hard-coding on the server). Source of truth here -
+# browser_renderer_template.py uses this same list to filter the
+# Butterchurn preset map at runtime.
+AUDIO_VISUALIZER_PRESETS = [
+    "martin - witchcraft reloaded",
+    "martin - reflections on black tiles",
+    "flexi + amandio c - organic12-3d-2",
+    "martin - chain breaker",
+    "martin [shadow harlequins shape code] - fata morgana",
+]
+
 
 def _default_idle_media() -> str:
     for candidate in IDLE_MEDIA_DEFAULT_CANDIDATES:
@@ -682,6 +696,7 @@ class BrowserController:
             event_endpoint=f"http://{BROWSER_EVENT_HOST}:{BROWSER_EVENT_PORT}/browser-event",
             butterchurn_lib_uri=bc_lib_uri,
             butterchurn_presets_uri=bc_presets_uri,
+            visualizer_presets=AUDIO_VISUALIZER_PRESETS,
         )
         BROWSER_HTML_FILE.write_text(html, encoding="utf-8")
 
@@ -1108,6 +1123,22 @@ class BrowserController:
             _set_chromium_sink_input_mute(bool(mute))
         except Exception as exc:
             _log("companion_chromium_mute_failed", error=str(exc))
+
+    def set_visualizer(self, choice: str) -> None:
+        """Per-playlist visualizer pick: 'none' / 'random' / preset name.
+
+        Stamps the choice onto the browser state file so the renderer's
+        audioVis module reads it on the next play. Default ('random')
+        preserves the existing cycle-every-5s behavior. 'none' skips
+        the overlay entirely. Anything else is treated as a literal
+        preset name to lock onto.
+        """
+        if not self._ensure_running():
+            return
+        normalized = (choice or "random").strip() or "random"
+        with self._state_lock:
+            self._state["visualizer"] = normalized
+            self._write_state()
 
 
 class MpvCompanion:
@@ -1677,6 +1708,13 @@ class PiFrameClient:
         )
         repeat = _coerce_bool(params.get("repeat", data.get("repeat", True)), default=True)
         target = (params.get("target") or data.get("target") or "hdmi")
+        visualizer = (
+            params.get("visualizer")
+            or data.get("visualizer")
+            or "random"
+        )
+        if not isinstance(visualizer, str):
+            visualizer = "random"
         is_companion = _coerce_bool(
             params.get("is_companion", data.get("is_companion", False)),
             default=False,
@@ -1706,9 +1744,14 @@ class PiFrameClient:
             items=len(items),
             repeat=repeat,
             target=target,
+            visualizer=visualizer,
             playlist=playlist_name or "",
             playlist_id=playlist_id or "",
         )
+        # Apply the visualizer pick BEFORE starting playback so the
+        # renderer's state file already carries the right value when
+        # the new audio item activates and the visualizer hooks fire.
+        self.renderer.set_visualizer(visualizer)
         handled = False
         if len(items) == 1:
             handled = self.renderer.play_single_video(items[0], loop=repeat)
@@ -2039,6 +2082,11 @@ class PiFrameClient:
                 "slideshow_index": BROWSER_EVENT_STATE.slideshow_index(),
                 "client_version": self.client_version,
                 "last_update": self.last_update,
+                # Bundle-curated visualizer preset names so the
+                # orchestrator can populate a per-playlist picker.
+                # Static across the lifetime of this client; cheap to
+                # ship every heartbeat (small list).
+                "visualizer_presets": list(AUDIO_VISUALIZER_PRESETS),
             }
             metrics = _collect_system_metrics()
             if metrics:

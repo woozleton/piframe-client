@@ -17,6 +17,7 @@ def render_browser_html(
     event_endpoint: str = "",
     butterchurn_lib_uri: str = "",
     butterchurn_presets_uri: str = "",
+    visualizer_presets: list | None = None,
 ) -> str:
     """Render the self-contained Chromium kiosk page."""
     show_hud_css = "block" if show_hud else "none"
@@ -34,6 +35,7 @@ def render_browser_html(
             f'<script src="{butterchurn_lib_uri}"></script>\n'
             f'  <script src="{butterchurn_presets_uri}"></script>'
         )
+    visualizer_presets_json = json.dumps(list(visualizer_presets or []))
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1091,22 +1093,18 @@ def render_browser_html(
         // mix", "acid wiring", "chain breaker", "fruit machine").
         // Fall back to all-presets if the bundle has shifted under
         // us so the visualizer never goes silent.
-        // Operator's hand-picked favorites. Tight list - everything
-        // outside this exact set is excluded. If the bundle ever
-        // ships without one of these, the fallback below picks
-        // every preset so the visualizer never goes silent.
-        const NAMED_ALLOW = [
-          "martin - witchcraft reloaded",
-          "martin - reflections on black tiles",
-          "flexi + amandio c - organic12-3d-2",
-          "martin - chain breaker",
-          "martin [shadow harlequins shape code] - fata morgana",
-        ];
+        // Operator's hand-picked favorites injected by the Python
+        // template (single source of truth via piframe_client.py
+        // AUDIO_VISUALIZER_PRESETS - same list also reported to the
+        // orchestrator in the heartbeat). Falls back to all presets
+        // if the bundle has shifted under us so the visualizer never
+        // goes silent.
+        const NAMED_ALLOW = {visualizer_presets_json};
         const all = Object.keys(allMap);
         const curated = all.filter((n) => {{
           const low = n.toLowerCase();
           for (const allow of NAMED_ALLOW) {{
-            if (low.includes(allow)) return true;
+            if (low.includes(allow.toLowerCase())) return true;
           }}
           return false;
         }});
@@ -1364,9 +1362,75 @@ def render_browser_html(
         rafHandle = window.requestAnimationFrame(render);
       }}
 
+      // Per-playlist visualizer pick. 'none' suppresses the overlay
+      // entirely, 'random' picks a random preset and cycles every
+      // PRESET_CYCLE_MS, anything else is treated as a preset name
+      // to lock onto with no cycling. applyChoice() is called by the
+      // state-poll loop whenever state.visualizer changes mid-stream.
+      let currentChoice = "random";
+
+      function applyChoice(choice) {{
+        const next = (choice || "random").toString().trim() || "random";
+        if (next === currentChoice && active) return;
+        currentChoice = next;
+        // If we're not currently active there's nothing to act on -
+        // start() will pick up currentChoice the next time it runs.
+        if (!active || !viz) return;
+        rewireForChoice();
+      }}
+
+      function rewireForChoice() {{
+        // Clear any existing cycle / heartbeat - they get rebuilt
+        // below if the new choice wants them.
+        if (presetCycleHandle) {{
+          window.clearInterval(presetCycleHandle);
+          presetCycleHandle = null;
+        }}
+        if (currentChoice === "none") {{
+          // Tear down the overlay so the page reads as "no visual."
+          if (root) {{
+            root.classList.remove("is-active");
+            root.setAttribute("aria-hidden", "true");
+          }}
+          if (artEl) artEl.classList.remove("is-loaded");
+          if (presetNameEl) presetNameEl.classList.remove("is-visible");
+          return;
+        }}
+        // Active overlay (random or named).
+        if (root) {{
+          root.classList.add("is-active");
+          root.setAttribute("aria-hidden", "false");
+        }}
+        if (artEl) artEl.classList.add("is-loaded");
+        if (currentChoice === "random") {{
+          if (presetNames.length) {{
+            loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
+          }}
+          presetCycleHandle = window.setInterval(nextPreset, PRESET_CYCLE_MS);
+        }} else {{
+          // Named preset: find by case-insensitive substring match
+          // against the curated list, fall back to first preset.
+          const wanted = currentChoice.toLowerCase();
+          let idx = presetNames.findIndex((n) => n.toLowerCase().includes(wanted));
+          if (idx < 0) idx = 0;
+          loadPresetByIdx(idx);
+        }}
+      }}
+
       function start(itemRef, video) {{
         item = itemRef;
         videoEl = video;
+        // 'none' = skip ensureViz entirely so we don't even spin up
+        // the WebGL context for surfaces that don't want a visual.
+        if (currentChoice === "none") {{
+          active = true;  // mark active so applyChoice can react if it flips
+          if (root) {{
+            root.classList.remove("is-active");
+            root.setAttribute("aria-hidden", "true");
+          }}
+          if (presetNameEl) presetNameEl.classList.remove("is-visible");
+          return;
+        }}
         if (!ensureViz()) {{
           if (root) {{
             root.classList.add("is-active");
@@ -1375,15 +1439,8 @@ def render_browser_html(
           return;
         }}
         active = true;
-        if (root) {{
-          root.classList.add("is-active");
-          root.setAttribute("aria-hidden", "false");
-        }}
-        if (artEl) artEl.classList.add("is-loaded");
+        rewireForChoice();
         if (itemRef && itemRef.src) startAnalyser(itemRef.src);
-        if (presetNames.length) loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
-        if (presetCycleHandle) window.clearInterval(presetCycleHandle);
-        presetCycleHandle = window.setInterval(nextPreset, PRESET_CYCLE_MS);
         if (start.syncTimer) window.clearInterval(start.syncTimer);
         start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
         startReactivityHeartbeat();
@@ -1425,7 +1482,7 @@ def render_browser_html(
         if (active) resize();
       }});
 
-      return {{ start, stop }};
+      return {{ start, stop, applyChoice }};
     }})();
 
     function renderItem(item, state, perItemSeconds) {{
@@ -1697,6 +1754,11 @@ def render_browser_html(
         activeState = state;
         applyLiveAudioState(state);
         applyCompanionState(state);
+        // Per-playlist visualizer pick lives on the state file. Apply
+        // every poll - applyChoice short-circuits if the value hasn't
+        // changed, so this is cheap on idle ticks and active mid-
+        // stream toggles flip the visual without stopping audio.
+        try {{ audioVis.applyChoice(state.visualizer || "random"); }} catch (_) {{}}
       }} catch (error) {{
         // ignore transient read errors while state file is being replaced
       }}
