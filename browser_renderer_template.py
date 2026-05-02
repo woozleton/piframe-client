@@ -705,10 +705,17 @@ def render_browser_html(
           state.items.length === 1;
         const fillMode = state.video_fill_mode || "contain";
         stage.video.style.display = "block";
-        stage.video.dataset.desiredMuted = (!!state.muted).toString();
+        // video_mute_override is set by set_companion when the
+        // companion is active AND mute_visual is on. Treat it as
+        // "force-mute" on top of the user's state.muted toggle so
+        // the override path doesn't have to re-fire after every
+        // video transition.
+        const forceMute = !!state.video_mute_override;
+        const userMuted = !!state.muted;
+        stage.video.dataset.desiredMuted = userMuted.toString();
         stage.video.dataset.desiredVolume = Math.max(0, Math.min(1, (state.volume || 0) / 100)).toString();
-        stage.video.muted = !!state.muted;
-        stage.video.volume = Math.max(0, Math.min(1, (state.volume || 0) / 100));
+        stage.video.muted = userMuted || forceMute;
+        stage.video.volume = forceMute ? 0 : Math.max(0, Math.min(1, (state.volume || 0) / 100));
         stage.video.loop = state.mode === "single" ? !!state.loop : isSingleRepeatingPlaylist;
         stage.video.preload = "auto";
         const failVideo = (reason) => {{
@@ -863,11 +870,14 @@ def render_browser_html(
     }}
 
     function applyLiveAudioState(state) {{
+      const forceMute = !!state.video_mute_override;
+      const userMuted = !!state.muted;
+      const userVol = Math.max(0, Math.min(1, (state.volume || 0) / 100));
       for (const stage of stages) {{
-        stage.video.dataset.desiredMuted = (!!state.muted).toString();
-        stage.video.dataset.desiredVolume = Math.max(0, Math.min(1, (state.volume || 0) / 100)).toString();
-        stage.video.muted = !!state.muted;
-        stage.video.volume = Math.max(0, Math.min(1, (state.volume || 0) / 100));
+        stage.video.dataset.desiredMuted = userMuted.toString();
+        stage.video.dataset.desiredVolume = userVol.toString();
+        stage.video.muted = userMuted || forceMute;
+        stage.video.volume = forceMute ? 0 : userVol;
       }}
       const nextVolume = Number(state.volume || 0);
       const nextMuted = !!state.muted;
@@ -1041,31 +1051,11 @@ def render_browser_html(
       const newToken = comp && typeof comp.token === "number" ? comp.token : -1;
       const wantActive = !!(comp && comp.active && Array.isArray(comp.items) && comp.items.length);
 
-      // Visual mute: when the companion is active AND mute_visual
-      // is set (override-embedded-audio path), force the visual
-      // <video> elements muted so the companion audio is the only
-      // thing the user hears. When inactive, do NOTHING - the
-      // existing applyLiveAudioState already restores muted state
-      // every poll from state.muted, and double-touching here was
-      // racing with the load path's own muted setup (the new video
-      // was getting muted because dataset.desiredMuted hadn't been
-      // refreshed yet by startFromState).
-      const muteVisual = !!(comp && comp.mute_visual && wantActive);
-      if (muteVisual) {{
-        stages.forEach((stage) => {{
-          if (!stage.video) return;
-          stage.video.muted = true;
-          // Belt-and-suspenders for Linux/ALSA audio stacks that
-          // don't mix concurrent streams: zero out the video volume
-          // too. On default `default = hdmi` ALSA configs without a
-          // mixer, the video element opening the audio device with
-          // a non-zero volume can lock out the companion <audio>
-          // element entirely. Setting volume=0 in addition to muted
-          // is what some Chromium kiosks need to fully release the
-          // device.
-          stage.video.volume = 0;
-        }});
-      }}
+      // Video muting for the override path is handled by
+      // startFromState + applyLiveAudioState reading
+      // state.video_mute_override (set by BrowserController.
+      // set_companion). Companion JS only manages the <audio>
+      // element here.
 
       // Volume: companion follows the surface's volume + user mute,
       // so the volume slider on the operator's UI always controls

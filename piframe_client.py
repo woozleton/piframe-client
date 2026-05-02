@@ -911,7 +911,13 @@ class BrowserController:
         """Update the companion-audio block in the state file. The
         renderer's hidden <audio> element polls state.companion and
         plays the queue in parallel with whatever visual content is
-        on screen. Empty items halts the companion."""
+        on screen. Empty items halts the companion.
+
+        mute_visual is also surfaced as `state.video_mute_override`
+        so the existing video-load + applyLiveAudioState paths mute
+        the visual through the canonical channel (state.muted is the
+        user mute and shouldn't be touched here - the companion needs
+        state.muted to stay false to be audible)."""
         if not self._ensure_running():
             return
         with self._state_lock:
@@ -926,19 +932,26 @@ class BrowserController:
             token = prev.get("token") or 0
             if prev_paths != new_paths:
                 token += 1
+            active = bool(companion_items)
             self._state["companion"] = {
                 "items": companion_items,
                 "repeat": bool(repeat),
                 "mute_visual": bool(mute_visual),
                 "token": token,
-                "active": bool(companion_items),
+                "active": active,
             }
+            # Override mute applies only while the companion is
+            # actually playing AND mute_visual is on. Off otherwise so
+            # the video resumes audio cleanly when override flips off
+            # or when the companion is cleared.
+            self._state["video_mute_override"] = bool(active and mute_visual)
             self._write_state()
         _log(
             "browser_companion_state_updated",
             items=len(items),
             repeat=repeat,
             mute_visual=mute_visual,
+            video_mute_override=self._state.get("video_mute_override", False),
         )
 
 
