@@ -377,33 +377,41 @@ def render_browser_html(
           rgba(6, 4, 16, 0) 82%,
           rgba(6, 4, 16, 0.85) 100%);
     }}
-    /* Preset-name overlay. Bottom-anchored, semi-transparent dark
-       pill. Fades on each preset change so the name reads as a
-       label rather than a permanent UI chrome strip. Mono font for
-       legibility against busy plasma backgrounds. */
-    .audio-vis__preset-name {{
+    /* Track-name OSD. Shown for ~5s when a new audio item starts.
+       Soft glassy pill, system serif/sans for a polished look (NOT
+       monospace - the operator wanted something that doesn't read
+       as a debug overlay). Letter-spacing tight, generous padding. */
+    .audio-vis__track-name {{
       position: absolute;
       left: 50%;
-      bottom: 6%;
-      transform: translateX(-50%);
-      max-width: 90%;
-      padding: 8px 16px;
-      background: rgba(0, 0, 0, 0.55);
-      color: rgba(255, 255, 255, 0.92);
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 14px;
-      letter-spacing: 0.02em;
-      border-radius: 6px;
+      bottom: 8%;
+      transform: translate(-50%, 12px);
+      max-width: min(82%, 800px);
+      padding: 14px 26px;
+      background: rgba(10, 8, 18, 0.62);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      backdrop-filter: blur(14px) saturate(140%);
+      color: rgba(255, 255, 255, 0.96);
+      font-family:
+        ui-rounded, "SF Pro Rounded", "SF Pro Display",
+        -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: 0.005em;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 14px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
       pointer-events: none;
       opacity: 0;
-      transition: opacity .4s ease;
+      transition: opacity .55s ease, transform .55s ease;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
-      max-width: min(86%, 720px);
+      text-align: center;
     }}
-    .audio-vis__preset-name.is-visible {{
+    .audio-vis__track-name.is-visible {{
       opacity: 1;
+      transform: translate(-50%, 0);
     }}
   </style>
 </head>
@@ -437,7 +445,7 @@ def render_browser_html(
       <div id="audioVisArt" class="audio-vis__art"></div>
       <canvas id="audioVisCanvas"></canvas>
       <div class="audio-vis__vignette"></div>
-      <div id="audioVisPresetName" class="audio-vis__preset-name" aria-hidden="true"></div>
+      <div id="audioVisTrackName" class="audio-vis__track-name" aria-hidden="true"></div>
     </div>
   </div>
   <div id="banner" class="banner"></div>
@@ -988,7 +996,40 @@ def render_browser_html(
       const root = document.getElementById("audioVis");
       const canvas = document.getElementById("audioVisCanvas");
       const artEl = document.getElementById("audioVisArt");
-      const presetNameEl = document.getElementById("audioVisPresetName");
+      const trackNameEl = document.getElementById("audioVisTrackName");
+      let trackNameTimer = null;
+
+      // Pretty filename: drop the extension, swap underscores for
+      // spaces, trim leading "NN. " or "NN - " track-number prefixes.
+      // Falls back to the raw label if anything's wrong.
+      function prettyTrackName(label) {{
+        if (!label || typeof label !== "string") return "";
+        let s = label.replace(/\.[a-z0-9]{{1,5}}$/i, "");  // drop extension
+        s = s.replace(/_/g, " ");
+        s = s.replace(/^\s*\d{{1,3}}\s*[\.\-_]\s*/, "");   // strip "01. " / "12 - "
+        return s.trim() || label;
+      }}
+
+      function showTrackName(label) {{
+        if (!trackNameEl) return;
+        trackNameEl.textContent = prettyTrackName(label);
+        trackNameEl.classList.add("is-visible");
+        if (trackNameTimer) {{
+          window.clearTimeout(trackNameTimer);
+        }}
+        trackNameTimer = window.setTimeout(() => {{
+          if (trackNameEl) trackNameEl.classList.remove("is-visible");
+          trackNameTimer = null;
+        }}, 5000);
+      }}
+
+      function hideTrackName() {{
+        if (trackNameTimer) {{
+          window.clearTimeout(trackNameTimer);
+          trackNameTimer = null;
+        }}
+        if (trackNameEl) trackNameEl.classList.remove("is-visible");
+      }}
 
       let audioCtx = null;
       let analyserAudio = null;
@@ -1025,24 +1066,6 @@ def render_browser_html(
         return !!(window.butterchurn && window.butterchurnPresets);
       }}
 
-      // Friendly display names for the curated presets - the raw
-      // filenames from the bundle are author-prefixed and ugly.
-      // Mirrors the orchestrator-side visualizerDisplayName().
-      function prettyPresetName(raw) {{
-        if (!raw) return "";
-        const PRETTY = [
-          ["martin - witchcraft reloaded", "Witchcraft"],
-          ["martin - reflections on black tiles", "Reflections"],
-          ["flexi + amandio c - organic12-3d-2", "Organic"],
-          ["martin - chain breaker", "Chain Breaker"],
-          ["martin [shadow harlequins shape code] - fata morgana", "Fata Morgana"],
-        ];
-        const low = String(raw).toLowerCase();
-        for (const [match, label] of PRETTY) {{
-          if (low.includes(match)) return label;
-        }}
-        return raw;
-      }}
 
       function vizDiag(stage, detail) {{
         // Surface visualizer init / runtime status to the parent
@@ -1242,10 +1265,6 @@ def render_browser_html(
           // a longer dissolve makes consecutive presets all look
           // like the same dissolving mush.
           viz.loadPreset(preset, 0.6);
-          if (presetNameEl) {{
-            presetNameEl.textContent = prettyPresetName(name);
-            presetNameEl.classList.add("is-visible");
-          }}
           // Start sampling AFTER the blend completes so the blend
           // dissolve doesn't get charged against the new preset's
           // FPS budget.
@@ -1412,7 +1431,6 @@ def render_browser_html(
             root.setAttribute("aria-hidden", "true");
           }}
           if (artEl) artEl.classList.remove("is-loaded");
-          if (presetNameEl) presetNameEl.classList.remove("is-visible");
           return;
         }}
         // Active overlay (random or named).
@@ -1447,7 +1465,6 @@ def render_browser_html(
             root.classList.remove("is-active");
             root.setAttribute("aria-hidden", "true");
           }}
-          if (presetNameEl) presetNameEl.classList.remove("is-visible");
           return;
         }}
         if (!ensureViz()) {{
@@ -1460,6 +1477,10 @@ def render_browser_html(
         active = true;
         rewireForChoice();
         if (itemRef && itemRef.src) startAnalyser(itemRef.src);
+        // Track-name OSD: show the (prettified) filename for ~5s on
+        // every new audio item. Re-triggers on each renderItem call,
+        // so playlist advance / next press always pulses the name.
+        showTrackName(itemRef && itemRef.label);
         if (start.syncTimer) window.clearInterval(start.syncTimer);
         start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
         startReactivityHeartbeat();
@@ -1477,7 +1498,7 @@ def render_browser_html(
           root.setAttribute("aria-hidden", "true");
         }}
         if (artEl) artEl.classList.remove("is-loaded");
-        if (presetNameEl) presetNameEl.classList.remove("is-visible");
+        hideTrackName();
         stopAnalyser();
         if (start.syncTimer) {{
           window.clearInterval(start.syncTimer);
