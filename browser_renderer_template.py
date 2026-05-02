@@ -869,31 +869,19 @@ def render_browser_html(
       video.play().catch(() => {{}});
     }}
 
-    let lastForceMute = false;
     function applyLiveAudioState(state) {{
       const forceMute = !!state.video_mute_override;
       const userMuted = !!state.muted;
       const userVol = Math.max(0, Math.min(1, (state.volume || 0) / 100));
-      const forceMuteJustChanged = forceMute !== lastForceMute;
-      lastForceMute = forceMute;
+      // Companion audio is now produced by a separate mpv sidecar
+      // process, mixed by PulseAudio/PipeWire at the OS level. The
+      // <video> element only needs to be muted (no need to pause +
+      // release the audio device anymore) when forceMute is on.
       for (const stage of stages) {{
         stage.video.dataset.desiredMuted = userMuted.toString();
         stage.video.dataset.desiredVolume = userVol.toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : userVol;
-        // Chromium on Pi keeps the audio device locked while a video
-        // is playing, even when muted+volume=0. Pause the video on
-        // forceMute so the audio device releases for the companion
-        // <audio> element. Last frame stays on screen (HTML <video>
-        // pause() retains the rendered frame), so the operator still
-        // sees the visual. Resume on forceMute=false.
-        if (stage.video.style.display === "block") {{
-          if (forceMute && !stage.video.paused) {{
-            try {{ stage.video.pause(); }} catch (_) {{}}
-          }} else if (!forceMute && forceMuteJustChanged && stage.video.paused) {{
-            try {{ stage.video.play().catch(() => {{}}); }} catch (_) {{}}
-          }}
-        }}
       }}
       const nextVolume = Number(state.volume || 0);
       const nextMuted = !!state.muted;
