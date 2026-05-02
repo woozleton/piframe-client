@@ -972,6 +972,22 @@ def render_browser_html(
       let videoEl = null;
       let item = null;
       let rafHandle = null;
+      // Performance scaffolding. Pi 5 GPU runs simple presets fine
+      // at 1:1, but heavy shader presets stall to single digits FPS.
+      // Render at a fixed lower resolution and upscale via CSS - cuts
+      // shader work proportionally to the area ratio. The canvas
+      // CSS size still fills the wrapper so the visual is fullscreen.
+      const RENDER_SCALE = 0.6;     // 60% of viewport pixels
+      const TARGET_FPS = 30;
+      const FRAME_MIN_MS = 1000 / TARGET_FPS;
+      let lastFrameTime = 0;
+      // Auto-skip presets that consistently render below this FPS.
+      // Sampled over a 4-second window after each preset load.
+      const FPS_FLOOR = 18;
+      const FPS_SAMPLE_MS = 4000;
+      let presetSampleStart = 0;
+      let presetFrameCount = 0;
+      const blacklistedPresets = new Set();
 
       function libAvailable() {{
         return !!(window.butterchurn && window.butterchurnPresets);
@@ -1091,8 +1107,11 @@ def render_browser_html(
           const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
           root.style.width = w + "px";
           root.style.height = h + "px";
-          canvas.width = Math.round(w * dpr);
-          canvas.height = Math.round(h * dpr);
+          // Render at RENDER_SCALE * viewport pixels; CSS scales the
+          // canvas back up to fill. ~36% as much shader work for
+          // RENDER_SCALE=0.6 since pixel work is the bottleneck.
+          canvas.width = Math.max(1, Math.round(w * dpr * RENDER_SCALE));
+          canvas.height = Math.max(1, Math.round(h * dpr * RENDER_SCALE));
 
           // The vendored butterchurn UMD wraps its export under
           // `.default` (webpack's namespace marker). We tolerate
@@ -1138,11 +1157,29 @@ def render_browser_html(
 
       function loadPresetByIdx(idx) {{
         if (!viz || !presets || !presetNames.length) return;
-        presetIdx = ((idx % presetNames.length) + presetNames.length) % presetNames.length;
+        // Skip blacklisted presets up to N rounds so we don't loop
+        // forever when most presets are bad on this device.
+        let attempts = 0;
+        let candidate = ((idx % presetNames.length) + presetNames.length) % presetNames.length;
+        while (attempts < presetNames.length
+               && blacklistedPresets.has(presetNames[candidate])) {{
+          candidate = (candidate + 1) % presetNames.length;
+          attempts++;
+        }}
+        presetIdx = candidate;
         const name = presetNames[presetIdx];
         const preset = presets[name];
         if (preset) {{
           viz.loadPreset(preset, 1.5);
+          // Start sampling AFTER the blend completes so the blend
+          // dissolve doesn't get charged against the new preset's
+          // FPS budget.
+          presetSampleStart = 0;
+          window.setTimeout(() => {{
+            if (!active) return;
+            presetSampleStart = performance.now();
+            presetFrameCount = 0;
+          }}, 1700);
         }}
       }}
 
@@ -1186,14 +1223,45 @@ def render_browser_html(
         const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
         root.style.width = w + "px";
         root.style.height = h + "px";
-        canvas.width = Math.round(w * dpr);
-        canvas.height = Math.round(h * dpr);
+        canvas.width = Math.max(1, Math.round(w * dpr * RENDER_SCALE));
+        canvas.height = Math.max(1, Math.round(h * dpr * RENDER_SCALE));
         viz.setRendererSize(canvas.width, canvas.height);
       }}
 
-      function render() {{
+      function render(now) {{
         if (!active || !viz) return;
+        // FPS cap. rAF can fire >60 times/s on some Chromium builds;
+        // skipping draws when we haven't accumulated FRAME_MIN_MS
+        // keeps GPU load down and prevents heavy presets from
+        // melting the V3D core trying to draw 60fps.
+        if (now - lastFrameTime < FRAME_MIN_MS) {{
+          rafHandle = window.requestAnimationFrame(render);
+          return;
+        }}
+        lastFrameTime = now;
         viz.render();
+        // FPS sampling: if a freshly-loaded preset stays below
+        // FPS_FLOOR over the FPS_SAMPLE_MS window, blacklist it and
+        // jump to the next preset. Some MilkDrop presets do per-pixel
+        // shader work that's just too heavy for a Pi 5 GPU.
+        if (presetSampleStart > 0) {{
+          presetFrameCount++;
+          const elapsed = now - presetSampleStart;
+          if (elapsed >= FPS_SAMPLE_MS) {{
+            const fps = (presetFrameCount * 1000) / elapsed;
+            presetSampleStart = 0;
+            if (fps < FPS_FLOOR && presetNames[presetIdx]) {{
+              const name = presetNames[presetIdx];
+              blacklistedPresets.add(name);
+              vizDiag("preset_blacklisted",
+                "name=" + name + " fps=" + fps.toFixed(1));
+              nextPreset();
+            }} else {{
+              vizDiag("preset_fps_ok",
+                "name=" + (presetNames[presetIdx] || "?") + " fps=" + fps.toFixed(1));
+            }}
+          }}
+        }}
         rafHandle = window.requestAnimationFrame(render);
       }}
 
