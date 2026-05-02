@@ -1,7 +1,17 @@
 api-env/
+.venv/
+venv/
+env/
 __pycache__/
 *.pyc
 *.pyo
 *.log
 .DS_Store
 client_settings.json
+.claude/
+.vscode/
+.idea/
+.pytest_cache/
+.ruff_cache/
+*.swp
+*~
