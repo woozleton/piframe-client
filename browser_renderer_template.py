@@ -311,8 +311,11 @@ def render_browser_html(
     </div>
     <!-- Audio companion: hidden <audio> element that plays a
          background queue in parallel with whatever visual is on
-         stage. Polled out of state.companion. -->
-    <audio id="companionAudio" preload="auto" style="display:none;"></audio>
+         stage. Polled out of state.companion. Positioned offscreen
+         instead of display:none because some Chromium builds skip
+         loading or autoplay on display:none media elements. -->
+    <audio id="companionAudio" preload="auto"
+           style="position:absolute; left:-9999px; width:1px; height:1px;"></audio>
   </div>
   <div id="banner" class="banner"></div>
   <div id="osd" class="osd">
@@ -1050,7 +1053,17 @@ def render_browser_html(
       const muteVisual = !!(comp && comp.mute_visual && wantActive);
       if (muteVisual) {{
         stages.forEach((stage) => {{
-          if (stage.video) stage.video.muted = true;
+          if (!stage.video) return;
+          stage.video.muted = true;
+          // Belt-and-suspenders for Linux/ALSA audio stacks that
+          // don't mix concurrent streams: zero out the video volume
+          // too. On default `default = hdmi` ALSA configs without a
+          // mixer, the video element opening the audio device with
+          // a non-zero volume can lock out the companion <audio>
+          // element entirely. Setting volume=0 in addition to muted
+          // is what some Chromium kiosks need to fully release the
+          // device.
+          stage.video.volume = 0;
         }});
       }}
 
@@ -1070,12 +1083,20 @@ def render_browser_html(
         if (companionItems.length) {{
           companionAudio.src = companionItems[0];
           companionAudio.loop = false;
-          companionAudio.play().catch(() => {{ /* autoplay may need a gesture once */ }});
+          companionAudio.load();
+          companionAudio.play().catch((err) => {{
+            console.warn("companion play failed", err);
+          }});
         }} else {{
           try {{ companionAudio.pause(); }} catch (_) {{}}
           companionAudio.removeAttribute("src");
           companionAudio.load();
         }}
+      }} else if (wantActive && companionAudio.paused) {{
+        // Token unchanged but we expect companion to play - happens
+        // when state arrives multiple times during a transition.
+        // .play() is idempotent and a no-op when already playing.
+        companionAudio.play().catch(() => {{}});
       }} else if (!wantActive && !companionAudio.paused) {{
         try {{ companionAudio.pause(); }} catch (_) {{}}
       }}
