@@ -1115,6 +1115,9 @@ def render_browser_html(
           "martin - infinity",
           "martin - reflections on black tiles",
           "martin - stormy sea",
+          "martin - witchcraft reloaded",
+          "martin - chain breaker",
+          "martin [shadow harlequins shape code] - fata morgana",
           // Flexi soft-themed
           "flexi - truly soft piece of software",
           "flexi - mom, why the sky looks different today",
