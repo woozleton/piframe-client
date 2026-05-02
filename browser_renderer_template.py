@@ -249,12 +249,19 @@ def render_browser_html(
       display: none;
     }}
     .html-frame {{
+      /* Sized to the rotated display: width = viewport height, height =
+         viewport width, so after the rotate() the iframe fills the screen
+         exactly. The page inside lays out for this rotated viewport
+         natively - no rotation awareness needed in idle.html itself. */
       position: absolute;
-      inset: 0;
-      width: 100%;
-      height: 100%;
+      left: 50%;
+      top: 50%;
+      width: 100vh;
+      height: 100vw;
       border: 0;
       background: transparent;
+      transform: translate(-50%, -50%) rotate({rotation_degrees}deg);
+      transform-origin: center center;
       display: none;
       opacity: 0;
       transition: opacity 180ms ease-in-out;
