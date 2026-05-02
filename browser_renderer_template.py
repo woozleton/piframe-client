@@ -869,19 +869,49 @@ def render_browser_html(
       video.play().catch(() => {{}});
     }}
 
+    let lastForceMute = false;
     function applyLiveAudioState(state) {{
       const forceMute = !!state.video_mute_override;
       const userMuted = !!state.muted;
       const userVol = Math.max(0, Math.min(1, (state.volume || 0) / 100));
-      // Companion audio is now produced by a separate mpv sidecar
+      const forceMuteJustEnabledMidStream = forceMute && !lastForceMute;
+      lastForceMute = forceMute;
+      // Companion audio is produced by a separate mpv sidecar
       // process, mixed by PulseAudio/PipeWire at the OS level. The
-      // <video> element only needs to be muted (no need to pause +
-      // release the audio device anymore) when forceMute is on.
+      // <video> element only needs to be muted when forceMute is on.
       for (const stage of stages) {{
         stage.video.dataset.desiredMuted = userMuted.toString();
         stage.video.dataset.desiredVolume = userVol.toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : userVol;
+        // Mid-stream OVR-on: simply setting muted=true on a playing
+        // video doesn't fully tear down Chromium's audio output -
+        // the muted stream still occupies the OS mixer slot and
+        // drowns out mpv's companion stream. Force a source reload
+        // so the audio decoder is rebuilt from scratch in the muted
+        // state, freeing the mixer for mpv. The reload is invisible
+        // to the user beyond a brief flash on the video frame.
+        if (forceMuteJustEnabledMidStream && stage.video.style.display === "block") {{
+          try {{
+            const src = stage.video.currentSrc || stage.video.src || "";
+            const t = stage.video.currentTime;
+            const wasPlaying = !stage.video.paused;
+            if (src) {{
+              stage.video.pause();
+              stage.video.removeAttribute("src");
+              stage.video.load();  // tear down audio output stream
+              setTimeout(() => {{
+                try {{
+                  stage.video.muted = true;  // reapply before re-attach
+                  stage.video.volume = 0;
+                  stage.video.src = src;
+                  stage.video.currentTime = t;
+                  if (wasPlaying) stage.video.play().catch(() => {{}});
+                }} catch (_) {{ /* best-effort */ }}
+              }}, 50);
+            }}
+          }} catch (_) {{ /* best-effort */ }}
+        }}
       }}
       const nextVolume = Number(state.volume || 0);
       const nextMuted = !!state.muted;
