@@ -881,22 +881,35 @@ def render_browser_html(
         stage.video.dataset.desiredVolume = userVol.toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : userVol;
-        // ALSA on Pi often won't release the audio device when a
-        // <video> just goes muted - the decoder stays open and the
-        // companion <audio> element can't claim HDMI. Force a quick
-        // pause + currentTime nudge + resume when forceMute toggles
-        // mid-playback so the audio pipeline resets cleanly.
+        // ALSA on Pi won't release the audio device when a <video>
+        // just goes muted - the decoder stays open and the companion
+        // <audio> element can't claim HDMI. When forceMute toggles
+        // mid-playback, fully tear down the video's media pipeline
+        // (remove src + load) and then reattach + resume from the
+        // same currentTime. This is the only thing that reliably
+        // makes Chromium release the audio device.
         if (forceMuteJustChanged && stage.video.style.display === "block") {{
-          const wasPlaying = !stage.video.paused;
-          if (wasPlaying) {{
-            try {{
+          try {{
+            const src = stage.video.currentSrc || stage.video.src || "";
+            const t = stage.video.currentTime;
+            const wasPlaying = !stage.video.paused;
+            if (src) {{
               stage.video.pause();
-              const t = stage.video.currentTime;
-              stage.video.currentTime = t;
-              // Resume next tick so the pause/seek lands first.
-              setTimeout(() => {{ stage.video.play().catch(() => {{}}); }}, 0);
-            }} catch (_) {{ /* best-effort */ }}
-          }}
+              stage.video.removeAttribute("src");
+              stage.video.load();  // forces decoder teardown
+              if (wasPlaying || forceMute) {{
+                // Re-attach and seek back. setTimeout so the
+                // teardown actually completes before we re-arm.
+                setTimeout(() => {{
+                  try {{
+                    stage.video.src = src;
+                    stage.video.currentTime = t;
+                    stage.video.play().catch(() => {{}});
+                  }} catch (_) {{ /* best-effort */ }}
+                }}, 50);
+              }}
+            }}
+          }} catch (_) {{ /* best-effort */ }}
         }}
       }}
       const nextVolume = Number(state.volume || 0);
