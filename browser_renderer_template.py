@@ -248,6 +248,20 @@ def render_browser_html(
     .video {{
       display: none;
     }}
+    .html-frame {{
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: transparent;
+      display: none;
+      opacity: 0;
+      transition: opacity 180ms ease-in-out;
+    }}
+    .html-frame.ready {{
+      opacity: 1;
+    }}
     .hud {{
       display: {show_hud_css};
       position: fixed;
@@ -280,11 +294,13 @@ def render_browser_html(
       <img id="bgImage0" class="backdrop" alt="">
       <img id="image0" class="media image" alt="">
       <video id="video0" class="media video" muted playsinline preload="auto"></video>
+      <iframe id="html0" class="html-frame" sandbox="allow-scripts allow-same-origin"></iframe>
     </div>
     <div id="stage1" class="stage">
       <img id="bgImage1" class="backdrop" alt="">
       <img id="image1" class="media image" alt="">
       <video id="video1" class="media video" muted playsinline preload="auto"></video>
+      <iframe id="html1" class="html-frame" sandbox="allow-scripts allow-same-origin"></iframe>
     </div>
   </div>
   <div id="banner" class="banner"></div>
@@ -315,12 +331,14 @@ def render_browser_html(
         bgImage: document.getElementById("bgImage0"),
         image: document.getElementById("image0"),
         video: document.getElementById("video0"),
+        html: document.getElementById("html0"),
       }},
       {{
         root: document.getElementById("stage1"),
         bgImage: document.getElementById("bgImage1"),
         image: document.getElementById("image1"),
         video: document.getElementById("video1"),
+        html: document.getElementById("html1"),
       }},
     ];
     const playlistEl = document.getElementById("playlistName");
@@ -568,12 +586,19 @@ def render_browser_html(
       stage.bgImage.classList.remove("ready");
       stage.image.classList.remove("ready");
       stage.video.classList.remove("ready");
+      stage.html.classList.remove("ready");
       stage.bgImage.style.display = "none";
       stage.image.style.display = "none";
       stage.video.style.display = "none";
+      stage.html.style.display = "none";
       stage.video.pause();
       stage.video.removeAttribute("src");
       stage.video.load();
+      stage.html.onload = null;
+      stage.html.onerror = null;
+      // about:blank releases the previous document; setting src="" leaves
+      // the prior page visible during the cross-fade.
+      stage.html.src = "about:blank";
     }}
 
     function getActiveStage() {{
@@ -646,7 +671,19 @@ def render_browser_html(
         stage.resetHandle = null;
       }}
       resetStage(stage);
-      if (item.kind === "video") {{
+      if (item.kind === "html") {{
+        stage.html.style.display = "block";
+        stage.html.onload = () => {{
+          stage.html.classList.add("ready");
+          if (state.mode !== "idle" && osdEl.classList.contains("error")) {{
+            hideOsd();
+          }}
+        }};
+        stage.html.onerror = () => {{
+          showBanner(itemErrorMessage(item), "error");
+        }};
+        stage.html.src = item.src;
+      }} else if (item.kind === "video") {{
         const isSingleRepeatingPlaylist =
           state.mode === "playlist" &&
           !!state.repeat &&
@@ -793,6 +830,9 @@ def render_browser_html(
       }}, {reset_delay_ms});
       if (item.kind === "video") {{
         stagePlay(targetStage.video);
+      }} else if (item.kind === "html") {{
+        // HTML idles are static iframes - no interval, no preload.
+        stopTimers();
       }} else {{
         scheduleImageAdvance(perItemSeconds);
         preloadNextImage();

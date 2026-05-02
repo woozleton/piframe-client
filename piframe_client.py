@@ -75,12 +75,13 @@ BROWSER_SHOW_HUD = (
 )
 IDLE_MEDIA_ENV = "PIFRAME_IDLE_MEDIA"
 # Bundled locally so idle display doesn't depend on the NAS being reachable.
-# Prefer an animated idle.mp4 if present, otherwise fall back to a still image.
+# Priority: HTML page > animated mp4 > still png > still jpg.
 _IDLE_MEDIA_DIR = Path(__file__).resolve().parent
 IDLE_MEDIA_DEFAULT_CANDIDATES = (
+    str(_IDLE_MEDIA_DIR / "idle.html"),
     str(_IDLE_MEDIA_DIR / "idle.mp4"),
-    str(_IDLE_MEDIA_DIR / "idle.jpg"),
     str(_IDLE_MEDIA_DIR / "idle.png"),
+    str(_IDLE_MEDIA_DIR / "idle.jpg"),
 )
 
 
@@ -91,7 +92,9 @@ def _default_idle_media() -> str:
                 return candidate
         except OSError:
             continue
-    return IDLE_MEDIA_DEFAULT_CANDIDATES[1]
+    # No bundled idle file present; return the jpg path as a last-resort
+    # placeholder (the renderer treats a missing idle as "blank").
+    return IDLE_MEDIA_DEFAULT_CANDIDATES[-1]
 
 
 IMAGE_EXTENSIONS = {
@@ -616,10 +619,14 @@ class BrowserController:
             return ""
         candidate = idle_url.replace("\\", "/")
         candidates = [candidate]
-        try:
-            candidates.append(str(Path(candidate).with_suffix(".jpg")))
-        except Exception:
-            pass
+        # The .jpg fallback only makes sense for image/video idle media;
+        # an idle.html has no still-image twin to recover to.
+        suffix = Path(candidate).suffix.lower()
+        if suffix not in {".html", ".htm"}:
+            try:
+                candidates.append(str(Path(candidate).with_suffix(".jpg")))
+            except Exception:
+                pass
         for path in candidates:
             try:
                 if path and Path(path).exists():
@@ -643,6 +650,8 @@ class BrowserController:
         ext = Path(path_str.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
         if ext in VIDEO_EXTENSIONS or ext in AUDIO_EXTENSIONS:
             return "video"
+        if ext in {".html", ".htm"}:
+            return "html"
         return "image"
 
     @staticmethod
