@@ -112,12 +112,16 @@ EOF
   fi
 fi
 
-# Detect a broken venv (interpreter symlink pointing at a Python that
-# was removed by an apt upgrade) and recreate it. Without this, the
-# next pip call dies with "cannot execute: required file not found"
-# and the operator has to rm -rf the venv by hand.
-if [[ -d "${VENV_DIR}" ]] && ! "${VENV_DIR}/bin/python" -c "import sys" >/dev/null 2>&1; then
-  echo "Existing venv is broken (interpreter missing). Recreating: ${VENV_DIR}"
+# Detect a broken venv and recreate it. Two ways the venv goes bad
+# after an apt upgrade:
+#   1. The interpreter symlink points at a Python binary that was
+#      removed (e.g. /usr/bin/python3.11 after an upgrade to 3.13).
+#   2. The pip shebang points at the old interpreter even when the
+#      venv's own python still works - so `pip --version` errors with
+#      "required file not found" while `python -c ...` succeeds.
+# Probe both by running pip itself.
+if [[ -d "${VENV_DIR}" ]] && ! "${VENV_DIR}/bin/pip" --version >/dev/null 2>&1; then
+  echo "Existing venv is broken (pip cannot execute). Recreating: ${VENV_DIR}"
   rm -rf "${VENV_DIR}"
 fi
 
