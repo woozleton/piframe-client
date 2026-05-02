@@ -61,6 +61,15 @@ BROWSER_STATE_POLL_MS = 250
 # loop reads the latest reported index and forwards it to the manager.
 BROWSER_EVENT_HOST = "127.0.0.1"
 BROWSER_EVENT_PORT = int(os.environ.get("PIFRAME_BROWSER_EVENT_PORT", "18888"))
+# Audio companion sidecar - separate mpv process so the audio device is
+# decoupled from Chromium's <video>. Chromium on Pi keeps the audio
+# device locked while a video plays (even muted), which prevents an
+# in-page <audio> element from claiming HDMI. mpv opens its own audio
+# stream via PulseAudio/PipeWire (or ALSA dmix), so the audio server
+# mixes them at the OS level.
+COMPANION_MPV_BIN = os.environ.get("PIFRAME_COMPANION_MPV_BIN", "mpv").strip() or "mpv"
+COMPANION_MPV_SOCKET = Path(os.environ.get("PIFRAME_COMPANION_MPV_SOCKET", "/tmp/piframe_companion_mpv.sock"))
+COMPANION_MPV_LOG_FILE = Path("/tmp/piframe_companion_mpv.log")
 BROWSER_TRANSITION = os.environ.get("PIFRAME_BROWSER_TRANSITION", "fade").strip() or "fade"
 BROWSER_TRANSITION_DURATION_MS = max(
     0,
@@ -901,58 +910,197 @@ class BrowserController:
             self._write_state()
         self._persist_audio_state()
 
-    def set_companion(
-        self,
-        items: List[str],
-        *,
-        repeat: bool = True,
-        mute_visual: bool = False,
-    ) -> None:
-        """Update the companion-audio block in the state file. The
-        renderer's hidden <audio> element polls state.companion and
-        plays the queue in parallel with whatever visual content is
-        on screen. Empty items halts the companion.
+    def set_video_mute_override(self, mute: bool) -> None:
+        """Surface the override-mute flag for the renderer's <video>
+        element. The actual companion audio is played by the
+        MpvCompanion sidecar (separate process, separate audio
+        stream, mixed by PulseAudio/PipeWire/dmix at the OS level)
+        - this method only handles the visual side of the override.
 
-        mute_visual is also surfaced as `state.video_mute_override`
-        so the existing video-load + applyLiveAudioState paths mute
-        the visual through the canonical channel (state.muted is the
-        user mute and shouldn't be touched here - the companion needs
-        state.muted to stay false to be audible)."""
+        state.muted is the user mute toggle and shouldn't be touched
+        here. video_mute_override is its own flag, ORed onto state.
+        muted in startFromState + applyLiveAudioState."""
         if not self._ensure_running():
             return
         with self._state_lock:
-            companion_items = [self._make_item(item) for item in items]
-            # Bump a token whenever the queue changes so the renderer
-            # can distinguish "same queue, keep playing" from "new
-            # queue, restart from track one." Without this, polling the
-            # state would re-load every tick.
-            prev = self._state.get("companion") or {}
-            prev_paths = [it.get("src", "") for it in (prev.get("items") or [])]
-            new_paths = [it.get("src", "") for it in companion_items]
-            token = prev.get("token") or 0
-            if prev_paths != new_paths:
-                token += 1
-            active = bool(companion_items)
-            self._state["companion"] = {
-                "items": companion_items,
-                "repeat": bool(repeat),
-                "mute_visual": bool(mute_visual),
-                "token": token,
-                "active": active,
-            }
-            # Override mute applies only while the companion is
-            # actually playing AND mute_visual is on. Off otherwise so
-            # the video resumes audio cleanly when override flips off
-            # or when the companion is cleared.
-            self._state["video_mute_override"] = bool(active and mute_visual)
+            self._state["video_mute_override"] = bool(mute)
             self._write_state()
-        _log(
-            "browser_companion_state_updated",
-            items=len(items),
-            repeat=repeat,
-            mute_visual=mute_visual,
-            video_mute_override=self._state.get("video_mute_override", False),
-        )
+
+
+class MpvCompanion:
+    """Sidecar mpv process for companion audio playback.
+
+    Why a separate process: Chromium on Pi keeps the audio device
+    locked while a <video> is playing, even with muted+volume=0. An
+    in-page <audio> element can't claim HDMI in that state, so the
+    companion never produces sound when override-mute is on. Spinning
+    up a separate mpv process opens its own audio stream through
+    PulseAudio/PipeWire (or ALSA dmix), which the audio server mixes
+    with the Chromium output.
+
+    Lifecycle: spawned on first load(), kept warm afterward, IPC over
+    a Unix socket. Shutdown() during PiFrameClient teardown.
+
+    Mirrors vwm/audio_companion.py from the woozlescape repo - same
+    one-mpv-per-pipe pattern, just on Linux instead of Windows."""
+
+    def __init__(self) -> None:
+        self.process: Optional[subprocess.Popen] = None
+        self._lock = threading.Lock()
+        self._last_volume: float = 75.0
+        self._last_muted: bool = False
+
+    def _is_running(self) -> bool:
+        if self.process is None:
+            return False
+        return self.process.poll() is None
+
+    def _ensure_running(self) -> bool:
+        with self._lock:
+            if self._is_running():
+                return True
+            # Sweep any orphan companion mpv that might still hold the
+            # socket. Without this, a previously-crashed mpv keeps the
+            # socket file alive and the new mpv exits with "Couldn't
+            # bind socket" - mirrors the orphan-sweep pattern in
+            # vwm/audio_companion.py.
+            try:
+                if COMPANION_MPV_SOCKET.exists():
+                    COMPANION_MPV_SOCKET.unlink()
+            except Exception:
+                pass
+            mpv_path = shutil.which(COMPANION_MPV_BIN)
+            if not mpv_path:
+                _log("companion_mpv_missing", binary=COMPANION_MPV_BIN)
+                return False
+            args = [
+                mpv_path,
+                "--no-config",
+                "--idle=yes",
+                "--no-video",
+                "--no-osc",
+                "--no-osd-bar",
+                "--no-input-default-bindings",
+                "--ytdl=no",
+                "--cache=no",
+                "--keep-open=yes",
+                f"--input-ipc-server={COMPANION_MPV_SOCKET}",
+                "--msg-level=all=info",
+                f"--log-file={COMPANION_MPV_LOG_FILE}",
+            ]
+            try:
+                self.process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                _log("companion_mpv_spawn_failed", error=str(exc))
+                return False
+            # Wait briefly for the socket to come up so the next
+            # send_command() doesn't race the spawn.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if COMPANION_MPV_SOCKET.exists():
+                    _log("companion_mpv_started", pid=self.process.pid)
+                    return True
+                if self.process.poll() is not None:
+                    _log("companion_mpv_exited_during_spawn", code=self.process.returncode)
+                    self.process = None
+                    return False
+                time.sleep(0.05)
+            _log("companion_mpv_socket_timeout")
+            return False
+
+    def _send_command(self, cmd: List[Any]) -> bool:
+        """One-shot JSON command send via Unix socket. Best-effort -
+        callers shouldn't depend on the return value beyond logging."""
+        if not self._ensure_running():
+            return False
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect(str(COMPANION_MPV_SOCKET))
+            payload = json.dumps({"command": cmd}).encode("utf-8") + b"\n"
+            sock.sendall(payload)
+            try:
+                sock.recv(4096)  # drain reply, ignore content
+            except (socket.timeout, OSError):
+                pass
+            sock.close()
+            return True
+        except Exception as exc:
+            _log("companion_mpv_ipc_failed", cmd=str(cmd[:1]), error=str(exc))
+            return False
+
+    def load(self, items: List[str], *, repeat: bool = True) -> bool:
+        """Replace the queue with `items` and start playback. Mirrors
+        the loadfile-replace + N-1 appends pattern."""
+        items = [s for s in items if s]
+        if not items:
+            self.stop()
+            return False
+        if not self._ensure_running():
+            return False
+        # Prime mpv: set loop + reset state, then load the queue.
+        self._send_command(["set_property", "loop-file", "no"])
+        self._send_command(["set_property", "loop-playlist", "inf" if repeat else "no"])
+        self._send_command(["set_property", "volume", float(self._last_volume)])
+        self._send_command(["set_property", "mute", bool(self._last_muted)])
+        self._send_command(["loadfile", items[0], "replace"])
+        for path in items[1:]:
+            self._send_command(["loadfile", path, "append"])
+        _log("companion_mpv_loaded", count=len(items), repeat=repeat)
+        return True
+
+    def stop(self) -> None:
+        """Drop the queue + leave mpv idle. Keeps the process warm
+        for the next load (avoids spawn cost)."""
+        if not self._is_running():
+            return
+        self._send_command(["stop"])
+        _log("companion_mpv_stopped")
+
+    def set_volume(self, level: float) -> None:
+        """Forward a volume change to the running mpv. mpv expects
+        0-100. The companion follows the surface volume so the
+        operator's slider always controls what they hear."""
+        try:
+            v = max(0.0, min(100.0, float(level)))
+        except (TypeError, ValueError):
+            return
+        self._last_volume = v
+        if self._is_running():
+            self._send_command(["set_property", "volume", v])
+
+    def set_muted(self, muted: bool) -> None:
+        self._last_muted = bool(muted)
+        if self._is_running():
+            self._send_command(["set_property", "mute", bool(muted)])
+
+    def shutdown(self) -> None:
+        """Kill the mpv process entirely. Used during PiFrameClient
+        teardown so we don't leave orphan companions running."""
+        with self._lock:
+            if not self._is_running():
+                self.process = None
+                return
+            self._send_command(["quit"])
+            try:
+                self.process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                try:
+                    self.process.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            self.process = None
+            try:
+                if COMPANION_MPV_SOCKET.exists():
+                    COMPANION_MPV_SOCKET.unlink()
+            except Exception:
+                pass
 
 
 class _BrowserEventState:
@@ -1066,6 +1214,7 @@ class PiFrameClient:
         self.config = config
         self.ws_connection: Optional[websocket.WebSocketApp] = None
         self.renderer = BrowserController()
+        self.companion_mpv = MpvCompanion()
         self.current_playlist_name: str = ""
         self.current_playlist_id: str = ""
         self.current_video: str = ""
@@ -1098,12 +1247,14 @@ class PiFrameClient:
         self.last_update: Optional[Dict[str, Any]] = _read_and_consume_last_update()
 
     def run(self) -> None:
+        mpv_found = shutil.which(COMPANION_MPV_BIN)
         _log(
             "client_starting",
             client_id=self.config.client_id,
             name=self.config.name,
             server=self.config.server,
             group=self.config.group,
+            companion_mpv=mpv_found or "missing",
         )
         while True:
             try:
@@ -1333,10 +1484,21 @@ class PiFrameClient:
     def _set_companion_state(
         self, items: List[str], *, repeat: bool, mute_visual: bool
     ) -> None:
-        """Update the renderer's companion-audio state. The renderer
-        polls state.companion and (re)loads its hidden <audio> element
-        when items change. Empty items halts the companion."""
-        self.renderer.set_companion(items, repeat=repeat, mute_visual=mute_visual)
+        """Drive the audio companion. Audio plays through the
+        MpvCompanion sidecar (separate process - Chromium on Pi
+        locks the audio device while a video plays, so an in-page
+        <audio> element can't claim HDMI). The renderer's
+        video_mute_override flag handles the visual side of the
+        override-mute path."""
+        if items:
+            self.companion_mpv.load(items, repeat=repeat)
+        else:
+            self.companion_mpv.stop()
+        # Visual side: video_mute_override applies only while companion
+        # is actually playing AND mute_visual is on. Off otherwise so
+        # the video resumes audio cleanly when override flips off or
+        # the companion is cleared.
+        self.renderer.set_video_mute_override(bool(items) and bool(mute_visual))
 
     def _handle_pause(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
@@ -1444,6 +1606,10 @@ class PiFrameClient:
             level = 75
         _log("volume_command", level=level)
         self.renderer.set_volume(level)
+        # Companion mpv tracks the same volume so the operator's slider
+        # controls what they hear regardless of which output is active.
+        self.companion_mpv.set_volume(level)
+        self.companion_mpv.set_muted(level <= 0)
 
     def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
         """Server-pushed in-place update. Spawns `update.sh` from the
@@ -1485,6 +1651,10 @@ class PiFrameClient:
 
     def shutdown(self) -> None:
         self.renderer.shutdown()
+        try:
+            self.companion_mpv.shutdown()
+        except Exception:
+            pass
         self._stop_status_updates()
         self._stop_browser_event_server()
 
