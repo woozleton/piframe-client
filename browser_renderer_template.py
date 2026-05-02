@@ -1091,50 +1091,16 @@ def render_browser_html(
         // mix", "acid wiring", "chain breaker", "fruit machine").
         // Fall back to all-presets if the bundle has shifted under
         // us so the visualizer never goes silent.
+        // Operator's hand-picked favorites. Tight list - everything
+        // outside this exact set is excluded. If the bundle ever
+        // ships without one of these, the fallback below picks
+        // every preset so the visualizer never goes silent.
         const NAMED_ALLOW = [
-          // Eo.S. - all three are dreamy / glowy / slow
-          "eo.s. + phat - cubetrace - v2",
-          "eo.s. + zylot - skylight",
-          "eo.s. - glowsticks v2",
-          // Amandio C. collaborations (generally slow)
-          "flexi + amandio c - piercing 05",
-          "flexi + amandio c - organic [random mashup]",
-          "flexi + amandio c - organic12-3d-2",
-          // Aderrasi calm titles
-          "aderrasi - songflower",
-          "aderrasi + geiss - airhandler",
-          "aderrasi - storm of the eye",
-          // Martin - calm-themed titles only
-          "martin - the bridge of khazad-dum",
-          "martin - angel flight",
-          "martin - bombyx mori",
-          "martin - castle in the air",
-          "martin - frosty caves",
-          "martin - ghost city",
-          "martin - glass corridor",
-          "martin - infinity",
-          "martin - reflections on black tiles",
-          "martin - stormy sea",
           "martin - witchcraft reloaded",
+          "martin - reflections on black tiles",
+          "flexi + amandio c - organic12-3d-2",
           "martin - chain breaker",
           "martin [shadow harlequins shape code] - fata morgana",
-          // Flexi soft-themed
-          "flexi - truly soft piece of software",
-          "flexi - mom, why the sky looks different today",
-          "flexi - swing out on the spiral",
-          // Geiss radial / reaction-diffusion (slow shaders)
-          "geiss - reaction diffusion 2",
-          "geiss - spiral artifact",
-          "_geiss - artifact 01",
-          "_geiss - desert rose 2",
-          "_geiss - untitled",
-          // fishbrain + flexi witchcraft is dreamy despite the name
-          "fishbrain + flexi - witchcraft 2.0",
-          // Cope soft mother-of-pearl
-          "cope + martin - mother-of-pearl",
-          // TonyMilkdrop's nebula / balloon - slow drifting
-          "tonymilkdrop - magellan's nebula",
-          "tonymilkdrop - leonardo da vinci's balloon",
         ];
         const all = Object.keys(allMap);
         const curated = all.filter((n) => {{
