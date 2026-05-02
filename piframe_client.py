@@ -730,11 +730,15 @@ class BrowserController:
             "--password-store=basic",
             "--allow-file-access-from-files",
             "--autoplay-policy=no-user-gesture-required",
-            # Force EGL + ignore the GPU blocklist so WebGL works on
-            # the Pi's V3D driver. Without this, Butterchurn's WebGL
-            # context creation silently fails on some Chromium builds
-            # under cage+wayland and the audio visualizer shows blue.
-            "--use-gl=egl",
+            # WebGL on Pi under cage+wayland: hardware path via the
+            # V3D Mesa driver works on a properly-equipped Pi 5, but
+            # cage doesn't always forward DRM access into the
+            # sandboxed renderer. Fall back to SwiftShader (software
+            # WebGL) so Butterchurn always gets a context. Software
+            # path runs ~10-15fps with the curated presets - usable.
+            "--use-gl=angle",
+            "--use-angle=swiftshader",
+            "--enable-unsafe-swiftshader",
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
             BROWSER_HTML_FILE.as_uri(),
