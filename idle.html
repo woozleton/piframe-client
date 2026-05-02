@@ -6,17 +6,14 @@
 <style>
   /* ===== USER CONFIG ===== */
   :root {
-    --interval: 5s;
-    --logo-width: 53%;
-    --horizon: 49%;
+    --interval: 60s;
+    --logo-width: 25%;
+    --horizon: 50%;
     --gap: 18px;
     --reflection-opacity: 0.3;
     --reflection-blur: 1px;
-    --glow-opacity: 0.35;
+    --glow-opacity: 0.10;
     --glow-color: 209;
-
-    /* Random mode rotation interval (how often the active mode changes) */
-    --rotate-interval: 60s;
 
     /* o piece geometry — derived from logo PNG, do not change */
     --o1-left: 34.20%;
@@ -588,11 +585,6 @@
           <input type="checkbox" id="rotateToggle" checked onchange="toggleRotation()">
           <label for="rotateToggle" style="font-size:11px;color:rgba(255,255,255,0.7);">Random rotation</label>
         </div>
-        <div class="control-row">
-          <span class="control-label">Switch every</span>
-          <input type="range" min="5" max="120" step="1" value="20" data-var="--rotate-interval" data-suffix="s">
-          <span class="control-value" data-display="--rotate-interval">20s</span>
-        </div>
       </div>
 
       <div class="section">
@@ -613,9 +605,9 @@
           <button class="mode-btn" data-mode="none" onclick="setMode(this, true)">Still</button>
         </div>
         <div class="control-row" style="margin-top:10px;">
-          <span class="control-label">Animation</span>
-          <input type="range" min="3" max="30" step="1" value="5" data-var="--interval" data-suffix="s">
-          <span class="control-value" data-display="--interval">5s</span>
+          <span class="control-label">Cycle</span>
+          <input type="range" min="5" max="120" step="1" value="60" data-var="--interval" data-suffix="s">
+          <span class="control-value" data-display="--interval">60s</span>
         </div>
       </div>
 
@@ -678,6 +670,14 @@
 
 <script>
   // ===== Mode rotation =====
+  // Reads --interval from CSS :root above. To change the cycle, edit that.
+  function getIntervalMs() {
+    const val = getComputedStyle(document.documentElement)
+      .getPropertyValue('--interval').trim();
+    const num = parseFloat(val);
+    return isNaN(num) ? 60000 : num * 1000;
+  }
+
   const MODES = ['pulse', 'drift', 'shimmer', 'scan', 'swap', 'swap-3d',
                  'spin', 'tilt', 'pop', 'stretch', 'wobble', 'hue'];
   let rotationEnabled = true;
@@ -695,6 +695,7 @@
   }
 
   function applyMode(mode) {
+    console.log('[woozlescape] Applying mode:', mode);
     document.body.className = 'mode-' + mode;
     // Update active button if controls visible
     document.querySelectorAll('.mode-btn').forEach(b => {
@@ -703,11 +704,7 @@
   }
 
   function getRotateIntervalMs() {
-    const val = getComputedStyle(document.documentElement)
-      .getPropertyValue('--rotate-interval').trim();
-    // Parse "20s" -> 20000
-    const num = parseFloat(val);
-    return isNaN(num) ? 20000 : num * 1000;
+    return getIntervalMs();
   }
 
   function startRotation() {
@@ -723,9 +720,18 @@
     rotationTimer = null;
   }
 
-  // Kick off with a random mode immediately
-  applyMode(pickRandomMode());
-  startRotation();
+  // Wait until DOM is fully ready, then kick off
+  function init() {
+    console.log('[woozlescape] Initializing, interval:', getIntervalMs(), 'ms');
+    applyMode(pickRandomMode());
+    startRotation();
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
 
   // ===== Controls (only active when panel is shown) =====
   const root = document.documentElement;
@@ -742,8 +748,8 @@
     else display.textContent = val;
     root.style.setProperty(varName, val + suffix);
 
-    // If the rotation interval changed, restart the timer
-    if (varName === '--rotate-interval') {
+    // If the cycle interval changed, restart the rotation timer
+    if (varName === '--interval') {
       startRotation();
     }
     updateCSSOutput();
@@ -784,8 +790,7 @@
     const defaults = {
       '--logo-width': 53, '--horizon': 49, '--gap': 18,
       '--reflection-opacity': 0.3, '--reflection-blur': 1,
-      '--glow-opacity': 0.35, '--glow-color': 209, '--interval': 5,
-      '--rotate-interval': 20
+      '--glow-opacity': 0.35, '--glow-color': 209, '--interval': 60
     };
     Object.entries(defaults).forEach(([key, val]) => {
       const slider = document.querySelector(`[data-var="${key}"]`);
