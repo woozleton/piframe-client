@@ -5,17 +5,20 @@
 <title>WoozleScape - Glass</title>
 <style>
   /* ===== USER CONFIG ===== */
-	:root {
-	  --cycle: 60s;
-	  --interval: 5s;
-	  --logo-width: 38%;
-	  --horizon: 50%;
-	  --gap: 21px;
-	  --reflection-opacity: 0.2;
-	  --reflection-blur: 1px;
-	  --glow-opacity: 0;
-	  --glow-color: 0;
-
+:root {
+  --cycle: 60s;
+  --interval: 5s;
+  --logo-width: 50%;
+  --horizon: 50%;
+  --gap: 15px;
+  --reflection-opacity: 0.4;
+  --reflection-blur: 1px;
+  --refl-fade-start: 0.6;
+  --refl-fade-mid: 0.15;
+  --refl-fade-mid-pos: 67%;
+  --refl-fade-end-pos: 100%;
+  --glow-opacity: 0.2;
+  --glow-color: 209;
 
     /* o piece geometry — derived from logo PNG, do not change */
     --o1-left: 34.20%;
@@ -110,15 +113,13 @@
     opacity: var(--reflection-opacity);
     filter: blur(var(--reflection-blur));
     -webkit-mask-image: linear-gradient(180deg,
-      rgba(0,0,0,1) 0%,
-      rgba(0,0,0,0.6) 20%,
-      rgba(0,0,0,0.2) 50%,
-      rgba(0,0,0,0) 90%);
+      rgba(0,0,0, var(--refl-fade-start)) 0%,
+      rgba(0,0,0, var(--refl-fade-mid)) var(--refl-fade-mid-pos),
+      rgba(0,0,0, 0) var(--refl-fade-end-pos));
     mask-image: linear-gradient(180deg,
-      rgba(0,0,0,1) 0%,
-      rgba(0,0,0,0.6) 20%,
-      rgba(0,0,0,0.2) 50%,
-      rgba(0,0,0,0) 90%);
+      rgba(0,0,0, var(--refl-fade-start)) 0%,
+      rgba(0,0,0, var(--refl-fade-mid)) var(--refl-fade-mid-pos),
+      rgba(0,0,0, 0) var(--refl-fade-end-pos));
   }
 
   .refl-animator {
@@ -649,6 +650,26 @@
           <input type="range" min="0" max="8" step="0.5" value="1" data-var="--reflection-blur" data-suffix="px">
           <span class="control-value" data-display="--reflection-blur">1px</span>
         </div>
+        <div class="control-row">
+          <span class="control-label">Fade top</span>
+          <input type="range" min="0" max="1" step="0.05" value="1" data-var="--refl-fade-start">
+          <span class="control-value" data-display="--refl-fade-start">1.00</span>
+        </div>
+        <div class="control-row">
+          <span class="control-label">Fade mid</span>
+          <input type="range" min="0" max="1" step="0.05" value="0.4" data-var="--refl-fade-mid">
+          <span class="control-value" data-display="--refl-fade-mid">0.40</span>
+        </div>
+        <div class="control-row">
+          <span class="control-label">Mid at</span>
+          <input type="range" min="10" max="80" step="1" value="35" data-var="--refl-fade-mid-pos" data-suffix="%">
+          <span class="control-value" data-display="--refl-fade-mid-pos">35%</span>
+        </div>
+        <div class="control-row">
+          <span class="control-label">Fade end</span>
+          <input type="range" min="30" max="100" step="1" value="85" data-var="--refl-fade-end-pos" data-suffix="%">
+          <span class="control-value" data-display="--refl-fade-end-pos">85%</span>
+        </div>
       </div>
 
       <div class="section">
@@ -804,7 +825,9 @@
     const defaults = {
       '--logo-width': 53, '--horizon': 49, '--gap': 18,
       '--reflection-opacity': 0.3, '--reflection-blur': 1,
-      '--glow-opacity': 0.35, '--glow-color': 209, '--interval': 5, '--cycle': 60
+      '--glow-opacity': 0.35, '--glow-color': 209, '--interval': 5, '--cycle': 60,
+      '--refl-fade-start': 1, '--refl-fade-mid': 0.4,
+      '--refl-fade-mid-pos': 35, '--refl-fade-end-pos': 85
     };
     Object.entries(defaults).forEach(([key, val]) => {
       const slider = document.querySelector(`[data-var="${key}"]`);
