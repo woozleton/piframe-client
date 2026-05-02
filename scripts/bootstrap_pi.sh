@@ -112,6 +112,15 @@ EOF
   fi
 fi
 
+# Detect a broken venv (interpreter symlink pointing at a Python that
+# was removed by an apt upgrade) and recreate it. Without this, the
+# next pip call dies with "cannot execute: required file not found"
+# and the operator has to rm -rf the venv by hand.
+if [[ -d "${VENV_DIR}" ]] && ! "${VENV_DIR}/bin/python" -c "import sys" >/dev/null 2>&1; then
+  echo "Existing venv is broken (interpreter missing). Recreating: ${VENV_DIR}"
+  rm -rf "${VENV_DIR}"
+fi
+
 if [[ ! -d "${VENV_DIR}" ]]; then
   python3 -m venv "${VENV_DIR}"
 fi
