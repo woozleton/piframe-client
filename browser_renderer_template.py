@@ -1047,17 +1047,69 @@ def render_browser_html(
       }}
 
       function pickPresetNames(allMap) {{
+        // Curated calm allow-list, hand-matched against the actual
+        // butterchurn-presets v2.4.7 bundle (~85 presets). Names
+        // chosen on two signals:
+        //   - "calm" thematic words in the filename (drift, frosty,
+        //     glass, stormy sea, organic, glowsticks, songflower,
+        //     reaction diffusion, etc.).
+        //   - Author trends: Eo.S. + Amandio C. consistently calm;
+        //     Martin's slower titles (excluding "extreme heat"-type
+        //     names); Geiss's reaction-diffusion + radial work.
+        // Specific titles excluded that match an author prefix but
+        // are clearly fast (e.g. martin's "extreme heat", "disco
+        // mix", "acid wiring", "chain breaker", "fruit machine").
+        // Fall back to all-presets if the bundle has shifted under
+        // us so the visualizer never goes silent.
+        const NAMED_ALLOW = [
+          // Eo.S. - all three are dreamy / glowy / slow
+          "eo.s. + phat - cubetrace - v2",
+          "eo.s. + zylot - skylight",
+          "eo.s. - glowsticks v2",
+          // Amandio C. collaborations (generally slow)
+          "flexi + amandio c - piercing 05",
+          "flexi + amandio c - organic [random mashup]",
+          "flexi + amandio c - organic12-3d-2",
+          // Aderrasi calm titles
+          "aderrasi - songflower",
+          "aderrasi + geiss - airhandler",
+          "aderrasi - storm of the eye",
+          // Martin - calm-themed titles only
+          "martin - the bridge of khazad-dum",
+          "martin - angel flight",
+          "martin - bombyx mori",
+          "martin - castle in the air",
+          "martin - frosty caves",
+          "martin - ghost city",
+          "martin - glass corridor",
+          "martin - infinity",
+          "martin - reflections on black tiles",
+          "martin - stormy sea",
+          // Flexi soft-themed
+          "flexi - truly soft piece of software",
+          "flexi - mom, why the sky looks different today",
+          "flexi - swing out on the spiral",
+          // Geiss radial / reaction-diffusion (slow shaders)
+          "geiss - reaction diffusion 2",
+          "geiss - spiral artifact",
+          "_geiss - artifact 01",
+          "_geiss - desert rose 2",
+          "_geiss - untitled",
+          // fishbrain + flexi witchcraft is dreamy despite the name
+          "fishbrain + flexi - witchcraft 2.0",
+          // Cope soft mother-of-pearl
+          "cope + martin - mother-of-pearl",
+          // TonyMilkdrop's nebula / balloon - slow drifting
+          "tonymilkdrop - magellan's nebula",
+          "tonymilkdrop - leonardo da vinci's balloon",
+        ];
         const all = Object.keys(allMap);
         const curated = all.filter((n) => {{
           const low = n.toLowerCase();
-          if (low.includes("extreme")) return false;
-          if (low.includes("royal")) return false;
-          if (low.includes("aurora")) return true;
-          if (low.includes("flexi")) return true;
-          if (low.includes("martin")) return true;
-          if (low.includes("geiss")) return true;
-          if (low.includes("zylot")) return true;
-          return (n.length % 3) === 0;
+          for (const allow of NAMED_ALLOW) {{
+            if (low.includes(allow)) return true;
+          }}
+          return false;
         }});
         return curated.length ? curated : all;
       }}
