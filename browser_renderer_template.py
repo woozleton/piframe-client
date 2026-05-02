@@ -309,6 +309,10 @@ def render_browser_html(
       <video id="video1" class="media video" muted playsinline preload="auto"></video>
       <iframe id="html1" class="html-frame" sandbox="allow-scripts allow-same-origin"></iframe>
     </div>
+    <!-- Audio companion: hidden <audio> element that plays a
+         background queue in parallel with whatever visual is on
+         stage. Polled out of state.companion. -->
+    <audio id="companionAudio" preload="auto" style="display:none;"></audio>
   </div>
   <div id="banner" class="banner"></div>
   <div id="osd" class="osd">
@@ -1010,10 +1014,83 @@ def render_browser_html(
         }}
         activeState = state;
         applyLiveAudioState(state);
+        applyCompanionState(state);
       }} catch (error) {{
         // ignore transient read errors while state file is being replaced
       }}
     }}
+
+    /* ============================================================
+       Audio companion playback. Hidden <audio> element that loops
+       through state.companion.items when companion.active is true.
+       Falls back to muting the visual when companion.mute_visual is
+       set (override-embedded-audio path).
+       ============================================================ */
+    let companionToken = -1;
+    let companionQueueIndex = 0;
+    let companionItems = [];
+    let companionRepeat = true;
+
+    function applyCompanionState(state) {{
+      const companionAudio = document.getElementById("companionAudio");
+      if (!companionAudio) return;
+      const comp = state.companion || null;
+      const newToken = comp && typeof comp.token === "number" ? comp.token : -1;
+      const wantActive = !!(comp && comp.active && Array.isArray(comp.items) && comp.items.length);
+
+      // Visual mute: when the companion is active AND mute_visual
+      // is set (override-embedded-audio path), force the visual
+      // <video> elements muted so the companion audio is the only
+      // thing the user hears. When inactive, restore the user/state-
+      // configured mute (state.muted is the canonical user toggle,
+      // dataset.desiredMuted carries that through transitions).
+      const muteVisual = !!(comp && comp.mute_visual && wantActive);
+      stages.forEach((stage) => {{
+        if (!stage.video) return;
+        if (muteVisual) {{
+          stage.video.muted = true;
+        }} else {{
+          // Restore the user/state-configured mute state.
+          stage.video.muted = stage.video.dataset.desiredMuted === "true" || !!state.muted;
+        }}
+      }});
+
+      // Volume: companion follows the surface's volume + user mute,
+      // so the volume slider on the operator's UI always controls
+      // what they hear regardless of which element is playing.
+      const userMuted = !!state.muted;
+      const userVolume = Math.max(0, Math.min(1, (state.volume || 0) / 100));
+      companionAudio.muted = userMuted;
+      companionAudio.volume = userVolume;
+
+      if (newToken !== companionToken) {{
+        companionToken = newToken;
+        companionItems = wantActive ? comp.items.map((it) => it.src || "").filter(Boolean) : [];
+        companionRepeat = !!(comp && comp.repeat !== false);
+        companionQueueIndex = 0;
+        if (companionItems.length) {{
+          companionAudio.src = companionItems[0];
+          companionAudio.loop = false;
+          companionAudio.play().catch(() => {{ /* autoplay may need a gesture once */ }});
+        }} else {{
+          try {{ companionAudio.pause(); }} catch (_) {{}}
+          companionAudio.removeAttribute("src");
+          companionAudio.load();
+        }}
+      }} else if (!wantActive && !companionAudio.paused) {{
+        try {{ companionAudio.pause(); }} catch (_) {{}}
+      }}
+    }}
+
+    document.getElementById("companionAudio").addEventListener("ended", function () {{
+      if (!companionItems.length) return;
+      companionQueueIndex = (companionQueueIndex + 1) % companionItems.length;
+      if (companionQueueIndex === 0 && !companionRepeat) {{
+        return;
+      }}
+      this.src = companionItems[companionQueueIndex];
+      this.play().catch(() => {{}});
+    }});
 
     window.addEventListener("resize", () => {{
       const activeStage = getActiveStage();

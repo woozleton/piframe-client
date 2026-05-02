@@ -901,6 +901,46 @@ class BrowserController:
             self._write_state()
         self._persist_audio_state()
 
+    def set_companion(
+        self,
+        items: List[str],
+        *,
+        repeat: bool = True,
+        mute_visual: bool = False,
+    ) -> None:
+        """Update the companion-audio block in the state file. The
+        renderer's hidden <audio> element polls state.companion and
+        plays the queue in parallel with whatever visual content is
+        on screen. Empty items halts the companion."""
+        if not self._ensure_running():
+            return
+        with self._state_lock:
+            companion_items = [self._make_item(item) for item in items]
+            # Bump a token whenever the queue changes so the renderer
+            # can distinguish "same queue, keep playing" from "new
+            # queue, restart from track one." Without this, polling the
+            # state would re-load every tick.
+            prev = self._state.get("companion") or {}
+            prev_paths = [it.get("src", "") for it in (prev.get("items") or [])]
+            new_paths = [it.get("src", "") for it in companion_items]
+            token = prev.get("token") or 0
+            if prev_paths != new_paths:
+                token += 1
+            self._state["companion"] = {
+                "items": companion_items,
+                "repeat": bool(repeat),
+                "mute_visual": bool(mute_visual),
+                "token": token,
+                "active": bool(companion_items),
+            }
+            self._write_state()
+        _log(
+            "browser_companion_state_updated",
+            items=len(items),
+            repeat=repeat,
+            mute_visual=mute_visual,
+        )
+
 
 class _BrowserEventState:
     """Thread-safe holder for the latest events the browser pushes back to
@@ -1197,13 +1237,25 @@ class PiFrameClient:
     def _handle_audio_playlist(
         self, data: Dict[str, Any], params: Dict[str, Any]
     ) -> None:
-        """Audio playlist dispatch. Treats audio files the same way
-        the video-playlist path treats videos - the renderer's
-        play_video_playlist accepts any media URL Chromium can play
-        through its <video> element, which includes the common audio
-        formats. The orchestrator-side `target` field (default "hdmi")
-        is reserved for future per-target audio routing; v1 always
-        plays through the browser's default ALSA -> HDMI audio path.
+        """Audio playlist dispatch. Two distinct cases keyed by the
+        `is_companion` flag:
+
+        - is_companion=False (default): direct audio playback.
+          Replaces the visual content with the audio output.
+          Treats audio files the same way the video-playlist path
+          treats videos - the renderer's play_video_playlist accepts
+          any media URL Chromium can play through its <video> element,
+          which includes the common audio formats.
+
+        - is_companion=True: background audio that plays in parallel
+          with whatever visual content is on screen. Routed to the
+          renderer's separate <audio> element so the visual content
+          (image or silent video) keeps playing. Empty items signals
+          "stop the companion."
+
+        The orchestrator-side `target` field (default "hdmi") is
+        reserved for future per-target audio routing; v1 always plays
+        through the browser's default ALSA -> HDMI audio path.
         """
         playlist_name, playlist_id = self._playlist_context(data, params)
         items = self._normalized_items(
@@ -1212,6 +1264,28 @@ class PiFrameClient:
         )
         repeat = _coerce_bool(params.get("repeat", data.get("repeat", True)), default=True)
         target = (params.get("target") or data.get("target") or "hdmi")
+        is_companion = _coerce_bool(
+            params.get("is_companion", data.get("is_companion", False)),
+            default=False,
+        )
+        mute_visual = _coerce_bool(
+            params.get("mute_visual", data.get("mute_visual", False)),
+            default=False,
+        )
+
+        if is_companion:
+            self._set_companion_state(items, repeat=repeat, mute_visual=mute_visual)
+            _log(
+                "audio_companion_command",
+                items=len(items),
+                repeat=repeat,
+                mute_visual=mute_visual,
+                target=target,
+                playlist=playlist_name or "",
+                playlist_id=playlist_id or "",
+            )
+            return
+
         self.current_playlist_name = playlist_name
         self.current_playlist_id = playlist_id
         _log(
@@ -1238,7 +1312,18 @@ class PiFrameClient:
             self.slideshow_started_at = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
             BROWSER_EVENT_STATE.set_paused(False)
+            # Starting direct audio playback supersedes any companion
+            # that was running - the surface is now an audio device.
+            self._set_companion_state([], repeat=False, mute_visual=False)
             self._send_render_command()
+
+    def _set_companion_state(
+        self, items: List[str], *, repeat: bool, mute_visual: bool
+    ) -> None:
+        """Update the renderer's companion-audio state. The renderer
+        polls state.companion and (re)loads its hidden <audio> element
+        when items change. Empty items halts the companion."""
+        self.renderer.set_companion(items, repeat=repeat, mute_visual=mute_visual)
 
     def _handle_pause(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
@@ -1264,7 +1349,23 @@ class PiFrameClient:
 
     def _handle_stop(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
-        _log("stop_command", playlist=playlist_name or "", playlist_id=playlist_id or "")
+        is_companion = _coerce_bool(
+            params.get("is_companion", data.get("is_companion", False)),
+            default=False,
+        )
+        _log(
+            "stop_command",
+            playlist=playlist_name or "",
+            playlist_id=playlist_id or "",
+            is_companion=is_companion,
+        )
+        if is_companion:
+            # Companion-only stop: halt the background audio without
+            # disturbing the visual. Used when the routing rule flips
+            # from "companion plays" to "companion off" mid-content
+            # (e.g. transitioning from image to video-with-audio).
+            self._set_companion_state([], repeat=False, mute_visual=False)
+            return
         if self.renderer.last_command:
             self._send_render_command(action="stop")
         self.renderer.show_idle(self._get_idle_media())
@@ -1274,6 +1375,9 @@ class PiFrameClient:
         self.slideshow_started_at = None
         BROWSER_EVENT_STATE.clear_slideshow_index()
         BROWSER_EVENT_STATE.set_paused(False)
+        # Full stop also halts any running companion - the surface is
+        # idle now.
+        self._set_companion_state([], repeat=False, mute_visual=False)
 
     def _handle_slideshow(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
