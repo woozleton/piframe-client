@@ -1098,6 +1098,18 @@ def render_browser_html(
       companionAudio.muted = userMuted;
       companionAudio.volume = userVolume;
 
+      function notifyCompanionEvent(payload) {{
+        if (!eventEndpoint) return;
+        try {{
+          fetch(eventEndpoint, {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(Object.assign({{type: "companion_diag"}}, payload)),
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_) {{ /* ignore */ }}
+      }}
+
       if (newToken !== companionToken) {{
         companionToken = newToken;
         companionItems = wantActive ? comp.items.map((it) => it.src || "").filter(Boolean) : [];
@@ -1107,19 +1119,27 @@ def render_browser_html(
           companionAudio.src = companionItems[0];
           companionAudio.loop = false;
           companionAudio.load();
-          companionAudio.play().catch((err) => {{
-            console.warn("companion play failed", err);
+          notifyCompanionEvent({{event: "load", src: companionItems[0], muted: companionAudio.muted, volume: companionAudio.volume}});
+          companionAudio.play().then(() => {{
+            notifyCompanionEvent({{event: "play_ok", src: companionItems[0], paused: companionAudio.paused}});
+          }}).catch((err) => {{
+            notifyCompanionEvent({{event: "play_err", src: companionItems[0], err: String(err && err.message || err)}});
           }});
         }} else {{
           try {{ companionAudio.pause(); }} catch (_) {{}}
           companionAudio.removeAttribute("src");
           companionAudio.load();
+          notifyCompanionEvent({{event: "stop"}});
         }}
       }} else if (wantActive && companionAudio.paused) {{
         // Token unchanged but we expect companion to play - happens
         // when state arrives multiple times during a transition.
         // .play() is idempotent and a no-op when already playing.
-        companionAudio.play().catch(() => {{}});
+        companionAudio.play().then(() => {{
+          notifyCompanionEvent({{event: "resume_ok"}});
+        }}).catch((err) => {{
+          notifyCompanionEvent({{event: "resume_err", err: String(err && err.message || err)}});
+        }});
       }} else if (!wantActive && !companionAudio.paused) {{
         try {{ companionAudio.pause(); }} catch (_) {{}}
       }}
