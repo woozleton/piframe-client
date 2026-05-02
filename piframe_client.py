@@ -1093,6 +1093,10 @@ class MpvCompanion:
         self._lock = threading.Lock()
         self._last_volume: float = 75.0
         self._last_muted: bool = False
+        # Tracked for the toggle path - the WS 'pause' command is a
+        # toggle (browser flips its own state on each press), so the
+        # companion mirrors by flipping this flag too.
+        self._paused: bool = False
 
     def _is_running(self) -> bool:
         if self.process is None:
@@ -1205,6 +1209,13 @@ class MpvCompanion:
         self._send_command(["set_property", "loop-playlist", "inf" if repeat else "no"])
         self._send_command(["set_property", "volume", float(self._last_volume)])
         self._send_command(["set_property", "mute", bool(self._last_muted)])
+        # Fresh content always starts unpaused. Without this, a stale
+        # _paused=True from an earlier pause-toggle would silence the
+        # newly-loaded queue and the operator would think nothing was
+        # playing. The pause command also wouldn't fix it because the
+        # toggle logic flips it to True again.
+        self._paused = False
+        self._send_command(["set_property", "pause", False])
         self._send_command(["loadfile", items[0], "replace"])
         for path in items[1:]:
             self._send_command(["loadfile", path, "append"])
@@ -1235,6 +1246,23 @@ class MpvCompanion:
         self._last_muted = bool(muted)
         if self._is_running():
             self._send_command(["set_property", "mute", bool(muted)])
+
+    def toggle_pause(self) -> None:
+        """Flip mpv's `pause` property. Mirrors the browser's pause
+        toggle so the companion stops/resumes alongside the visual.
+        No-op when mpv isn't running (companion not started yet)."""
+        if not self._is_running():
+            return
+        self._paused = not self._paused
+        self._send_command(["set_property", "pause", bool(self._paused)])
+
+    def set_paused(self, paused: bool) -> None:
+        """Explicit-state variant of toggle_pause for callers that
+        already know which state to land in (e.g. recovering from a
+        drift between browser-toggle count and companion state)."""
+        self._paused = bool(paused)
+        if self._is_running():
+            self._send_command(["set_property", "pause", bool(paused)])
 
     def shutdown(self) -> None:
         """Kill the mpv process entirely. Used during PiFrameClient
@@ -1679,6 +1707,14 @@ class PiFrameClient:
         # underlying media kind (slideshow / playing / stopped).
         self.renderer.toggle_pause()
         self._send_render_command(action="pause")
+        # Companion plays alongside visual content, so it pauses with
+        # the visual. Toggle mirrors the browser's toggle - both flip
+        # on each press, so they stay in lockstep without us needing
+        # to know the resulting state.
+        try:
+            self.companion_mpv.toggle_pause()
+        except Exception as exc:
+            _log("companion_pause_error", error=str(exc))
 
     def _handle_next(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
