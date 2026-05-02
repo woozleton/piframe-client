@@ -1054,11 +1054,15 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
         elif kind == "companion_diag":
             # Diagnostic firehose from the renderer's companion path.
             # Logged via _log so it shows up in journalctl alongside
-            # the rest of the client activity.
-            _log(
-                "companion_diag",
-                **{k: v for k, v in payload.items() if k != "type"},
-            )
+            # the rest of the client activity. The renderer payload's
+            # `event` key is the diagnostic verb (load / play_ok /
+            # play_err / etc) - rename to `phase` because `event` is
+            # _log's first positional arg and would collide.
+            fields = {k: v for k, v in payload.items() if k != "type"}
+            phase = fields.pop("event", None)
+            if phase is not None:
+                fields["phase"] = phase
+            _log("companion_diag", **fields)
         # Always return 204; CORS header lets the browser stop spamming
         # console errors when it crosses the file:// -> http:// boundary.
         self.send_response(204)
