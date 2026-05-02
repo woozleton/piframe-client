@@ -12,13 +12,13 @@ This client now uses one browser-based renderer for:
 
 ## Files
 
-- `piframe_client.py` - WebSocket client + browser orchestrator
+- `piframe_client.py` - WebSocket client + browser orchestrator + audio companion sidecar
 - `browser_renderer_template.py` - Chromium kiosk HTML/JS template
 - `update.sh` - in-place self-updater (see Self-update below)
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
-- `idle.jpg`
+- `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
 - `/etc/systemd/system/piframe-client.service` (installed by bootstrap)
 
 ## How It Works
@@ -46,11 +46,12 @@ The client currently handles these server-side commands:
 
 - `play`
 - `video_playlist`
+- `audio_playlist` (direct audio + companion mode via `is_companion: true`)
 - `slideshow`
 - `pause`
 - `next`
 - `previous`
-- `stop`
+- `stop` (also accepts `is_companion: true` to halt only the companion)
 - `volume`
 - `update_self` (see Self-update below)
 
@@ -58,6 +59,12 @@ Single-video note:
 
 - the server may normalize a bare `play` request into a one-item `video_playlist`
 - the client detects that one-item video playlist case and renders it locally as a true single video
+
+Audio companion note:
+
+- when `audio_playlist` arrives with `is_companion: true`, the client routes the audio to a sidecar `mpv` process instead of replacing the visual content
+- the visual `<video>` is muted (when `mute_visual: true`) so the companion is the only audio source the operator hears
+- see [Audio](#audio) for the OS-level audio mixer requirement
 
 ## Display Features
 
@@ -100,8 +107,7 @@ Current service configuration:
 [Unit]
 Description=PiFrame Client
 After=network-online.target mnt-nas.mount
-Requires=network-online.target mnt-nas.mount
-Wants=network-online.target
+Wants=network-online.target mnt-nas.mount
 
 [Service]
 User=woozleton
@@ -111,9 +117,27 @@ Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PIFRAME_SERVER=ws://...
+Environment=PIFRAME_NAS_ROOT=/mnt/nas
 
 [Install]
 WantedBy=multi-user.target
+```
+
+The `Wants=` (vs `Requires=`) on `network-online.target` and the NAS
+mount unit lets the service come up at boot even when those have a
+slow / degraded start. The client itself reconnects on its own retry
+loop and tolerates a briefly-unavailable NAS, so soft dependencies
+are the right shape.
+
+User lingering must be enabled for the service user so
+`/run/user/<uid>` exists at boot for cage / Chromium's Wayland
+socket. `bootstrap_pi.sh` runs `loginctl enable-linger <user>`
+automatically. On a Pi bootstrapped before that change was added,
+run it manually once:
+
+```bash
+sudo loginctl enable-linger $USER
 ```
 
 Useful commands:
@@ -209,13 +233,27 @@ sudo ./scripts/bootstrap_pi.sh --user <user> --server ws://<manager-ip>:8080/ws
 What it does:
 
 - installs `gh` and `git`
-- installs required apt packages
+- installs required apt packages (chromium, cage, seatd, wlrctl,
+  alsa-utils, mpv for the audio companion)
 - installs and enables `seatd`
 - installs `wlrctl` for compositor-level cursor parking
 - creates `/home/<user>/piframe_client/api-env`
 - installs Python requirements from `requirements.txt`
 - writes `/etc/systemd/system/piframe-client.service`
+- enables user lingering via `loginctl enable-linger` so
+  `/run/user/<uid>` exists at boot for cage / Chromium's Wayland
+  socket
 - enables and restarts the service
+
+Audio mixer (one-time, recommended):
+
+```bash
+sudo apt install pipewire pipewire-pulse wireplumber
+systemctl --user --now enable pipewire pipewire-pulse wireplumber
+```
+
+Without a userspace mixer, the audio companion stays silent while
+the surface is showing video. See [Audio](#audio).
 
 Useful flags:
 
@@ -229,11 +267,16 @@ The client writes structured operational logs to `journalctl`.
 
 Typical events include:
 
-- `client_starting`
+- `client_starting` (carries `audio_server=` so you can see the
+  detected mixer at a glance)
+- `audio_mixer_warning` (only when no mixer detected)
 - `registered`
 - `play_command`
 - `video_playlist_command`
+- `audio_playlist_command` / `audio_companion_command`
 - `slideshow_command`
+- `companion_mpv_started` / `companion_mpv_loaded` /
+  `companion_mpv_stopped`
 - `browser_state_updated`
 - `renderer_transition`
 - `websocket_closed`
@@ -262,15 +305,72 @@ only place to see what the script actually did.
 
 ## Audio
 
-The client now uses live HDMI audio output again.
+The client uses two audio paths depending on the dispatch:
 
-Important note for this Pi:
+- **Visual content audio** (video, direct audio playback) plays
+  through Chromium's `<video>` element straight to the OS audio
+  device.
+- **Audio companion** plays through a sidecar `mpv` process the
+  client spawns on demand. Companion items run in parallel with
+  whatever visual content is on screen so the operator hears music
+  over images / silent videos / muted videos.
 
-- ALSA default output must point at the active HDMI device
-- current working setup uses `/home/woozleton/.asoundrc`
-- on this Pi, the active output was corrected to `plughw:0,0`
+### Why a separate mpv process
 
-If video is playing but audio is missing, verify the ALSA default before changing Chromium or client code.
+Chromium on Pi keeps the OS audio device locked while a `<video>`
+element is playing - even when muted. An in-page `<audio>` element
+can't claim the device in that state, which made the original
+companion implementation silent in mid-stream toggles. mpv opens
+its own audio stream which the OS audio server mixes with
+Chromium's at the kernel level.
+
+### OS-level audio mixer requirement
+
+**Bare ALSA is single-stream**: whichever process opens the audio
+device first holds it exclusive, the second gets silence. For
+companion playback to work alongside a Chromium `<video>`, the Pi
+needs a userspace mixer:
+
+- **PipeWire** (recommended, modern default on Raspberry Pi OS):
+
+```bash
+sudo apt install pipewire pipewire-pulse wireplumber
+systemctl --user --now enable pipewire pipewire-pulse wireplumber
+```
+
+- **PulseAudio** also works.
+
+- **ALSA dmix** as a last resort - configure `~/.asoundrc` with a
+  dmix plugin pointing at the HDMI device.
+
+The client logs the detected mixer on startup under `audio_server=`.
+If it logs `audio_server=alsa-only`, an `audio_mixer_warning` event
+follows explaining what to install.
+
+### Companion mpv
+
+- binary: `mpv` (path overridable via `PIFRAME_COMPANION_MPV_BIN`)
+- IPC socket: `/tmp/piframe_companion_mpv.sock` (overridable via
+  `PIFRAME_COMPANION_MPV_SOCKET`)
+- log: `/tmp/piframe_companion_mpv.log`
+- volume: tracks the surface volume the operator sets via the
+  manager UI (forwarded on every `volume` command)
+
+### Per-Pi setup
+
+- ALSA default output must point at the active HDMI device when
+  using bare ALSA (not needed with PipeWire/PA, which auto-route)
+- on this Pi the historical setup uses `/home/woozleton/.asoundrc`
+  with `plughw:0,0`
+
+If video is playing but audio is missing, verify the audio mixer
+state in this order:
+
+```bash
+systemctl --user status pipewire pipewire-pulse 2>&1 | head
+pactl info 2>&1 | head
+aplay -l
+```
 
 ## Persisted Client Settings
 
@@ -303,7 +403,7 @@ Tracked files:
 - `.gitattributes`
 - `requirements.txt`, `requirements.md`
 - `scripts/bootstrap_pi.sh`
-- `idle.jpg`
+- `idle.jpg`, `idle.html`
 - `README.md`
 
 Ignored:
@@ -357,6 +457,8 @@ These can be set in the service file or shell environment.
 - `PIFRAME_IDLE_MEDIA`
 - `PIFRAME_CHROMIUM_BIN`
 - `PIFRAME_CAGE_BIN`
+- `PIFRAME_COMPANION_MPV_BIN` (default `mpv`) - sidecar binary for the audio companion
+- `PIFRAME_COMPANION_MPV_SOCKET` (default `/tmp/piframe_companion_mpv.sock`)
 
 ### Self-update
 
@@ -419,8 +521,40 @@ tail -f /tmp/piframe_browser.log
 - NAS mount is available
 - Chromium and `cage` are installed
 
-4. restart the service:
+4. verify user lingering is enabled (cage needs `/run/user/<uid>`
+   at boot for the Wayland socket):
+
+```bash
+loginctl show-user $USER --property=Linger
+# expected: Linger=yes
+sudo loginctl enable-linger $USER  # if not yes
+```
+
+If you see `cage[<defunct>]` in `ps` and `Unable to open Wayland
+socket: Invalid argument` in `/tmp/piframe_browser.log`, lingering
+is missing.
+
+5. restart the service:
 
 ```bash
 sudo systemctl restart piframe-client
+```
+
+If audio companion is silent while video plays:
+
+1. check the detected mixer in the boot log:
+
+```bash
+journalctl -u piframe-client -b | grep audio_server
+```
+
+2. if it reads `audio_server=alsa-only`, install PipeWire (see
+   [Audio](#audio)).
+
+3. confirm mpv companion is being spawned:
+
+```bash
+journalctl -u piframe-client -b | grep companion_mpv
+# expect: companion_mpv_started, companion_mpv_loaded events
+tail -50 /tmp/piframe_companion_mpv.log
 ```
