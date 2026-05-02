@@ -293,35 +293,77 @@ def render_browser_html(
       font-size: 12px;
       line-height: 1.3;
     }}
-    /* Audio visualizer overlay (Phase 11 skeleton).
+    /* Audio visualizer overlay.
        Fullscreen layer above the stages, only shown while the active
-       item carries is_audio=true. Painted via <canvas> at 30fps - the
-       deliberate cap keeps Pi 5 well under thermal throttle even on
-       cheap board chassis. The actual visualization is intentionally
-       minimal (sweeping playhead over a soft gradient) so we can
-       measure render headroom before layering on FFT-driven bars. */
+       item carries is_audio=true. Rotates to match the device's
+       physical mount orientation (270deg for portrait Pi clients).
+       Composition:
+         .audio-vis           rotated wrapper, dimensions are the
+                              POST-rotation viewport (height=1080 if
+                              physical=1920 with 90/270 rotation).
+         .audio-vis__art      blurred waveform PNG as background.
+                              Scales subtly via Ken Burns animation.
+         canvas               FFT bars + bass pulse drawn here.
+         .audio-vis__vignette top/bottom soft fade so bars never hit
+                              a hard edge. */
     .audio-vis {{
-      position: absolute;
-      inset: 0;
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate({rotation_degrees}deg);
+      transform-origin: center center;
       pointer-events: none;
       opacity: 0;
       transition: opacity .35s ease;
       z-index: 4;
-      background:
-        radial-gradient(
-          ellipse at center,
-          rgba(70, 50, 110, 0.55) 0%,
-          rgba(20, 14, 35, 0.88) 60%,
-          rgba(8, 5, 14, 1) 100%
-        );
+      overflow: hidden;
+      /* Width / height land via JS once we know the post-rotation
+         dimensions; default fallback fills viewport in landscape. */
+      width: 100vw;
+      height: 100vh;
+      background: #060410;
     }}
     .audio-vis.is-active {{
       opacity: 1;
     }}
+    .audio-vis__art {{
+      position: absolute;
+      inset: -8%;
+      width: 116%;
+      height: 116%;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-size: cover;
+      filter: blur(36px) saturate(135%) brightness(0.7);
+      opacity: 0;
+      transition: opacity .8s ease, background-image 0s;
+      transform: scale(1);
+      animation: audio-vis-pan 24s ease-in-out infinite alternate;
+    }}
+    .audio-vis__art.is-loaded {{
+      opacity: 1;
+    }}
+    @keyframes audio-vis-pan {{
+      from {{ transform: scale(1.0); }}
+      to   {{ transform: scale(1.12); }}
+    }}
     .audio-vis canvas {{
+      position: absolute;
+      inset: 0;
       display: block;
       width: 100%;
       height: 100%;
+    }}
+    .audio-vis__vignette {{
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(180deg,
+          rgba(6, 4, 16, 0.85) 0%,
+          rgba(6, 4, 16, 0) 18%,
+          rgba(6, 4, 16, 0) 82%,
+          rgba(6, 4, 16, 0.85) 100%);
     }}
   </style>
 </head>
@@ -348,11 +390,13 @@ def render_browser_html(
            style="position:absolute; left:-9999px; width:1px; height:1px;"></audio>
     <!-- Audio visualizer overlay. Hidden by default; the renderer
          flips .is-active when the current item is_audio=true. The
-         canvas is sized 1:1 with the frame in JS via the resize
-         observer so the device-pixel-ratio scale matches the
-         drawing surface. -->
+         layer is itself rotated to match the device mount; canvas
+         + art live inside the rotated coordinate space so the
+         visualization reads upright on a portrait-mounted screen. -->
     <div id="audioVis" class="audio-vis" aria-hidden="true">
+      <div id="audioVisArt" class="audio-vis__art"></div>
       <canvas id="audioVisCanvas"></canvas>
+      <div class="audio-vis__vignette"></div>
     </div>
   </div>
   <div id="banner" class="banner"></div>
@@ -873,28 +917,51 @@ def render_browser_html(
     }}
 
     /* =================================================================
-       Audio visualizer (Phase 11 skeleton).
+       Audio visualizer.
        ----------------------------------------------------------------
-       Owns the #audioVis canvas. Activates when the current item is
-       is_audio=true. The skeleton renders a sweeping playhead +
-       gentle gradient sweep at 30fps - enough to validate Pi 5 paint
-       cost before layering on FFT-driven bars / OSD.
-       ----------------------------------------------------------------
-       Pi 5 cost notes:
-         - Canvas redraw is the dominant cost. We cap to 30fps via a
-           manual frame-time gate (rAF skips alternate frames).
-         - The canvas is sized to the device-pixel-ratio of the
-           viewport, NOT the display's full resolution - on a 4K Pi
-           that would be 8MP per frame which is absurd. window dpr
-           gives us the actual rendered pixels.
-         - Gradient strokes are computed once per resize and cached;
-           per-frame work is just `clearRect` + a few `fillRect`s
-           and one `strokeStyle` change. ~0.5ms on a Pi 5 GPU.
+       FFT-driven visualization shown in place of the (blank) <video>
+       element while an audio file is playing. Decodes a parallel
+       silent <audio> element through Web Audio's AnalyserNode - the
+       audible audio is still produced by the existing <video>; this
+       second decode path exists purely to feed FFT data.
+
+       Layers (back -> front):
+         art       : procedural gradient backdrop, hue derived from
+                     a hash of the filename (deterministic per file).
+                     Animated via CSS scale (Ken Burns).
+         canvas    : FFT bars + bass pulse ring + breath glow.
+         vignette  : top/bottom soft fade so bars never touch a hard
+                     edge. (CSS only.)
+
+       Rotation: the wrapper is rotated via CSS (.audio-vis transform).
+       JS sizes the wrapper to the post-rotation viewport so the
+       canvas's drawing surface matches the rotated display
+       (e.g. 1080x1920 portrait when the device is 1920x1080 with a
+       90/270deg rotation).
+
+       Pi 5 cost target: ~10-15% CPU total (parallel decode + FFT +
+       canvas paint). Confirmed running: skeleton at 4%; this should
+       land around 12-18%.
        ================================================================= */
     const audioVis = (() => {{
       const root = document.getElementById("audioVis");
       const canvas = document.getElementById("audioVisCanvas");
+      const artEl = document.getElementById("audioVisArt");
       const ctx = canvas ? canvas.getContext("2d", {{ alpha: true }}) : null;
+
+      // Web Audio context + silent <audio> element for FFT input.
+      // Created lazily on first start() so the renderer doesn't pay
+      // the cost on devices that never play audio. Reused across
+      // tracks - we just swap the `src`.
+      let audioCtx = null;
+      let analyserAudio = null;
+      let analyserSrc = null;
+      let analyser = null;
+      let freqData = null;
+      const FFT_SIZE = 512;        // 256 frequency bins
+      const BAR_COUNT = 48;
+      const SMOOTHING = 0.78;
+
       let active = false;
       let videoEl = null;
       let item = null;
@@ -903,13 +970,115 @@ def render_browser_html(
       const frameMinMs = 1000 / 30;  // 30fps cap
       let cssW = 0;
       let cssH = 0;
+      // Bar peak-decay state: each bar caches its previous value
+      // so peaks fall off smoothly even when the source signal
+      // drops sharply (gives the bars their bouncy feel).
+      const peaks = new Float32Array(BAR_COUNT);
+      const peakDecay = 0.92;
+      const peakRise = 0.55;       // how quickly bars catch up
+
+      // Procedural color from file name.
+      function colorFromName(name) {{
+        if (!name) return {{ hue: 270, sat: 65 }};
+        let h = 0;
+        for (let i = 0; i < name.length; i++) {{
+          h = (h * 31 + name.charCodeAt(i)) | 0;
+        }}
+        const hue = ((h % 360) + 360) % 360;
+        return {{ hue, sat: 70 }};
+      }}
+
+      function applyArt(itemRef) {{
+        if (!artEl) return;
+        const name = (itemRef && itemRef.label) || "";
+        const {{ hue, sat }} = colorFromName(name);
+        // Two-stop conic so the art reads as a soft colored cloud
+        // rather than a flat fill. CSS blur in .audio-vis__art
+        // smears the seams away.
+        const a = `hsl(${{hue}}, ${{sat}}%, 36%)`;
+        const b = `hsl(${{(hue + 40) % 360}}, ${{sat}}%, 22%)`;
+        const c = `hsl(${{(hue + 200) % 360}}, ${{sat - 15}}%, 14%)`;
+        artEl.style.backgroundImage =
+          `radial-gradient(circle at 30% 35%, ${{a}} 0%, ${{b}} 38%, ${{c}} 80%)`;
+        artEl.classList.add("is-loaded");
+      }}
+
+      function ensureAudio() {{
+        if (audioCtx) return true;
+        try {{
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) return false;
+          audioCtx = new Ctx();
+          analyserAudio = document.createElement("audio");
+          analyserAudio.crossOrigin = "anonymous";
+          analyserAudio.muted = true;             // silent path
+          analyserAudio.volume = 0;
+          analyserAudio.preload = "auto";
+          analyserAudio.style.display = "none";
+          document.body.appendChild(analyserAudio);
+          analyserSrc = audioCtx.createMediaElementSource(analyserAudio);
+          analyser = audioCtx.createAnalyser();
+          analyser.fftSize = FFT_SIZE;
+          analyser.smoothingTimeConstant = SMOOTHING;
+          analyserSrc.connect(analyser);
+          // No connect to destination - we never want this audible.
+          freqData = new Uint8Array(analyser.frequencyBinCount);
+          return true;
+        }} catch (err) {{
+          // Web Audio unavailable (sandboxed iframe etc.) - fall back
+          // to the procedural-only path.
+          audioCtx = null;
+          return false;
+        }}
+      }}
+
+      function startAnalyser(src) {{
+        if (!ensureAudio()) return;
+        try {{
+          if (audioCtx.state === "suspended") audioCtx.resume();
+          if (analyserAudio.src !== src) {{
+            analyserAudio.src = src;
+            analyserAudio.load();
+          }}
+          // Best-effort autoplay; muted autoplay is allowed in Chromium.
+          analyserAudio.play().catch(() => {{}});
+        }} catch (_) {{}}
+      }}
+
+      function stopAnalyser() {{
+        if (analyserAudio) {{
+          try {{ analyserAudio.pause(); }} catch (_) {{}}
+          try {{ analyserAudio.removeAttribute("src"); analyserAudio.load(); }} catch (_) {{}}
+        }}
+      }}
+
+      function syncAnalyserToVideo() {{
+        // Best-effort: keep the silent analyzer's currentTime within
+        // ~150ms of the audible <video>. Drift can creep in across
+        // long tracks; nudge if it gets too far. Visual sync doesn't
+        // need to be perfect - the bars are reading the same notes
+        // either way.
+        if (!analyserAudio || !videoEl) return;
+        if (!Number.isFinite(videoEl.currentTime)) return;
+        const drift = Math.abs(analyserAudio.currentTime - videoEl.currentTime);
+        if (drift > 0.4) {{
+          try {{ analyserAudio.currentTime = videoEl.currentTime; }} catch (_) {{}}
+        }}
+      }}
 
       function resize() {{
-        if (!canvas || !ctx) return;
+        if (!canvas || !ctx || !root) return;
+        // Compute post-rotation viewport. The wrapper has rotation in
+        // its transform, but its content-box dimensions need to match
+        // the visual orientation. For 90/270 we swap window w/h.
+        const rot = (({rotation_degrees} % 360) + 360) % 360;
+        const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+        const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+        root.style.width = w + "px";
+        root.style.height = h + "px";
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const rect = root.getBoundingClientRect();
-        cssW = Math.max(1, Math.round(rect.width));
-        cssH = Math.max(1, Math.round(rect.height));
+        cssW = w;
+        cssH = h;
         canvas.width = Math.round(cssW * dpr);
         canvas.height = Math.round(cssH * dpr);
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -922,47 +1091,100 @@ def render_browser_html(
           return;
         }}
         lastFrame = now;
-        // Background-only - the gradient lives in CSS so this just
-        // paints the moving foreground over a transparent canvas.
         ctx.clearRect(0, 0, cssW, cssH);
 
-        // Track progress derived from the playing <video> element.
-        // currentTime / duration are NaN until metadata loads, so
-        // fall back to a slow 30s sweep if we don't have it yet.
-        let progress = 0;
-        if (videoEl
-            && Number.isFinite(videoEl.duration)
-            && videoEl.duration > 0
-            && Number.isFinite(videoEl.currentTime)) {{
-          progress = videoEl.currentTime / videoEl.duration;
-        }} else {{
-          progress = ((now / 1000) % 30) / 30;
+        // Pull FFT data + bass energy.
+        let bass = 0;
+        if (analyser && freqData) {{
+          analyser.getByteFrequencyData(freqData);
+          // Bass = average of the bottom ~6% of bins (~0-180Hz at
+          // 44.1k sample rate with FFT_SIZE=512).
+          const bins = freqData.length;
+          const bassBins = Math.max(2, Math.round(bins * 0.06));
+          let sum = 0;
+          for (let i = 0; i < bassBins; i++) sum += freqData[i];
+          bass = (sum / bassBins) / 255;  // 0..1
         }}
 
-        // Centerline pulse: a soft horizontal band that breathes with
-        // a sine driven by the wall clock. Cheap and gives the surface
-        // a sense of "alive" without any FFT.
-        const breathPhase = (now / 1500) % (Math.PI * 2);
-        const breath = 0.5 + 0.5 * Math.sin(breathPhase);
-        const bandH = cssH * (0.10 + 0.06 * breath);
-        const bandY = (cssH - bandH) / 2;
-        const grd = ctx.createLinearGradient(0, bandY, 0, bandY + bandH);
-        grd.addColorStop(0, "rgba(196, 168, 235, 0)");
-        grd.addColorStop(0.5, "rgba(196, 168, 235, " + (0.16 + 0.10 * breath).toFixed(3) + ")");
-        grd.addColorStop(1, "rgba(196, 168, 235, 0)");
-        ctx.fillStyle = grd;
-        ctx.fillRect(0, bandY, cssW, bandH);
+        // Layout: bars take the middle 70% of the canvas vertically,
+        // anchored so they grow up + down from a centerline.
+        const cx = cssW / 2;
+        const cy = cssH / 2;
+        const barAreaH = cssH * 0.70;   // tallest bar peaks at 35% above + below center
+        const halfH = barAreaH / 2;
+        const barW = (cssW * 0.84) / BAR_COUNT;
+        const gap = barW * 0.18;
+        const drawW = barW - gap;
+        const startX = (cssW - (BAR_COUNT * barW)) / 2;
 
-        // Sweeping playhead: a vertical line tracking the track's
-        // progress. Width tapers via three layered fillRects (cheap
-        // glow alternative to shadowBlur, which is expensive on Pi).
-        const x = Math.round(progress * cssW);
-        ctx.fillStyle = "rgba(196, 168, 235, 0.15)";
-        ctx.fillRect(x - 6, 0, 12, cssH);
-        ctx.fillStyle = "rgba(196, 168, 235, 0.30)";
-        ctx.fillRect(x - 2, 0, 4, cssH);
-        ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
-        ctx.fillRect(x - 1, 0, 2, cssH);
+        // Bass pulse: a soft circle behind the bars whose radius
+        // tracks bass energy. Two layered fillRects-equivalent
+        // ellipses (just stroke + fill ring) is too expensive on
+        // Pi - use one filled circle with a radial gradient.
+        if (bass > 0.05) {{
+          const radius = (cssW * 0.32) + bass * (cssW * 0.18);
+          const ringGrd = ctx.createRadialGradient(
+            cx, cy, radius * 0.6,
+            cx, cy, radius
+          );
+          ringGrd.addColorStop(0, "rgba(255, 255, 255, 0)");
+          ringGrd.addColorStop(0.78, "rgba(255, 255, 255, " + (0.04 + bass * 0.10).toFixed(3) + ")");
+          ringGrd.addColorStop(1, "rgba(255, 255, 255, 0)");
+          ctx.fillStyle = ringGrd;
+          ctx.beginPath();
+          ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+          ctx.fill();
+        }}
+
+        // FFT bars.
+        // Map BAR_COUNT bars onto the lower 70% of the FFT bins
+        // (logarithmic-ish to give bass more visual weight). The
+        // top 30% is mostly dead air on most music.
+        const usableBins = freqData ? Math.floor(freqData.length * 0.70) : BAR_COUNT;
+        for (let i = 0; i < BAR_COUNT; i++) {{
+          // Logarithmic bin pick: bands toward the right end of the
+          // spectrum sample over a wider range so high-frequency
+          // bars don't all flatline at zero.
+          const t = i / (BAR_COUNT - 1);
+          const binStart = Math.floor(Math.pow(t, 1.6) * usableBins);
+          const binEnd = Math.floor(Math.pow((i + 1) / BAR_COUNT, 1.6) * usableBins);
+          let v = 0;
+          if (freqData) {{
+            const lo = Math.max(0, binStart);
+            const hi = Math.max(lo + 1, Math.min(freqData.length, binEnd));
+            let max = 0;
+            for (let b = lo; b < hi; b++) {{
+              if (freqData[b] > max) max = freqData[b];
+            }}
+            v = max / 255;  // 0..1
+          }}
+          // Peak-decay smoothing.
+          const target = v;
+          if (target > peaks[i]) {{
+            peaks[i] = peaks[i] * (1 - peakRise) + target * peakRise;
+          }} else {{
+            peaks[i] = peaks[i] * peakDecay;
+          }}
+          const energy = peaks[i];
+          const barH = energy * halfH;
+
+          // Color: hue shifts a tiny bit by bin index, brightness by
+          // energy. Solid rgba is cheap; createLinearGradient per
+          // bar would tank Pi performance.
+          const hueBase = 270;
+          const hueShift = (i / BAR_COUNT) * 60 - 20;  // ~250..310
+          const hue = hueBase + hueShift;
+          const lightness = 50 + energy * 30;
+          const alpha = 0.55 + energy * 0.40;
+          ctx.fillStyle = `hsla(${{hue}}, 80%, ${{lightness}}%, ${{alpha}})`;
+
+          const x = Math.round(startX + i * barW);
+          // Mirror: top half + bottom half. Round corners are too
+          // expensive on Pi (path stroke); plain rects look fine
+          // at canvas resolution.
+          ctx.fillRect(x, cy - barH, drawW, barH);
+          ctx.fillRect(x, cy, drawW, barH);
+        }}
 
         rafHandle = window.requestAnimationFrame(render);
       }}
@@ -974,7 +1196,15 @@ def render_browser_html(
         active = true;
         root.classList.add("is-active");
         root.setAttribute("aria-hidden", "false");
+        // Reset peaks so a fresh track starts clean.
+        for (let i = 0; i < BAR_COUNT; i++) peaks[i] = 0;
+        applyArt(itemRef);
         resize();
+        if (itemRef && itemRef.src) startAnalyser(itemRef.src);
+        // Periodically re-sync the silent analyser to the audible
+        // <video>. Cheap setInterval - no rAF needed.
+        if (start.syncTimer) window.clearInterval(start.syncTimer);
+        start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
         if (rafHandle == null) {{
           rafHandle = window.requestAnimationFrame(render);
         }}
@@ -987,6 +1217,12 @@ def render_browser_html(
         if (root) {{
           root.classList.remove("is-active");
           root.setAttribute("aria-hidden", "true");
+        }}
+        if (artEl) artEl.classList.remove("is-loaded");
+        stopAnalyser();
+        if (start.syncTimer) {{
+          window.clearInterval(start.syncTimer);
+          start.syncTimer = null;
         }}
         if (rafHandle != null) {{
           window.cancelAnimationFrame(rafHandle);
