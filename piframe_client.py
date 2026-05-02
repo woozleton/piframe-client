@@ -1128,6 +1128,19 @@ class MpvCompanion:
                 "--ytdl=no",
                 "--cache=no",
                 "--keep-open=yes",
+                # Force the PulseAudio/PipeWire output and an
+                # explicit default-sink routing. Without this,
+                # PipeWire's module-stream-restore remembers the
+                # first sink the stream connected to (which on a
+                # cold-boot Pi is sometimes no sink at all) and
+                # pins all future mpv companion runs to that
+                # broken state - the stream connects, plays
+                # decoded audio, but never reaches the HDMI sink.
+                "--ao=pulse",
+                "--audio-device=pulse",
+                # Clear any role-based stream-restore memory so the
+                # companion always uses the current default sink.
+                "--audio-stream-silence=no",
                 f"--input-ipc-server={COMPANION_MPV_SOCKET}",
                 "--msg-level=all=info",
                 f"--log-file={COMPANION_MPV_LOG_FILE}",
