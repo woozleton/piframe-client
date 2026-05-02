@@ -869,6 +869,50 @@ def render_browser_html(
       video.play().catch(() => {{}});
     }}
 
+    /* When mid-stream OVR-on is requested, swap the <video> element
+       for a freshly-created one that's muted from creation. Replacing
+       the element is what actually frees Chromium's OS audio sink -
+       removeAttribute('src') + load() leaves the sink attached to
+       the existing element. */
+    function recreateMutedVideo(stage) {{
+      const old = stage.video;
+      if (!old) return;
+      const src = old.currentSrc || old.src || "";
+      const t = Number.isFinite(old.currentTime) ? old.currentTime : 0;
+      const wasPlaying = !old.paused;
+      const fresh = document.createElement("video");
+      fresh.id = old.id;
+      fresh.className = old.className;
+      fresh.muted = true;
+      fresh.volume = 0;
+      fresh.playsInline = true;
+      fresh.setAttribute("playsinline", "");
+      fresh.preload = "auto";
+      fresh.loop = old.loop;
+      // Carry over the inline style (width / height / object-fit set
+      // by fitMedia) so the new element renders at the same size.
+      fresh.style.cssText = old.style.cssText;
+      fresh.dataset.desiredMuted = "true";
+      fresh.dataset.desiredVolume = "0";
+      // Drop the old element first so its audio sink is fully
+      // released before the new element opens its own muted output.
+      try {{ old.pause(); }} catch (_) {{}}
+      old.removeAttribute("src");
+      try {{ old.load(); }} catch (_) {{}}
+      old.parentNode.replaceChild(fresh, old);
+      stage.video = fresh;
+      if (src) {{
+        // Defer the src + play() so the replaceChild lands first.
+        setTimeout(() => {{
+          try {{
+            fresh.src = src;
+            fresh.currentTime = t;
+            if (wasPlaying) fresh.play().catch(() => {{}});
+          }} catch (_) {{ /* best-effort */ }}
+        }}, 50);
+      }}
+    }}
+
     let lastForceMute = false;
     function applyLiveAudioState(state) {{
       const forceMute = !!state.video_mute_override;
@@ -884,33 +928,20 @@ def render_browser_html(
         stage.video.dataset.desiredVolume = userVol.toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : userVol;
-        // Mid-stream OVR-on: simply setting muted=true on a playing
-        // video doesn't fully tear down Chromium's audio output -
-        // the muted stream still occupies the OS mixer slot and
-        // drowns out mpv's companion stream. Force a source reload
-        // so the audio decoder is rebuilt from scratch in the muted
-        // state, freeing the mixer for mpv. The reload is invisible
-        // to the user beyond a brief flash on the video frame.
-        if (forceMuteJustEnabledMidStream && stage.video.style.display === "block") {{
-          try {{
-            const src = stage.video.currentSrc || stage.video.src || "";
-            const t = stage.video.currentTime;
-            const wasPlaying = !stage.video.paused;
-            if (src) {{
-              stage.video.pause();
-              stage.video.removeAttribute("src");
-              stage.video.load();  // tear down audio output stream
-              setTimeout(() => {{
-                try {{
-                  stage.video.muted = true;  // reapply before re-attach
-                  stage.video.volume = 0;
-                  stage.video.src = src;
-                  stage.video.currentTime = t;
-                  if (wasPlaying) stage.video.play().catch(() => {{}});
-                }} catch (_) {{ /* best-effort */ }}
-              }}, 50);
-            }}
-          }} catch (_) {{ /* best-effort */ }}
+      }}
+      // Mid-stream OVR-on: setting muted=true (or even reloading the
+      // source) doesn't fully tear down Chromium's audio output - the
+      // <video> element retains its audio sink and keeps occupying
+      // the OS mixer slot, which drowns out mpv's companion stream.
+      // The only thing that reliably frees the sink is replacing the
+      // element entirely with a fresh <video muted> created from
+      // scratch. Brief flash on the video frame at OVR-toggle time;
+      // operator is choosing to switch audio sources, so the cost is
+      // acceptable.
+      if (forceMuteJustEnabledMidStream) {{
+        for (const stage of stages) {{
+          if (!stage.video || stage.video.style.display !== "block") continue;
+          recreateMutedVideo(stage);
         }}
       }}
       const nextVolume = Number(state.volume || 0);
