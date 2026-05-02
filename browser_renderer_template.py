@@ -881,35 +881,18 @@ def render_browser_html(
         stage.video.dataset.desiredVolume = userVol.toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : userVol;
-        // ALSA on Pi won't release the audio device when a <video>
-        // just goes muted - the decoder stays open and the companion
-        // <audio> element can't claim HDMI. When forceMute toggles
-        // mid-playback, fully tear down the video's media pipeline
-        // (remove src + load) and then reattach + resume from the
-        // same currentTime. This is the only thing that reliably
-        // makes Chromium release the audio device.
-        if (forceMuteJustChanged && stage.video.style.display === "block") {{
-          try {{
-            const src = stage.video.currentSrc || stage.video.src || "";
-            const t = stage.video.currentTime;
-            const wasPlaying = !stage.video.paused;
-            if (src) {{
-              stage.video.pause();
-              stage.video.removeAttribute("src");
-              stage.video.load();  // forces decoder teardown
-              if (wasPlaying || forceMute) {{
-                // Re-attach and seek back. setTimeout so the
-                // teardown actually completes before we re-arm.
-                setTimeout(() => {{
-                  try {{
-                    stage.video.src = src;
-                    stage.video.currentTime = t;
-                    stage.video.play().catch(() => {{}});
-                  }} catch (_) {{ /* best-effort */ }}
-                }}, 50);
-              }}
-            }}
-          }} catch (_) {{ /* best-effort */ }}
+        // Chromium on Pi keeps the audio device locked while a video
+        // is playing, even when muted+volume=0. Pause the video on
+        // forceMute so the audio device releases for the companion
+        // <audio> element. Last frame stays on screen (HTML <video>
+        // pause() retains the rendered frame), so the operator still
+        // sees the visual. Resume on forceMute=false.
+        if (stage.video.style.display === "block") {{
+          if (forceMute && !stage.video.paused) {{
+            try {{ stage.video.pause(); }} catch (_) {{}}
+          }} else if (!forceMute && forceMuteJustChanged && stage.video.paused) {{
+            try {{ stage.video.play().catch(() => {{}}); }} catch (_) {{}}
+          }}
         }}
       }}
       const nextVolume = Number(state.volume || 0);
@@ -1098,18 +1081,6 @@ def render_browser_html(
       companionAudio.muted = userMuted;
       companionAudio.volume = userVolume;
 
-      function notifyCompanionEvent(payload) {{
-        if (!eventEndpoint) return;
-        try {{
-          fetch(eventEndpoint, {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify(Object.assign({{type: "companion_diag"}}, payload)),
-            keepalive: true,
-          }}).catch(() => {{}});
-        }} catch (_) {{ /* ignore */ }}
-      }}
-
       if (newToken !== companionToken) {{
         companionToken = newToken;
         companionItems = wantActive ? comp.items.map((it) => it.src || "").filter(Boolean) : [];
@@ -1119,27 +1090,14 @@ def render_browser_html(
           companionAudio.src = companionItems[0];
           companionAudio.loop = false;
           companionAudio.load();
-          notifyCompanionEvent({{event: "load", src: companionItems[0], muted: companionAudio.muted, volume: companionAudio.volume}});
-          companionAudio.play().then(() => {{
-            notifyCompanionEvent({{event: "play_ok", src: companionItems[0], paused: companionAudio.paused}});
-          }}).catch((err) => {{
-            notifyCompanionEvent({{event: "play_err", src: companionItems[0], err: String(err && err.message || err)}});
-          }});
+          companionAudio.play().catch(() => {{ /* best-effort */ }});
         }} else {{
           try {{ companionAudio.pause(); }} catch (_) {{}}
           companionAudio.removeAttribute("src");
           companionAudio.load();
-          notifyCompanionEvent({{event: "stop"}});
         }}
       }} else if (wantActive && companionAudio.paused) {{
-        // Token unchanged but we expect companion to play - happens
-        // when state arrives multiple times during a transition.
-        // .play() is idempotent and a no-op when already playing.
-        companionAudio.play().then(() => {{
-          notifyCompanionEvent({{event: "resume_ok"}});
-        }}).catch((err) => {{
-          notifyCompanionEvent({{event: "resume_err", err: String(err && err.message || err)}});
-        }});
+        companionAudio.play().catch(() => {{}});
       }} else if (!wantActive && !companionAudio.paused) {{
         try {{ companionAudio.pause(); }} catch (_) {{}}
       }}
