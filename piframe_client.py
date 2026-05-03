@@ -609,6 +609,12 @@ class BrowserController:
         self.slideshow_active = False
         self.slideshow_images: List[str] = []
         self.last_command: str = ""
+        # Browser mode toggles between the kiosk renderer and a windowed
+        # Chromium with chrome visible (address bar + tabs) for ad-hoc
+        # web browsing via VNC. Switching modes restarts the browser
+        # process under cage with a different arg set.
+        self._browser_mode: str = "kiosk"
+        self._webview_url: Optional[str] = None
         self._settings_path = CLIENT_SETTINGS_FILE
         self._last_volume: float = 75.0
         self._last_mute: bool = False
@@ -719,6 +725,8 @@ class BrowserController:
             chromium=CHROMIUM_BIN,
             html=BROWSER_HTML_FILE,
             state=BROWSER_STATE_FILE,
+            mode=self._browser_mode,
+            webview_url=self._webview_url or "",
         )
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         _log("browser_runtime", xdg_runtime_dir=runtime_dir)
@@ -730,9 +738,10 @@ class BrowserController:
             max_bytes=BROWSER_LOG_MAX_BYTES,
             backups=BROWSER_LOG_BACKUPS,
         )
+        # Args common to both kiosk and webview modes. Mode-specific
+        # bits (--kiosk, target URL) are added below.
         chromium_args = [
             CHROMIUM_BIN,
-            "--kiosk",
             "--ozone-platform=wayland",
             "--enable-features=UseOzonePlatform",
             "--no-first-run",
@@ -773,8 +782,17 @@ class BrowserController:
             # quality bump on the lighter presets.
             "--disable-frame-rate-limit",
             "--disable-gpu-vsync",
-            BROWSER_HTML_FILE.as_uri(),
         ]
+        if self._browser_mode == "webview":
+            # Windowed Chromium with chrome (address bar + tabs) so an
+            # operator on VNC can navigate freely. --start-maximized
+            # ensures it fills the cage output without --kiosk hiding
+            # the chrome we want visible.
+            chromium_args.append("--start-maximized")
+            chromium_args.append(self._webview_url or "about:blank")
+        else:
+            chromium_args.append("--kiosk")
+            chromium_args.append(BROWSER_HTML_FILE.as_uri())
         wlrctl_path = shutil.which(WLRCTL_BIN)
         wlr_randr_path = shutil.which(WLR_RANDR_BIN)
         rotate_cmd = ""
@@ -842,6 +860,43 @@ class BrowserController:
         if self.is_running:
             return True
         return self._start_browser()
+
+    def set_browser_mode(self, mode: str, webview_url: Optional[str] = None) -> bool:
+        """Switch between kiosk and webview modes.
+
+        Tearing down + relaunching cage+Chromium is the only way to
+        toggle --kiosk; Chromium does not expose a runtime flag for
+        this. The blank screen between teardown and respawn is brief
+        (~2-3s) and only happens on operator-triggered mode changes.
+        """
+        if mode not in ("kiosk", "webview"):
+            _log("browser_mode_invalid", mode=mode)
+            return False
+        normalized_url = webview_url.strip() if webview_url else None
+        if (
+            mode == self._browser_mode
+            and normalized_url == self._webview_url
+            and self.is_running
+        ):
+            return True
+        _log(
+            "browser_mode_change",
+            from_mode=self._browser_mode,
+            to_mode=mode,
+            webview_url=normalized_url or "",
+        )
+        self._browser_mode = mode
+        self._webview_url = normalized_url
+        self.shutdown()
+        return self._start_browser()
+
+    @property
+    def browser_mode(self) -> str:
+        return self._browser_mode
+
+    @property
+    def webview_url(self) -> Optional[str]:
+        return self._webview_url
 
     @staticmethod
     def _pick_existing_idle_media(idle_url: str) -> str:
@@ -1641,6 +1696,8 @@ class PiFrameClient:
             "slideshow": self._handle_slideshow,
             "volume": self._handle_volume,
             "update_self": self._handle_update_self,
+            "webview_open": self._handle_webview_open,
+            "webview_close": self._handle_webview_close,
         }.get(cmd)
         if handler:
             handler(data, params)
@@ -1988,6 +2045,48 @@ class PiFrameClient:
         except OSError as exc:
             _log("update_self_spawn_failed", error=exc)
 
+    def _handle_webview_open(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:
+        """Switch the kiosk into a windowed Chromium with chrome
+        visible (address bar + tabs) so an operator on VNC can browse.
+        Optional `url` field jumps straight to that page; without it
+        Chromium opens to about:blank and the operator types in the
+        address bar via VNC."""
+        url = (params.get("url") or data.get("url") or "").strip() or None
+        _log("webview_open_command", url=url or "")
+        # Stop any audio companion first - the operator's expectation
+        # when "open URL" is clicked is a clean web session, not
+        # background music continuing to play.
+        self._set_companion_state([], repeat=False, mute_visual=False)
+        self.playback_state = "webview"
+        self.current_video = ""
+        self.current_slideshow = []
+        self.current_playlist_name = ""
+        self.current_playlist_id = ""
+        self.slideshow_started_at = None
+        BROWSER_EVENT_STATE.clear_slideshow_index()
+        BROWSER_EVENT_STATE.set_paused(False)
+        self.renderer.set_browser_mode("webview", url)
+        BROWSER_EVENT_STATE.wakeup.set()
+
+    def _handle_webview_close(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:  # pylint: disable=unused-argument
+        """Return from webview mode to the kiosk renderer. Playback
+        does not auto-resume - the operator picks the next thing to
+        play from the manager. Same shape as `_handle_stop` for the
+        post-mode state."""
+        _log("webview_close_command")
+        self.playback_state = "stopped"
+        self.current_video = ""
+        self.current_slideshow = []
+        self.renderer.set_browser_mode("kiosk", None)
+        # Once the kiosk renderer is back up, show idle so the screen
+        # has something to display rather than a blank page.
+        self.renderer.ensure_idle(self._get_idle_media())
+        BROWSER_EVENT_STATE.wakeup.set()
+
     def on_close(self, ws, close_status_code, close_msg) -> None:  # pylint: disable=unused-argument
         _log("websocket_closed", code=close_status_code, message=close_msg)
         self.ws_connection = None
@@ -2131,6 +2230,8 @@ class PiFrameClient:
                 "current_playlist": self.current_playlist_name,
                 "current_playlist_id": self.current_playlist_id,
                 "playback_state": effective_state,
+                "browser_mode": self.renderer.browser_mode,
+                "webview_url": self.renderer.webview_url,
                 "shuffle": self.current_shuffle,
                 "volume": renderer_volume,
                 "muted": renderer_muted,

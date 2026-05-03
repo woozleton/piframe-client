@@ -218,6 +218,11 @@ cat > "${VNC_SERVICE_FILE}" <<EOF
 Description=PiFrame VNC (wayvnc attached to the cage kiosk)
 After=${SERVICE_NAME}.service
 Wants=${SERVICE_NAME}.service
+# Cage gets torn down whenever the client switches between kiosk and
+# webview modes, which makes wayvnc lose its Wayland socket. Disable
+# systemd's start-limit rate cap so wayvnc keeps retrying after the
+# mode swap rather than giving up after the default ~5 fails / 10s.
+StartLimitIntervalSec=0
 
 [Service]
 User=${SERVICE_USER}
@@ -227,7 +232,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
 Environment=WAYLAND_DISPLAY=wayland-0
 ExecStart=/usr/bin/wayvnc --config=${VNC_CONFIG_FILE} ${VNC_LISTEN_ADDRESS} ${VNC_LISTEN_PORT}
 Restart=always
-RestartSec=5
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

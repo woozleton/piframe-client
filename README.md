@@ -55,6 +55,8 @@ The client currently handles these server-side commands:
 - `stop` (also accepts `is_companion: true` to halt only the companion)
 - `volume`
 - `update_self` (see Self-update below)
+- `webview_open` (optional `url` field; see [Remote Control](#remote-control-vnc))
+- `webview_close`
 
 Single-video note:
 
@@ -161,6 +163,48 @@ Cage exposes the wlroots protocols `wayvnc` requires
 (`wlr-screencopy-unstable-v1`, `wlr-virtual-pointer-unstable-v1`,
 `virtual-keyboard-unstable-v1`). Verified on cage 0.x running on
 Raspberry Pi OS Trixie with the Pi 5's V3D path.
+
+### Webview mode (operator-driven web browsing)
+
+VNC alone only lets you click on whatever the kiosk happens to be
+showing - and the kiosk normally renders its own self-generated
+HTML, which has nothing meaningful to click. Webview mode swaps the
+kiosk Chromium for a windowed Chromium with chrome (address bar +
+tabs) so an operator on VNC can browse arbitrary websites.
+
+Switching modes restarts Chromium under cage with a different arg
+set; `--kiosk` is mutually exclusive with showing chrome, so a
+process restart is the only way to toggle. The TV shows ~2-3s blank
+during each transition.
+
+Commands:
+
+- `webview_open` (optional `url`) - tear down the kiosk Chromium,
+  start a windowed Chromium pointed at the URL (or `about:blank` so
+  the operator types it via VNC). Stops the audio companion as a
+  side effect since the operator's intent is a clean web session.
+- `webview_close` - tear down the windowed Chromium, restart the
+  kiosk renderer, return to idle. Playback does not auto-resume -
+  the operator picks the next item from the manager.
+
+Heartbeat fields the manager reads to reflect mode:
+
+- `browser_mode` - `"kiosk"` or `"webview"`
+- `webview_url` - the URL the windowed Chromium loaded (null in
+  kiosk mode)
+- `playback_state` - reads `"webview"` while in webview mode
+
+Notes:
+
+- The Chromium user data dir is shared across modes, so cookies,
+  history, bookmarks, and saved passwords persist when toggling
+- The compositor-side rotation stays applied in webview mode, so
+  websites render in the same portrait orientation as the kiosk
+  (Chromium's chrome adapts; most modern sites adapt; a few will
+  look awkward in portrait)
+- The VNC viewer disconnects briefly during the mode swap and most
+  clients auto-reconnect. Connecting only after the mode change
+  avoids the disconnect entirely.
 
 ## Media Guidance
 
