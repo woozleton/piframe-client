@@ -1163,7 +1163,11 @@ def render_browser_html(
           return false;
         }}
         // Probe WebGL availability up front so we get a useful error
-        // message instead of "createVisualizer threw."
+        // message instead of "createVisualizer threw." Also report
+        // which renderer Chromium picked - SwiftShader / ANGLE
+        // software fallbacks are valid WebGL contexts but render on
+        // CPU at fractional speed, so the diag log distinguishes
+        // hardware paths from software ones.
         try {{
           const probe = document.createElement("canvas");
           const gl = probe.getContext("webgl2") || probe.getContext("webgl");
@@ -1172,6 +1176,19 @@ def render_browser_html(
             paintVizError("WebGL unavailable on this device");
             return false;
           }}
+          let rendererInfo = "unknown";
+          try {{
+            const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+            if (dbg) {{
+              const vendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+              const renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+              rendererInfo = String(vendor || "?") + " | " + String(renderer || "?");
+            }} else {{
+              rendererInfo = "vendor=" + gl.getParameter(gl.VENDOR)
+                + " renderer=" + gl.getParameter(gl.RENDERER);
+            }}
+          }} catch (_) {{}}
+          vizDiag("webgl_renderer", rendererInfo);
         }} catch (probeErr) {{
           vizDiag("webgl_probe_threw", probeErr && probeErr.message);
           paintVizError("WebGL probe failed: " + (probeErr && probeErr.message || ""));
