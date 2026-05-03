@@ -2059,10 +2059,14 @@ class PiFrameClient:
             # while leaving the underlying media kind in self.playback_state
             # untouched. Stopped state is never overridden (a paused flag
             # left over from a prior slideshow shouldn't mask "stopped").
+            # audio_playing belongs in the pause-eligible set too -
+            # without it, the orchestrator's tile flips back to
+            # "playing" on the next heartbeat tick (~2-3s) even when
+            # the browser is genuinely paused.
             reported_paused = BROWSER_EVENT_STATE.is_paused()
             effective_state = (
                 "paused"
-                if reported_paused and self.playback_state in ("playing", "slideshow")
+                if reported_paused and self.playback_state in ("playing", "slideshow", "audio_playing")
                 else self.playback_state
             )
             status: Dict[str, Any] = {
