@@ -1310,62 +1310,19 @@ def render_browser_html(
       // continues while the music is paused (analyser keeps
       // decoding) and looks broken.
       function setAnalyserPaused(paused) {{
-        vizDiag("setAnalyserPaused_called",
-          "paused=" + paused
-          + " hasAnalyser=" + !!analyserAudio
-          + " analyserState=" + (analyserAudio
-            ? "paused=" + analyserAudio.paused + " currentTime=" + analyserAudio.currentTime.toFixed(2)
-            : "null"));
         if (!analyserAudio) return;
         try {{
           if (paused) {{
             analyserAudio.pause();
-            vizDiag("analyser_paused_after",
-              "paused=" + analyserAudio.paused);
           }} else {{
             if (audioCtx && audioCtx.state === "suspended") {{
               audioCtx.resume().catch(() => {{}});
             }}
-            analyserAudio.play().then(
-              () => vizDiag("analyser_resumed", "paused=" + analyserAudio.paused),
-              (e) => vizDiag("analyser_resume_failed", e && e.message)
-            );
+            analyserAudio.play().catch(() => {{}});
           }}
-        }} catch (e) {{
-          vizDiag("setAnalyserPaused_threw", e && e.message);
-        }}
+        }} catch (_) {{}}
       }}
 
-      // Diag heartbeat: while active, every 2s log whether the
-      // silent analyser is actually feeding non-zero FFT bins. If
-      // every byte is 0 we know reactivity is broken even though
-      // butterchurn is happily painting its idle animation.
-      function startReactivityHeartbeat() {{
-        if (startReactivityHeartbeat.handle) {{
-          window.clearInterval(startReactivityHeartbeat.handle);
-        }}
-        const probe = audioCtx ? audioCtx.createAnalyser() : null;
-        if (!probe || !analyserSrc) return;
-        probe.fftSize = 256;
-        analyserSrc.connect(probe);
-        const data = new Uint8Array(probe.frequencyBinCount);
-        startReactivityHeartbeat.handle = window.setInterval(() => {{
-          if (!active) return;
-          probe.getByteFrequencyData(data);
-          let max = 0;
-          let sum = 0;
-          for (let i = 0; i < data.length; i++) {{
-            if (data[i] > max) max = data[i];
-            sum += data[i];
-          }}
-          const avg = sum / data.length;
-          vizDiag("reactivity_heartbeat",
-            "max=" + max + " avg=" + avg.toFixed(1)
-            + " analyser_paused=" + (analyserAudio ? analyserAudio.paused : "?")
-            + " analyser_t=" + (analyserAudio && Number.isFinite(analyserAudio.currentTime)
-              ? analyserAudio.currentTime.toFixed(2) : "?"));
-        }}, 2000);
-      }}
 
       function stopAnalyser() {{
         if (analyserAudio) {{
@@ -1508,7 +1465,6 @@ def render_browser_html(
         showTrackName(itemRef && itemRef.label);
         if (start.syncTimer) window.clearInterval(start.syncTimer);
         start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
-        startReactivityHeartbeat();
         if (rafHandle == null) {{
           rafHandle = window.requestAnimationFrame(render);
         }}
@@ -1532,10 +1488,6 @@ def render_browser_html(
         if (presetCycleHandle) {{
           window.clearInterval(presetCycleHandle);
           presetCycleHandle = null;
-        }}
-        if (startReactivityHeartbeat.handle) {{
-          window.clearInterval(startReactivityHeartbeat.handle);
-          startReactivityHeartbeat.handle = null;
         }}
         if (rafHandle != null) {{
           window.cancelAnimationFrame(rafHandle);
@@ -1768,19 +1720,6 @@ def render_browser_html(
         const activeStage = getActiveStage();
         const videoVisible = activeStage.video.style.display === "block";
         const wasPaused = activeStage.video.paused;
-        // Diag: confirm the pause path ran + which branch it took.
-        try {{
-          fetch(eventEndpoint, {{
-            method: "POST",
-            headers: {{"Content-Type": "application/json"}},
-            body: JSON.stringify({{
-              type: "audio_visualizer_status",
-              stage: "applyControl_pause",
-              detail: "videoVisible=" + videoVisible + " wasPaused=" + wasPaused,
-            }}),
-            keepalive: true,
-          }}).catch(() => {{}});
-        }} catch (_) {{}}
         if (videoVisible) {{
           if (wasPaused) {{
             activeStage.video.play().catch(() => {{}});
