@@ -736,7 +736,7 @@ Tracked files:
 - `browser_renderer_template.py`
 - `update.sh`
 - `.gitattributes`
-- `requirements.txt`, `requirements.md`
+- `requirements.txt`
 - `scripts/bootstrap_pi.sh`
 - `idle.jpg`, `idle.html`
 - `README.md`
