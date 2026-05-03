@@ -376,6 +376,33 @@ Heartbeat fields the server cares about:
 - `last_update` - whatever the marker contained, echoed every tick
   until the server's TTL clears the result UI-side
 
+### What self-update does NOT do
+
+Self-update is `git pull` + service restart. It does not re-run
+`scripts/bootstrap_pi.sh`, so changes that live outside the repo
+checkout don't roll out via this path:
+
+- new apt packages (e.g. `wayvnc`, `wlr-randr` introduced in the
+  remote-control work)
+- new systemd unit files (e.g. `piframe-vnc.service`)
+- changes to the `piframe-client.service` unit itself (e.g. new
+  `Environment=` lines like `PIFRAME_OUTPUT_TRANSFORM`)
+- masking or unmasking system services (e.g. the packaged
+  `wayvnc.service` we mask in favor of our own)
+- generated config files like `~/.config/wayvnc/config`
+
+When a release adds infrastructure of that shape, every existing
+Pi needs `bootstrap_pi.sh` re-run once via SSH to pick it up.
+After that, future code-only releases can be self-update only.
+
+The bootstrap is idempotent: re-running on a configured Pi
+overwrites the unit files in place, preserves
+`PIFRAME_OUTPUT_TRANSFORM` from the existing service file (so the
+operator's orientation choice survives), and skips the wayvnc
+config write if one already exists. It does restart both
+`piframe-client` and `piframe-vnc` at the end so there's a brief
+blank screen.
+
 ### Sudoers prerequisite
 
 `update.sh` ends with `exec sudo /bin/systemctl restart
