@@ -768,6 +768,12 @@ def render_browser_html(
         hideOsd();
       }}
       if (!item) {{
+        // Audio visualizer only kills itself inside renderItem(); the
+        // no-idle-media branch skips renderItem entirely, so we have
+        // to stop the visualizer here too. Without this, the
+        // visualizer keeps painting + the silent analyser keeps
+        // decoding after the playlist ends.
+        try {{ audioVis.stop(); }} catch (_) {{}}
         for (const stage of stages) {{
           resetStage(stage);
           stage.root.classList.remove("active");
@@ -1292,6 +1298,26 @@ def render_browser_html(
         }}
       }}
 
+      // Pause/resume the silent analyser to mirror the audible
+      // <video>'s pause state. Without this, visual reactivity
+      // continues while the music is paused (analyser keeps
+      // decoding) and looks broken.
+      function setAnalyserPaused(paused) {{
+        if (!analyserAudio) return;
+        try {{
+          if (paused) {{
+            analyserAudio.pause();
+          }} else {{
+            // resume() the context too in case it suspended on tab
+            // backgrounding.
+            if (audioCtx && audioCtx.state === "suspended") {{
+              audioCtx.resume().catch(() => {{}});
+            }}
+            analyserAudio.play().catch(() => {{}});
+          }}
+        }} catch (_) {{}}
+      }}
+
       // Diag heartbeat: while active, every 2s log whether the
       // silent analyser is actually feeding non-zero FFT bins. If
       // every byte is 0 we know reactivity is broken even though
@@ -1503,7 +1529,7 @@ def render_browser_html(
         if (active) resize();
       }});
 
-      return {{ start, stop, applyChoice }};
+      return {{ start, stop, applyChoice, setPaused: setAnalyserPaused }};
     }})();
 
     function renderItem(item, state, perItemSeconds) {{
@@ -1727,10 +1753,16 @@ def render_browser_html(
             activeStage.video.play().catch(() => {{}});
             hideOsd();
             notifyPauseState(false);
+            // Resume the silent analyser so the visualizer reacts
+            // to the resuming track again.
+            try {{ audioVis.setPaused(false); }} catch (_) {{}}
           }} else {{
             activeStage.video.pause();
             showOsd("pause", "", "", null, 1000);
             notifyPauseState(true);
+            // Pause the silent analyser so the visualizer freezes
+            // along with the audio.
+            try {{ audioVis.setPaused(true); }} catch (_) {{}}
           }}
         }} else {{
           if (intervalHandle) {{
