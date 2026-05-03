@@ -110,7 +110,6 @@ AUDIO_VISUALIZER_PRESETS = [
     "martin - disco mix 4",
     "martin - mandelbox explorer",
     "martin - mucus cervix",
-    "martin - stormy sea",
     "suksma - heretical crosscut playpen",
 ]
 
