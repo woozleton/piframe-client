@@ -520,6 +520,61 @@ def _set_chromium_sink_input_mute(mute: bool) -> None:
     _log("companion_chromium_mute", count=len(chromium_ids), muted=bool(mute))
 
 
+def _set_chromium_sink_input_volume(level: float) -> None:
+    """Set Chromium's sink-input volume to ``level`` (0-100).
+
+    Used in webview mode where the operator drives volume from the
+    woozlescape NP tile but the kiosk's renderer state file path
+    (``ChromiumRenderer.set_volume`` -> JS reads + applies via
+    ``<video>.volume``) doesn't run because Chromium is loading the
+    operator URL, not the kiosk HTML.
+
+    Mirrors ``_set_chromium_sink_input_mute`` exactly for the discovery
+    walk; only the final pactl command differs. Best-effort - returns
+    silently if pactl is missing or no Chromium sink-input has been
+    spawned yet (Chromium creates the sink-input lazily on first audio
+    frame, so a vol- on a silent page is a no-op until audio plays).
+    """
+    pactl = shutil.which("pactl")
+    if not pactl:
+        return
+    try:
+        long_result = subprocess.run(
+            [pactl, "list", "sink-inputs"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return
+    if long_result.returncode != 0:
+        return
+    chromium_ids: list[str] = []
+    current_id: Optional[str] = None
+    for raw in (long_result.stdout or "").splitlines():
+        line = raw.strip()
+        if line.startswith("Sink Input #"):
+            current_id = line.split("#", 1)[1].strip()
+            continue
+        lower = line.lower()
+        if current_id is not None and (
+            'application.name = "chromium' in lower
+            or 'application.process.binary = "chromium' in lower
+            or 'node.name = "chromium' in lower
+        ):
+            chromium_ids.append(current_id)
+            current_id = None
+    clamped = max(0.0, min(100.0, float(level)))
+    pct = f"{clamped:.0f}%"
+    for sid in chromium_ids:
+        try:
+            subprocess.run(
+                [pactl, "set-sink-input-volume", sid, pct],
+                capture_output=True, timeout=2, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+    _log("chromium_volume_set", count=len(chromium_ids), level=clamped)
+
+
 def _load_client_settings(path: Path) -> Dict[str, Any]:
     """Load small persisted client settings from disk."""
     try:
@@ -2103,6 +2158,17 @@ class PiFrameClient:
         # controls what they hear regardless of which output is active.
         self.companion_mpv.set_volume(level)
         self.companion_mpv.set_muted(level <= 0)
+        # In webview mode the renderer state file isn't read (Chromium
+        # is loading the operator URL, not BROWSER_HTML_FILE), so the
+        # set_volume call above is a no-op. Drive Chromium's master
+        # sink-input directly via pactl. NP-tile Mute arrives here as
+        # level=0, so this single guard covers volume + mute both.
+        if self.playback_state == "webview":
+            try:
+                _set_chromium_sink_input_volume(level)
+                _set_chromium_sink_input_mute(level <= 0)
+            except Exception as exc:
+                _log("chromium_volume_failed", error=exc)
         # Immediately wake the heartbeat loop so the orchestrator sees
         # the new volume in ~50ms (network round-trip) instead of
         # waiting up to STATUS_UPDATE_INTERVAL seconds. Same channel
