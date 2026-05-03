@@ -15,12 +15,16 @@ This client now uses one browser-based renderer for:
 - `piframe_client.py` - WebSocket client + browser orchestrator + audio companion sidecar
 - `browser_renderer_template.py` - Chromium kiosk HTML/JS template
 - `vendor/butterchurn/` - Butterchurn (MilkDrop port) + preset bundle for the audio visualizer overlay
+- `vendor/h264ify/` - bundled Chromium extension that forces video sites
+  off AV1 in webview mode (see [Remote Control](#remote-control-vnc))
 - `update.sh` - in-place self-updater (see Self-update below)
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
+- `scripts/test_webview.sh` - manual webview-mode test driver (see [Remote Control](#remote-control-vnc))
 - `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
 - `/etc/systemd/system/piframe-client.service` (installed by bootstrap)
+- `/etc/systemd/system/piframe-vnc.service` (installed by bootstrap; runs `wayvnc` against the cage Wayland session)
 
 ## How It Works
 
@@ -285,11 +289,12 @@ If you need to keep 4K masters in the library, the recommended approach is to ge
 
 ## Service
 
-Installed service file:
+Two units are installed by `bootstrap_pi.sh`:
 
-- [piframe-client.service](/etc/systemd/system/piframe-client.service)
+- [piframe-client.service](/etc/systemd/system/piframe-client.service) - the main client
+- [piframe-vnc.service](/etc/systemd/system/piframe-vnc.service) - `wayvnc` attached to the cage session (see [Remote Control](#remote-control-vnc))
 
-Current service configuration:
+Current `piframe-client.service` shape:
 
 ```ini
 [Unit]
@@ -307,6 +312,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PIFRAME_SERVER=ws://...
 Environment=PIFRAME_NAS_ROOT=/mnt/nas
+Environment=PIFRAME_OUTPUT_TRANSFORM=90
 
 [Install]
 WantedBy=multi-user.target
@@ -769,6 +775,9 @@ Tracked files:
 - `.gitattributes`
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
+- `scripts/test_webview.sh`
+- `vendor/butterchurn/` (the audio visualizer bundle)
+- `vendor/h264ify/` (the AV1-disable extension for webview mode)
 - `idle.jpg`, `idle.html`
 - `README.md`
 
@@ -781,7 +790,7 @@ Ignored:
 
 ## On-Screen Status Banner
 
-The browser renderer can show a rotated top-of-screen banner for important runtime issues without taking over the entire display.
+The browser renderer can show a top-of-screen banner for important runtime issues without taking over the entire display.
 
 Current banner cases include:
 
@@ -794,7 +803,9 @@ Behavior:
 
 - the banner overlays current content
 - it clears automatically when valid content resumes
-- it is sized and rotated for the portrait-mounted display
+- it is sized for the post-rotation viewport (the compositor rotates
+  the framebuffer; the renderer treats the canvas as native portrait
+  on a portrait-mounted Pi)
 
 ## On-Screen Display
 
@@ -828,7 +839,10 @@ These can be set in the service file or shell environment.
 - `PIFRAME_OUTPUT_TRANSFORM` (default `90`) - cage output rotation,
   applied via `wlr-randr --transform`. Accepts `normal`, `90`,
   `180`, `270`, `flipped`, `flipped-90`, `flipped-180`,
-  `flipped-270`. See [Remote Control](#remote-control-vnc).
+  `flipped-270`. The bootstrap's `--orientation` flag covers the
+  four common orientations (landscape / portrait / portrait-ccw /
+  upside-down); the `flipped*` values are only reachable by setting
+  this env var directly. See [Remote Control](#remote-control-vnc).
 - `PIFRAME_COMPANION_MPV_BIN` (default `mpv`) - sidecar binary for the audio companion
 - `PIFRAME_COMPANION_MPV_SOCKET` (default `/tmp/piframe_companion_mpv.sock`)
 
