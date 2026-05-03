@@ -220,24 +220,44 @@ Notes:
   does not load the extension because NAS-sourced playlist
   content is never AV1.
 
-### Testing webview mode without the manager
+### Loopback control endpoint
 
-`scripts/test_webview.sh` drives `BrowserController.set_browser_mode()`
-directly so you can exercise webview mode from an SSH session before
-the manager is wired up to send `webview_open` / `webview_close`.
+The browser-event server on `127.0.0.1:18888` also accepts
+manager-shaped commands at `POST /control`. Same in-process
+dispatcher the manager WebSocket uses, so it's the fast path
+(~700ms total mode swap on a Pi 5, measured) - no service
+restart, no cage cold start.
+
+Example:
 
 ```bash
-sudo ./scripts/test_webview.sh                       # opens about:blank
-sudo ./scripts/test_webview.sh https://youtube.com   # opens that URL
+curl -H 'Content-Type: application/json' \
+  -d '{"cmd":"webview_open","params":{"url":"https://example.com"}}' \
+  http://127.0.0.1:18888/control
+curl -H 'Content-Type: application/json' \
+  -d '{"cmd":"webview_close"}' \
+  http://127.0.0.1:18888/control
 ```
 
-What it does:
+Loopback-only (`127.0.0.1`), no auth - same security posture as
+the existing browser-event endpoint. Useful for local automation
+and for the test script below.
 
-- stops `piframe-client` (the device shows offline in the manager)
-- spins up cage + a windowed Chromium pointed at the URL (or
-  `about:blank`); VNC into `<pi-ip>:5900` to use the address bar
-- on Ctrl-C tears down the webview and restarts `piframe-client`
-  so the device returns to normal manager-driven operation
+### Testing webview mode without the manager
+
+`scripts/test_webview.sh` posts `webview_open` to the loopback
+control endpoint and on Ctrl-C posts `webview_close`. Lets you
+exercise the same in-process fast path the manager would use,
+without needing the manager wired up.
+
+```bash
+sudo ./scripts/test_webview.sh                       # about:blank
+sudo ./scripts/test_webview.sh https://youtube.com   # specific URL
+sudo ./scripts/test_webview.sh --close               # close any active webview and exit
+```
+
+Requires `piframe-client.service` to be running. Mode swap takes
+~700ms (same as the manager-driven path).
 
 ## Media Guidance
 

@@ -933,8 +933,19 @@ class BrowserController:
         )
         self._browser_mode = mode
         self._webview_url = normalized_url
+        t0 = time.time()
         self.shutdown()
-        return self._start_browser()
+        t1 = time.time()
+        ok = self._start_browser()
+        t2 = time.time()
+        _log(
+            "browser_mode_timing",
+            shutdown_s=f"{t1 - t0:.2f}",
+            start_s=f"{t2 - t1:.2f}",
+            total_s=f"{t2 - t0:.2f}",
+            ok=ok,
+        )
+        return ok
 
     @property
     def browser_mode(self) -> str:
@@ -1549,6 +1560,13 @@ class _BrowserEventState:
 # can stash events for the PiFrameClient instance to read.
 BROWSER_EVENT_STATE = _BrowserEventState()
 
+# Module-level reference to the PiFrameClient so the loopback HTTP
+# control endpoint (POST /control) can dispatch commands without going
+# through the manager WebSocket. Used by test scripts and for any
+# local automation that wants to drive the kiosk without standing up
+# a fake manager.
+_CLIENT_REF: Optional[Any] = None
+
 
 class _BrowserEventHandler(BaseHTTPRequestHandler):
     """Tiny POST endpoint the kiosk fetch()es on every slide change."""
@@ -1563,6 +1581,34 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+    def _handle_control(self) -> None:
+        """Dispatch a Woozlescape-shaped command into the running client.
+
+        Lets local tools (test_webview.sh, debugging shells) drive the
+        kiosk without needing a manager WebSocket connection. Same
+        in-process fast path as the manager - no service restart, no
+        cage teardown beyond what the command itself does.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = 0
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        client = _CLIENT_REF
+        if client is None:
+            self._send(503)
+            return
+        try:
+            client.on_message(None, json.dumps(payload))
+            self._send(204)
+        except Exception as exc:
+            _log("control_dispatch_failed", error=str(exc))
+            self._send(500)
+
     def do_OPTIONS(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
         # CORS preflight - browser fetch() to a different origin (file:// page
         # to http://127.0.0.1) treats this as cross-origin.
@@ -1574,6 +1620,9 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/control":
+            self._handle_control()
+            return
         if self.path != "/browser-event":
             self._send(404)
             return
@@ -2349,13 +2398,16 @@ def parse_args() -> ClientConfig:
 
 
 def main() -> None:
+    global _CLIENT_REF
     config = parse_args()
     client = PiFrameClient(config)
+    _CLIENT_REF = client
     try:
         client.run()
     except KeyboardInterrupt:
         _log("client_stopping")
     finally:
+        _CLIENT_REF = None
         client.shutdown()
 
 
