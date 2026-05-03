@@ -1303,19 +1303,30 @@ def render_browser_html(
       // continues while the music is paused (analyser keeps
       // decoding) and looks broken.
       function setAnalyserPaused(paused) {{
+        vizDiag("setAnalyserPaused_called",
+          "paused=" + paused
+          + " hasAnalyser=" + !!analyserAudio
+          + " analyserState=" + (analyserAudio
+            ? "paused=" + analyserAudio.paused + " currentTime=" + analyserAudio.currentTime.toFixed(2)
+            : "null"));
         if (!analyserAudio) return;
         try {{
           if (paused) {{
             analyserAudio.pause();
+            vizDiag("analyser_paused_after",
+              "paused=" + analyserAudio.paused);
           }} else {{
-            // resume() the context too in case it suspended on tab
-            // backgrounding.
             if (audioCtx && audioCtx.state === "suspended") {{
               audioCtx.resume().catch(() => {{}});
             }}
-            analyserAudio.play().catch(() => {{}});
+            analyserAudio.play().then(
+              () => vizDiag("analyser_resumed", "paused=" + analyserAudio.paused),
+              (e) => vizDiag("analyser_resume_failed", e && e.message)
+            );
           }}
-        }} catch (_) {{}}
+        }} catch (e) {{
+          vizDiag("setAnalyserPaused_threw", e && e.message);
+        }}
       }}
 
       // Diag heartbeat: while active, every 2s log whether the
@@ -1748,20 +1759,31 @@ def render_browser_html(
         advancePlaylist(-1);
       }} else if (control.action === "pause") {{
         const activeStage = getActiveStage();
-        if (activeStage.video.style.display === "block") {{
-          if (activeStage.video.paused) {{
+        const videoVisible = activeStage.video.style.display === "block";
+        const wasPaused = activeStage.video.paused;
+        // Diag: confirm the pause path ran + which branch it took.
+        try {{
+          fetch(eventEndpoint, {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify({{
+              type: "audio_visualizer_status",
+              stage: "applyControl_pause",
+              detail: "videoVisible=" + videoVisible + " wasPaused=" + wasPaused,
+            }}),
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_) {{}}
+        if (videoVisible) {{
+          if (wasPaused) {{
             activeStage.video.play().catch(() => {{}});
             hideOsd();
             notifyPauseState(false);
-            // Resume the silent analyser so the visualizer reacts
-            // to the resuming track again.
             try {{ audioVis.setPaused(false); }} catch (_) {{}}
           }} else {{
             activeStage.video.pause();
             showOsd("pause", "", "", null, 1000);
             notifyPauseState(true);
-            // Pause the silent analyser so the visualizer freezes
-            // along with the audio.
             try {{ audioVis.setPaused(true); }} catch (_) {{}}
           }}
         }} else {{
