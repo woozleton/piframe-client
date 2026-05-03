@@ -1923,6 +1923,14 @@ class PiFrameClient:
         # controls what they hear regardless of which output is active.
         self.companion_mpv.set_volume(level)
         self.companion_mpv.set_muted(level <= 0)
+        # Immediately wake the heartbeat loop so the orchestrator sees
+        # the new volume in ~50ms (network round-trip) instead of
+        # waiting up to STATUS_UPDATE_INTERVAL seconds. Same channel
+        # the heartbeat already uses; just ticks it now.
+        try:
+            BROWSER_EVENT_STATE.wakeup.set()
+        except Exception:
+            pass
 
     def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
         """Server-pushed in-place update. Spawns `update.sh` from the
