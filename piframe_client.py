@@ -2075,6 +2075,20 @@ class PiFrameClient:
                 if reported_paused and self.playback_state in ("playing", "slideshow", "audio_playing")
                 else self.playback_state
             )
+            # Pull current audio level from the renderer. The Pi tracks
+            # _last_volume / _last_mute on every set_volume / set_muted
+            # call; surfacing them in the heartbeat lets the
+            # orchestrator persist + display real values across page
+            # refreshes (without these the UI shows default 100% / 50%
+            # for the 0-2s window after a refresh).
+            try:
+                renderer_volume = float(self.renderer._last_volume)
+            except Exception:
+                renderer_volume = None
+            try:
+                renderer_muted = bool(self.renderer._last_mute)
+            except Exception:
+                renderer_muted = None
             status: Dict[str, Any] = {
                 "current_video": self.current_video,
                 "current_slideshow": self.current_slideshow,
@@ -2082,6 +2096,8 @@ class PiFrameClient:
                 "current_playlist_id": self.current_playlist_id,
                 "playback_state": effective_state,
                 "shuffle": self.current_shuffle,
+                "volume": renderer_volume,
+                "muted": renderer_muted,
                 "slideshow_active": self.renderer.slideshow_active,
                 "last_render_cmd": self.renderer.last_command or None,
                 # Manager UI projects the current slide locally from these
