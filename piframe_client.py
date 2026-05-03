@@ -44,7 +44,14 @@ NAS_ROOT = os.environ.get("PIFRAME_NAS_ROOT", "/mnt/nas").rstrip("/") or "/mnt/n
 CHROMIUM_BIN = os.environ.get("PIFRAME_CHROMIUM_BIN", "chromium").strip() or "chromium"
 CAGE_BIN = os.environ.get("PIFRAME_CAGE_BIN", "cage").strip() or "cage"
 WLRCTL_BIN = os.environ.get("PIFRAME_WLRCTL_BIN", "wlrctl").strip() or "wlrctl"
-BROWSER_ROTATION_DEGREES = 270
+WLR_RANDR_BIN = os.environ.get("PIFRAME_WLR_RANDR_BIN", "wlr-randr").strip() or "wlr-randr"
+# Output rotation is applied at the compositor (cage) via wlr-randr so the
+# framebuffer is natively portrait. This makes VNC viewers see the screen
+# upright without any client-side rotation, which most VNC clients don't
+# support. Set BROWSER_ROTATION_DEGREES to 0 because the renderer's CSS
+# rotation would double-rotate against the compositor transform.
+OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "90"
+BROWSER_ROTATION_DEGREES = 0
 BROWSER_STATE_FILE = Path("/tmp/piframe_browser_state.json")
 BROWSER_HTML_FILE = Path("/tmp/piframe_browser.html")
 BROWSER_PROFILE_DIR = Path("/tmp/piframe_chromium_profile")
@@ -769,11 +776,26 @@ class BrowserController:
             BROWSER_HTML_FILE.as_uri(),
         ]
         wlrctl_path = shutil.which(WLRCTL_BIN)
+        wlr_randr_path = shutil.which(WLR_RANDR_BIN)
+        rotate_cmd = ""
+        if wlr_randr_path and OUTPUT_TRANSFORM and OUTPUT_TRANSFORM != "normal":
+            # Apply the compositor-side rotation to every output cage
+            # exposes. wlr-randr's plain output starts each output with
+            # its name at column 0, indented detail lines follow.
+            rotate_cmd = (
+                f"{shlex.quote(wlr_randr_path)} 2>/dev/null | "
+                "awk '/^[^ \\t]/ { print $1 }' | "
+                f"while read o; do {shlex.quote(wlr_randr_path)} "
+                f"--output \"$o\" --transform {shlex.quote(OUTPUT_TRANSFORM)} "
+                ">/dev/null 2>&1 || true; done"
+            )
         if wlrctl_path:
             park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])
-            launcher_script = "\n".join(
+            launcher_lines = ["set -eu"]
+            if rotate_cmd:
+                launcher_lines.append(rotate_cmd)
+            launcher_lines.extend(
                 [
-                    "set -eu",
                     f"{shlex.join(chromium_args)} &",
                     "pid=$!",
                     "(",
@@ -784,6 +806,12 @@ class BrowserController:
                     ") &",
                     "wait \"$pid\"",
                 ]
+            )
+            launcher_script = "\n".join(launcher_lines)
+            args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
+        elif rotate_cmd:
+            launcher_script = "\n".join(
+                ["set -eu", rotate_cmd, f"exec {shlex.join(chromium_args)}"]
             )
             args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
         else:

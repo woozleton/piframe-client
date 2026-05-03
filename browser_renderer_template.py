@@ -36,6 +36,15 @@ def render_browser_html(
             f'  <script src="{butterchurn_presets_uri}"></script>'
         )
     visualizer_presets_json = json.dumps(list(visualizer_presets or []))
+    # When the renderer was rotating CSS by 90/270, the iframe and audio-vis
+    # surfaces had to be sized in *pre-rotation* coordinates so that after
+    # the rotate() they covered the screen. With rotation_degrees=0 the
+    # output is rotated by the compositor instead, so these surfaces should
+    # use plain viewport units.
+    _rot_norm = rotation_degrees % 360
+    _swap_dims = _rot_norm == 90 or _rot_norm == 270
+    rotated_full_width = "100vh" if _swap_dims else "100vw"
+    rotated_full_height = "100vw" if _swap_dims else "100vh"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -261,15 +270,15 @@ def render_browser_html(
       display: none;
     }}
     .html-frame {{
-      /* Sized to the rotated display: width = viewport height, height =
-         viewport width, so after the rotate() the iframe fills the screen
-         exactly. The page inside lays out for this rotated viewport
-         natively - no rotation awareness needed in idle.html itself. */
+      /* Sized so that after the (optional) CSS rotate() the iframe
+         fills the screen exactly. With rotation_degrees=0 these are
+         plain viewport units; with 90/270 they are swapped so the
+         pre-rotation surface still covers the screen post-rotation. */
       position: absolute;
       left: 50%;
       top: 50%;
-      width: 100vh;
-      height: 100vw;
+      width: {rotated_full_width};
+      height: {rotated_full_height};
       border: 0;
       background: transparent;
       transform: translate(-50%, -50%) rotate({rotation_degrees}deg);
@@ -664,8 +673,10 @@ def render_browser_html(
     function fitMedia(element, naturalWidth, naturalHeight, fitMode = "contain") {{
       const viewportWidth = window.innerWidth || 1;
       const viewportHeight = window.innerHeight || 1;
-      const usableWidth = viewportHeight;
-      const usableHeight = viewportWidth;
+      const rot = (({rotation_degrees} % 360) + 360) % 360;
+      const swap = (rot === 90 || rot === 270);
+      const usableWidth = swap ? viewportHeight : viewportWidth;
+      const usableHeight = swap ? viewportWidth : viewportHeight;
       const fitFn = fitMode === "cover" ? Math.max : Math.min;
       const scale = fitFn(usableWidth / naturalWidth, usableHeight / naturalHeight);
       element.style.width = `${{Math.max(1, naturalWidth * scale)}}px`;

@@ -71,16 +71,96 @@ Audio companion note:
 
 Current browser renderer features include:
 
-- 270-degree rotation for portrait-mounted displays
+- compositor-level rotation for portrait-mounted displays (`wlr-randr`
+  applied to cage at startup, see [Remote Control](#remote-control-vnc))
 - crossfade-style transitions using double-buffered stages
 - mixed-media playlist support
 - hidden cursor via compositor-level pointer parking with `wlrctl`
 - idle fallback image when nothing is playing
-- top-of-screen rotated status banner for runtime issues
+- top-of-screen status banner for runtime issues
 - bottom OSD for pause / volume / mute state
 - audio visualizer overlay (Butterchurn / MilkDrop) during audio
   playback, with per-playlist preset selection and a track-name
   OSD pulse on each new song
+
+## Remote Control (VNC)
+
+Each Pi runs a `wayvnc` instance attached to the cage Wayland session
+so an operator can drive the kiosk screen with mouse and keyboard
+from any VNC viewer on the LAN. This is useful for:
+
+- interacting with arbitrary websites loaded into the kiosk
+- nudging Chromium when a page needs a click to recover
+- debugging what the kiosk is actually rendering, in real time
+
+### Architecture
+
+- `wayvnc` runs under the same user as `cage` (e.g. `woozleton`) so
+  it captures the active kiosk output instead of starting a headless
+  session of its own
+- managed by a dedicated systemd unit (`piframe-vnc.service`) so it
+  starts at boot alongside `piframe-client.service`
+- listens on `0.0.0.0:5900` by default
+- the Raspberry Pi OS package ships its own `wayvnc.service` running
+  as user `vnc` against a private runtime dir; bootstrap masks that
+  unit because it would not capture the kiosk
+
+### Why compositor-side rotation
+
+The kiosk renderer used to apply a 270-degree CSS rotation so a
+portrait-mounted display read upright while cage produced a landscape
+framebuffer. That worked for the Pi's HDMI output, but VNC clients
+mirror what cage actually produces - so a remote viewer would see a
+landscape framebuffer with sideways content, and most VNC clients
+(RealVNC Viewer, TigerVNC, macOS Screen Sharing, Remmina) do not
+expose a client-side rotation toggle.
+
+Rotating at the compositor instead (`wlr-randr --transform 90` on
+the cage output) makes the framebuffer itself portrait, so:
+
+- the physical TV reads upright
+- VNC viewers see the screen upright with no client-side rotation
+- the renderer no longer applies a CSS rotation
+  (`BROWSER_ROTATION_DEGREES = 0`)
+
+The transform direction (90, 180, 270) is configurable via the
+`PIFRAME_OUTPUT_TRANSFORM` environment variable. Default is `90`.
+
+### Connecting
+
+Any VNC viewer that speaks RFB will work. Tested setups:
+
+- iPhone: RealVNC Viewer (App Store) - point it at
+  `<pi-ip>:5900`, no password by default
+- macOS: Finder -> `Cmd+K` -> `vnc://<pi-ip>:5900`
+- Linux desktop: TigerVNC, Remmina
+- Windows: TightVNC, RealVNC
+
+### Auth and trust posture
+
+V1 ships with `enable_auth=false` to match the existing LAN-trust
+posture: the manager -> client WebSocket has no per-device tokens
+either. Do not expose `5900/tcp` outside the LAN.
+
+To turn on authentication later, edit
+`/home/<user>/.config/wayvnc/config` and follow `man wayvnc` -
+`enable_auth=true` requires TLS keys + a username/password (the
+packaged `wayvnc-generate-keys.sh` covers the keys).
+
+### Useful checks
+
+```bash
+systemctl status piframe-vnc --no-pager
+journalctl -u piframe-vnc -f
+ss -ltnp | grep 5900
+```
+
+### Compositor compatibility
+
+Cage exposes the wlroots protocols `wayvnc` requires
+(`wlr-screencopy-unstable-v1`, `wlr-virtual-pointer-unstable-v1`,
+`virtual-keyboard-unstable-v1`). Verified on cage 0.x running on
+Raspberry Pi OS Trixie with the Pi 5's V3D path.
 
 ## Media Guidance
 
@@ -238,16 +318,26 @@ What it does:
 
 - installs `gh` and `git`
 - installs required apt packages (chromium, cage, seatd, wlrctl,
-  alsa-utils, mpv for the audio companion)
+  wlr-randr, wayvnc, alsa-utils, mpv for the audio companion)
 - installs and enables `seatd`
 - installs `wlrctl` for compositor-level cursor parking
+- installs `wlr-randr` so the client can rotate the cage output to
+  match the physical mount (see [Remote Control](#remote-control-vnc))
+- installs `wayvnc` and writes the `piframe-vnc.service` unit so the
+  kiosk display is reachable from a VNC viewer on the LAN
+- masks the packaged `wayvnc.service` (it runs as a separate `vnc`
+  user against a private headless session, which would not capture
+  the kiosk)
 - creates `/home/<user>/piframe_client/api-env`
 - installs Python requirements from `requirements.txt`
 - writes `/etc/systemd/system/piframe-client.service`
+- writes `/etc/systemd/system/piframe-vnc.service`
+- writes `/home/<user>/.config/wayvnc/config` (only if absent, so
+  later edits survive re-runs)
 - enables user lingering via `loginctl enable-linger` so
   `/run/user/<uid>` exists at boot for cage / Chromium's Wayland
   socket
-- enables and restarts the service
+- enables and restarts both services
 
 Audio mixer (one-time, recommended):
 
@@ -598,6 +688,12 @@ These can be set in the service file or shell environment.
 - `PIFRAME_IDLE_MEDIA`
 - `PIFRAME_CHROMIUM_BIN`
 - `PIFRAME_CAGE_BIN`
+- `PIFRAME_WLR_RANDR_BIN` (default `wlr-randr`) - used to apply
+  `PIFRAME_OUTPUT_TRANSFORM` to the cage output at startup
+- `PIFRAME_OUTPUT_TRANSFORM` (default `90`) - cage output rotation,
+  applied via `wlr-randr --transform`. Accepts `normal`, `90`,
+  `180`, `270`, `flipped`, `flipped-90`, `flipped-180`,
+  `flipped-270`. See [Remote Control](#remote-control-vnc).
 - `PIFRAME_COMPANION_MPV_BIN` (default `mpv`) - sidecar binary for the audio companion
 - `PIFRAME_COMPANION_MPV_SOCKET` (default `/tmp/piframe_companion_mpv.sock`)
 
