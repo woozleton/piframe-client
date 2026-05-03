@@ -758,7 +758,13 @@ class BrowserController:
             "--disable-component-update",
             "--disable-default-apps",
             "--disable-domain-reliability",
-            "--disable-features=AutofillServerCommunication,CertificateTransparencyComponentUpdater,MediaRouter,OptimizationHints",
+            # Av1Enabled / Dav1dVideoDecoder removed because the Pi 5 has
+            # no AV1 hardware decode - libdav1d ran on the CPU and capped
+            # YouTube playback at ~480p/30fps even without VNC. With AV1
+            # disabled in Chromium, YouTube falls back to VP9 (which the
+            # Pi's V3D path can hardware-decode) or H.264. Both are
+            # dramatically lighter on this hardware.
+            "--disable-features=AutofillServerCommunication,CertificateTransparencyComponentUpdater,MediaRouter,OptimizationHints,Av1Enabled,Dav1dVideoDecoder",
             "--disable-pings",
             "--disable-renderer-backgrounding",
             "--disable-sync",
