@@ -1187,8 +1187,15 @@ def render_browser_html(
           audioCtx = new Ctx();
           analyserAudio = document.createElement("audio");
           analyserAudio.crossOrigin = "anonymous";
-          analyserAudio.muted = true;
-          analyserAudio.volume = 0;
+          // CRITICAL: do NOT set muted=true or volume=0. Chromium's
+          // MediaElementAudioSourceNode skips actual decoding when the
+          // element has no audible destination, which makes the
+          // AnalyserNode read all zeros (every reactivity_heartbeat
+          // sample landed at max=0 with this on). The element's
+          // audio output is already diverted away from the default
+          // sink the moment we connect it to a Web Audio source node
+          // - Chromium stops routing it to speakers automatically.
+          // No redundant muting needed.
           analyserAudio.preload = "auto";
           analyserAudio.style.display = "none";
           document.body.appendChild(analyserAudio);
