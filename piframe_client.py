@@ -93,6 +93,25 @@ IDLE_MEDIA_DEFAULT_CANDIDATES = (
     str(_IDLE_MEDIA_DIR / "idle.jpg"),
 )
 
+# Audio visualizer presets the bundle ships with. Heartbeat reports
+# this list to the orchestrator so the audio-playlist inspector can
+# offer a per-playlist visualizer dropdown sourced from each Pi's
+# capabilities (vs hard-coding on the server). Source of truth here -
+# browser_renderer_template.py uses this same list to filter the
+# Butterchurn preset map at runtime.
+AUDIO_VISUALIZER_PRESETS = [
+    "martin - reflections on black tiles",
+    "flexi + amandio c - organic12-3d-2",
+    "Eo.S. + Zylot - skylight",
+    "Flexi + amandio c - piercing 05",
+    "flexi + geiss - pogo cubes vs. tokamak vs. game of life",
+    "Flexi, martin + geiss - dedicated to the sherwin maxawow",
+    "martin - disco mix 4",
+    "martin - mandelbox explorer",
+    "martin - mucus cervix",
+    "suksma - heretical crosscut playpen",
+]
+
 
 def _default_idle_media() -> str:
     for candidate in IDLE_MEDIA_DEFAULT_CANDIDATES:
@@ -650,6 +669,28 @@ class BrowserController:
         return max(0.0, min(100.0, float(level)))
 
     def _write_html(self) -> None:
+        # Butterchurn (audio visualizer) ships as two minified UMD
+        # bundles in vendor/butterchurn/. Copy them next to the HTML
+        # in /tmp/ and reference via file:// - inlining tripped over
+        # f-string brace escapes in the renderer template. Same-
+        # origin file:// loads keep us out of CORS entirely. Missing
+        # files just disable the visualizer at runtime.
+        vendor_dir = Path(__file__).resolve().parent / "vendor" / "butterchurn"
+        bc_lib = vendor_dir / "butterchurn.min.js"
+        bc_presets = vendor_dir / "butterchurnPresets.min.js"
+        bc_lib_uri = ""
+        bc_presets_uri = ""
+        try:
+            if bc_lib.exists():
+                dest = BROWSER_HTML_FILE.parent / "piframe_butterchurn.min.js"
+                shutil.copyfile(bc_lib, dest)
+                bc_lib_uri = dest.as_uri()
+            if bc_presets.exists():
+                dest = BROWSER_HTML_FILE.parent / "piframe_butterchurnPresets.min.js"
+                shutil.copyfile(bc_presets, dest)
+                bc_presets_uri = dest.as_uri()
+        except OSError as exc:
+            _log("butterchurn_vendor_copy_failed", error=str(exc))
         html = render_browser_html(
             rotation_degrees=self.rotation_degrees,
             show_hud=BROWSER_SHOW_HUD,
@@ -658,6 +699,9 @@ class BrowserController:
             nas_root=NAS_ROOT,
             poll_ms=BROWSER_STATE_POLL_MS,
             event_endpoint=f"http://{BROWSER_EVENT_HOST}:{BROWSER_EVENT_PORT}/browser-event",
+            butterchurn_lib_uri=bc_lib_uri,
+            butterchurn_presets_uri=bc_presets_uri,
+            visualizer_presets=AUDIO_VISUALIZER_PRESETS,
         )
         BROWSER_HTML_FILE.write_text(html, encoding="utf-8")
 
@@ -706,6 +750,22 @@ class BrowserController:
             "--password-store=basic",
             "--allow-file-access-from-files",
             "--autoplay-policy=no-user-gesture-required",
+            # WebGL flags: the second probe (after the first round of
+            # diagnostics) confirmed Chromium can produce a hardware
+            # WebGL context once we drop --use-gl=egl and let
+            # Chromium's default ANGLE path negotiate. Keep
+            # ignore-gpu-blocklist + gpu-rasterization since the Pi's
+            # V3D driver shows up in the blocklist by default.
+            "--ignore-gpu-blocklist",
+            "--enable-gpu-rasterization",
+            # Drop both Chromium's frame-rate ceiling AND vsync. The
+            # earlier vsync test found stormy / heavy presets reported
+            # 58fps while visually running at ~10 - we've since
+            # culled the worst offenders, so the remaining set runs
+            # smoothly enough that the unbounded path gives a real
+            # quality bump on the lighter presets.
+            "--disable-frame-rate-limit",
+            "--disable-gpu-vsync",
             BROWSER_HTML_FILE.as_uri(),
         ]
         wlrctl_path = shutil.which(WLRCTL_BIN)
@@ -840,10 +900,17 @@ class BrowserController:
         return None
 
     def _make_item(self, path_str: str) -> Dict[str, Any]:
+        ext = Path(path_str.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
         return {
             "src": Path(path_str).as_uri(),
             "label": Path(path_str).name,
             "kind": self._item_kind(path_str),
+            # is_audio is the renderer's hook for the audio visualization
+            # overlay. The kind stays "video" so playback / next-prev /
+            # repeat logic works unchanged through the existing
+            # <video> path; this flag just tells the browser to paint
+            # the audio overlay on top of the (otherwise blank) video.
+            "is_audio": ext in AUDIO_EXTENSIONS,
         }
 
     def _write_state(self) -> None:
@@ -1069,6 +1136,22 @@ class BrowserController:
             _set_chromium_sink_input_mute(bool(mute))
         except Exception as exc:
             _log("companion_chromium_mute_failed", error=str(exc))
+
+    def set_visualizer(self, choice: str) -> None:
+        """Per-playlist visualizer pick: 'none' / 'random' / preset name.
+
+        Stamps the choice onto the browser state file so the renderer's
+        audioVis module reads it on the next play. Default ('random')
+        preserves the existing cycle-every-5s behavior. 'none' skips
+        the overlay entirely. Anything else is treated as a literal
+        preset name to lock onto.
+        """
+        if not self._ensure_running():
+            return
+        normalized = (choice or "random").strip() or "random"
+        with self._state_lock:
+            self._state["visualizer"] = normalized
+            self._write_state()
 
 
 class MpvCompanion:
@@ -1384,6 +1467,18 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
                 BROWSER_EVENT_STATE.set_slideshow_index(idx)
         elif kind == "pause_state":
             BROWSER_EVENT_STATE.set_paused(bool(payload.get("paused")))
+        elif kind == "audio_visualizer_status":
+            # Forward to the regular log so init failures / runtime
+            # warnings show up in journalctl instead of being swallowed
+            # by the kiosk Chromium (which has no console output by
+            # default).
+            _log(
+                "audio_visualizer_status",
+                stage=str(payload.get("stage") or ""),
+                detail=str(payload.get("detail") or "")[:200],
+                has_butterchurn=bool(payload.get("has_butterchurn")),
+                has_presets=bool(payload.get("has_presets")),
+            )
         # Always return 204; CORS header lets the browser stop spamming
         # console errors when it crosses the file:// -> http:// boundary.
         self.send_response(204)
@@ -1626,6 +1721,13 @@ class PiFrameClient:
         )
         repeat = _coerce_bool(params.get("repeat", data.get("repeat", True)), default=True)
         target = (params.get("target") or data.get("target") or "hdmi")
+        visualizer = (
+            params.get("visualizer")
+            or data.get("visualizer")
+            or "random"
+        )
+        if not isinstance(visualizer, str):
+            visualizer = "random"
         is_companion = _coerce_bool(
             params.get("is_companion", data.get("is_companion", False)),
             default=False,
@@ -1655,9 +1757,14 @@ class PiFrameClient:
             items=len(items),
             repeat=repeat,
             target=target,
+            visualizer=visualizer,
             playlist=playlist_name or "",
             playlist_id=playlist_id or "",
         )
+        # Apply the visualizer pick BEFORE starting playback so the
+        # renderer's state file already carries the right value when
+        # the new audio item activates and the visualizer hooks fire.
+        self.renderer.set_visualizer(visualizer)
         handled = False
         if len(items) == 1:
             handled = self.renderer.play_single_video(items[0], loop=repeat)
@@ -1816,6 +1923,14 @@ class PiFrameClient:
         # controls what they hear regardless of which output is active.
         self.companion_mpv.set_volume(level)
         self.companion_mpv.set_muted(level <= 0)
+        # Immediately wake the heartbeat loop so the orchestrator sees
+        # the new volume in ~50ms (network round-trip) instead of
+        # waiting up to STATUS_UPDATE_INTERVAL seconds. Same channel
+        # the heartbeat already uses; just ticks it now.
+        try:
+            BROWSER_EVENT_STATE.wakeup.set()
+        except Exception:
+            pass
 
     def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
         """Server-pushed in-place update. Spawns `update.sh` from the
@@ -1958,12 +2073,30 @@ class PiFrameClient:
             # while leaving the underlying media kind in self.playback_state
             # untouched. Stopped state is never overridden (a paused flag
             # left over from a prior slideshow shouldn't mask "stopped").
+            # audio_playing belongs in the pause-eligible set too -
+            # without it, the orchestrator's tile flips back to
+            # "playing" on the next heartbeat tick (~2-3s) even when
+            # the browser is genuinely paused.
             reported_paused = BROWSER_EVENT_STATE.is_paused()
             effective_state = (
                 "paused"
-                if reported_paused and self.playback_state in ("playing", "slideshow")
+                if reported_paused and self.playback_state in ("playing", "slideshow", "audio_playing")
                 else self.playback_state
             )
+            # Pull current audio level from the renderer. The Pi tracks
+            # _last_volume / _last_mute on every set_volume / set_muted
+            # call; surfacing them in the heartbeat lets the
+            # orchestrator persist + display real values across page
+            # refreshes (without these the UI shows default 100% / 50%
+            # for the 0-2s window after a refresh).
+            try:
+                renderer_volume = float(self.renderer._last_volume)
+            except Exception:
+                renderer_volume = None
+            try:
+                renderer_muted = bool(self.renderer._last_mute)
+            except Exception:
+                renderer_muted = None
             status: Dict[str, Any] = {
                 "current_video": self.current_video,
                 "current_slideshow": self.current_slideshow,
@@ -1971,6 +2104,8 @@ class PiFrameClient:
                 "current_playlist_id": self.current_playlist_id,
                 "playback_state": effective_state,
                 "shuffle": self.current_shuffle,
+                "volume": renderer_volume,
+                "muted": renderer_muted,
                 "slideshow_active": self.renderer.slideshow_active,
                 "last_render_cmd": self.renderer.last_command or None,
                 # Manager UI projects the current slide locally from these
@@ -1988,6 +2123,11 @@ class PiFrameClient:
                 "slideshow_index": BROWSER_EVENT_STATE.slideshow_index(),
                 "client_version": self.client_version,
                 "last_update": self.last_update,
+                # Bundle-curated visualizer preset names so the
+                # orchestrator can populate a per-playlist picker.
+                # Static across the lifetime of this client; cheap to
+                # ship every heartbeat (small list).
+                "visualizer_presets": list(AUDIO_VISUALIZER_PRESETS),
             }
             metrics = _collect_system_metrics()
             if metrics:

@@ -15,6 +15,9 @@ def render_browser_html(
     nas_root: str,
     poll_ms: int,
     event_endpoint: str = "",
+    butterchurn_lib_uri: str = "",
+    butterchurn_presets_uri: str = "",
+    visualizer_presets: list | None = None,
 ) -> str:
     """Render the self-contained Chromium kiosk page."""
     show_hud_css = "block" if show_hud else "none"
@@ -24,6 +27,15 @@ def render_browser_html(
         'url("data:image/png;base64,'
         'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9s0qK1wAAAAASUVORK5CYII=") 0 0, none'
     )
+    # Butterchurn vendor script tags. Empty when the bundle isn't
+    # deployed; the visualizer JS gracefully no-ops in that case.
+    butterchurn_scripts = ""
+    if butterchurn_lib_uri and butterchurn_presets_uri:
+        butterchurn_scripts = (
+            f'<script src="{butterchurn_lib_uri}"></script>\n'
+            f'  <script src="{butterchurn_presets_uri}"></script>'
+        )
+    visualizer_presets_json = json.dumps(list(visualizer_presets or []))
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -293,6 +305,106 @@ def render_browser_html(
       font-size: 12px;
       line-height: 1.3;
     }}
+    /* Audio visualizer overlay.
+       Fullscreen layer above the stages, only shown while the active
+       item carries is_audio=true. Rotates to match the device's
+       physical mount orientation (270deg for portrait Pi clients).
+       Composition:
+         .audio-vis           rotated wrapper, dimensions are the
+                              POST-rotation viewport (height=1080 if
+                              physical=1920 with 90/270 rotation).
+         .audio-vis__art      blurred waveform PNG as background.
+                              Scales subtly via Ken Burns animation.
+         canvas               FFT bars + bass pulse drawn here.
+         .audio-vis__vignette top/bottom soft fade so bars never hit
+                              a hard edge. */
+    .audio-vis {{
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) rotate({rotation_degrees}deg);
+      transform-origin: center center;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .35s ease;
+      z-index: 4;
+      overflow: hidden;
+      /* Width / height land via JS once we know the post-rotation
+         dimensions; default fallback fills viewport in landscape. */
+      width: 100vw;
+      height: 100vh;
+      background: #060410;
+    }}
+    .audio-vis.is-active {{
+      opacity: 1;
+    }}
+    .audio-vis__art {{
+      position: absolute;
+      inset: -8%;
+      width: 116%;
+      height: 116%;
+      background-position: center;
+      background-repeat: no-repeat;
+      background-size: cover;
+      filter: blur(36px) saturate(135%) brightness(0.7);
+      opacity: 0;
+      transition: opacity .8s ease, background-image 0s;
+      transform: scale(1);
+      animation: audio-vis-pan 24s ease-in-out infinite alternate;
+    }}
+    .audio-vis__art.is-loaded {{
+      opacity: 1;
+    }}
+    @keyframes audio-vis-pan {{
+      from {{ transform: scale(1.0); }}
+      to   {{ transform: scale(1.12); }}
+    }}
+    .audio-vis canvas {{
+      position: absolute;
+      inset: 0;
+      display: block;
+      width: 100%;
+      height: 100%;
+    }}
+    .audio-vis__vignette {{
+      display: none;
+    }}
+    /* Track-name OSD. Shown for ~5s when a new audio item starts.
+       Soft glassy pill, system serif/sans for a polished look (NOT
+       monospace - the operator wanted something that doesn't read
+       as a debug overlay). Letter-spacing tight, generous padding. */
+    .audio-vis__track-name {{
+      position: absolute;
+      left: 50%;
+      bottom: 8%;
+      transform: translate(-50%, 12px);
+      max-width: min(82%, 800px);
+      padding: 14px 26px;
+      background: rgba(10, 8, 18, 0.62);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      backdrop-filter: blur(14px) saturate(140%);
+      color: rgba(255, 255, 255, 0.96);
+      font-family:
+        ui-rounded, "SF Pro Rounded", "SF Pro Display",
+        -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 22px;
+      font-weight: 500;
+      letter-spacing: 0.005em;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 14px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity .55s ease, transform .55s ease;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      text-align: center;
+    }}
+    .audio-vis__track-name.is-visible {{
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }}
   </style>
 </head>
 <body>
@@ -316,6 +428,17 @@ def render_browser_html(
          loading or autoplay on display:none media elements. -->
     <audio id="companionAudio" preload="auto"
            style="position:absolute; left:-9999px; width:1px; height:1px;"></audio>
+    <!-- Audio visualizer overlay. Hidden by default; the renderer
+         flips .is-active when the current item is_audio=true. The
+         layer is itself rotated to match the device mount; canvas
+         + art live inside the rotated coordinate space so the
+         visualization reads upright on a portrait-mounted screen. -->
+    <div id="audioVis" class="audio-vis" aria-hidden="true">
+      <div id="audioVisArt" class="audio-vis__art"></div>
+      <canvas id="audioVisCanvas"></canvas>
+      <div class="audio-vis__vignette"></div>
+      <div id="audioVisTrackName" class="audio-vis__track-name" aria-hidden="true"></div>
+    </div>
   </div>
   <div id="banner" class="banner"></div>
   <div id="osd" class="osd">
@@ -333,6 +456,11 @@ def render_browser_html(
     <span id="fileName"></span>
     <span id="timing"></span>
   </div>
+  <!-- Vendor scripts: Butterchurn (MilkDrop port) + its preset
+       bundle. Loaded by file:// from /tmp/ alongside the HTML so
+       same-origin same-disk - no CORS, no network. Empty when the
+       vendor bundle isn't deployed; audioVis falls back to disabled. -->
+  {butterchurn_scripts}
   <script>
     const stateUrl = {json.dumps(state_file_uri)};
     const eventEndpoint = {json.dumps(event_endpoint)};
@@ -640,6 +768,12 @@ def render_browser_html(
         hideOsd();
       }}
       if (!item) {{
+        // Audio visualizer only kills itself inside renderItem(); the
+        // no-idle-media branch skips renderItem entirely, so we have
+        // to stop the visualizer here too. Without this, the
+        // visualizer keeps painting + the silent analyser keeps
+        // decoding after the playlist ends.
+        try {{ audioVis.stop(); }} catch (_) {{}}
         for (const stage of stages) {{
           resetStage(stage);
           stage.root.classList.remove("active");
@@ -834,6 +968,557 @@ def render_browser_html(
       setHud(item, state, perItemSeconds);
     }}
 
+    /* =================================================================
+       Audio visualizer (Butterchurn / MilkDrop port).
+       ----------------------------------------------------------------
+       Drives a WebGL canvas via Butterchurn, fed by a silent <audio>
+       element decoding the same source as the audible <video>. The
+       audible audio is still produced by the existing <video>; the
+       silent decode path exists purely to feed FFT data into
+       Butterchurn's AnalyserNode hookup.
+       ----------------------------------------------------------------
+       Why parallel decode rather than tapping the <video>:
+         createMediaElementSource on a <video> seizes the element's
+         audio output - we'd lose audibility. A second silent decoder
+         is the canonical workaround. Drift between the two streams
+         is <150ms on Pi 5; we resync every 1.5s if it grows.
+       ----------------------------------------------------------------
+       Rotation: the wrapper is rotated via CSS. Butterchurn paints
+       in the wrapper's post-rotation coordinate space, so a portrait
+       Pi gets a portrait visualization with no extra math.
+       ----------------------------------------------------------------
+       Preset cycling: a curated subset of the bundled presets that
+       skips the GPU-heaviest. Cycles every 45s + on track change.
+       ================================================================= */
+    const audioVis = (() => {{
+      const root = document.getElementById("audioVis");
+      const canvas = document.getElementById("audioVisCanvas");
+      const artEl = document.getElementById("audioVisArt");
+      const trackNameEl = document.getElementById("audioVisTrackName");
+      let trackNameTimer = null;
+
+      // Pretty filename: drop the extension, swap underscores for
+      // spaces, trim leading "NN. " or "NN - " track-number prefixes.
+      // Falls back to the raw label if anything's wrong.
+      function prettyTrackName(label) {{
+        if (!label || typeof label !== "string") return "";
+        let s = label.replace(/\.[a-z0-9]{{1,5}}$/i, "");  // drop extension
+        s = s.replace(/_/g, " ");
+        s = s.replace(/^\s*\d{{1,3}}\s*[\.\-_]\s*/, "");   // strip "01. " / "12 - "
+        return s.trim() || label;
+      }}
+
+      function showTrackName(label) {{
+        if (!trackNameEl) return;
+        trackNameEl.textContent = prettyTrackName(label);
+        trackNameEl.classList.add("is-visible");
+        if (trackNameTimer) {{
+          window.clearTimeout(trackNameTimer);
+        }}
+        trackNameTimer = window.setTimeout(() => {{
+          if (trackNameEl) trackNameEl.classList.remove("is-visible");
+          trackNameTimer = null;
+        }}, 5000);
+      }}
+
+      function hideTrackName() {{
+        if (trackNameTimer) {{
+          window.clearTimeout(trackNameTimer);
+          trackNameTimer = null;
+        }}
+        if (trackNameEl) trackNameEl.classList.remove("is-visible");
+      }}
+
+      let audioCtx = null;
+      let analyserAudio = null;
+      let analyserSrc = null;
+      let viz = null;
+      let presets = null;
+      let presetNames = [];
+      let presetIdx = 0;
+      let presetCycleHandle = null;
+      const PRESET_CYCLE_MS = 5000;
+
+      let active = false;
+      let videoEl = null;
+      let item = null;
+      let rafHandle = null;
+      // Performance scaffolding. Pi 5 GPU runs simple presets fine
+      // at 1:1, but heavy shader presets stall to single digits FPS.
+      // Render at a fixed lower resolution and upscale via CSS - cuts
+      // shader work proportionally to the area ratio. The canvas
+      // CSS size still fills the wrapper so the visual is fullscreen.
+      const RENDER_SCALE = 0.4;     // 40% of viewport pixels (~16% of native shader work)
+      const TARGET_FPS = 60;
+      // Butterchurn warp/comp mesh density. Default is 48; 24 cuts
+      // vertex-shader work to ~25% of default. Tuned in concert with
+      // RENDER_SCALE for headroom across the 10-preset curated list
+      // with Chromium's vsync + frame-rate-limit both lifted.
+      const VIZ_MESH_SIZE = 24;
+      const FRAME_MIN_MS = 1000 / TARGET_FPS;
+      let lastFrameTime = 0;
+      // FPS sampling - measured over a 4-second window after each
+      // preset load and reported to journalctl. No auto-blacklist;
+      // the operator picks which presets to keep based on the logs.
+      const FPS_SAMPLE_MS = 4000;
+      let presetSampleStart = 0;
+      let presetFrameCount = 0;
+
+      function libAvailable() {{
+        return !!(window.butterchurn && window.butterchurnPresets);
+      }}
+
+
+      function vizDiag(stage, detail) {{
+        // Surface visualizer init / runtime status to the parent
+        // process so we can diagnose blue-screen failures over the
+        // existing browser-event channel.
+        const payload = {{
+          type: "audio_visualizer_status",
+          stage: String(stage || ""),
+          detail: detail == null ? "" : String(detail),
+          has_butterchurn: !!window.butterchurn,
+          has_presets: !!window.butterchurnPresets,
+          ua: navigator.userAgent,
+        }};
+        try {{ console.log("[audioVis]", payload); }} catch (_) {{}}
+        if (!eventEndpoint) return;
+        try {{
+          fetch(eventEndpoint, {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify(payload),
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_) {{}}
+      }}
+
+      function paintVizError(message) {{
+        // When init fails, paint the failure reason onto the canvas
+        // (using its 2D context separately from any GL context that
+        // may already be lost). Operators see it on screen instead
+        // of a silent blue.
+        if (!canvas) return;
+        try {{
+          const c = canvas.getContext("2d");
+          if (!c) return;
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const rot = (({rotation_degrees} % 360) + 360) % 360;
+          const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+          const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+          canvas.width = Math.round(w * dpr);
+          canvas.height = Math.round(h * dpr);
+          c.setTransform(dpr, 0, 0, dpr, 0, 0);
+          c.fillStyle = "#080612";
+          c.fillRect(0, 0, w, h);
+          c.fillStyle = "rgba(255,255,255,0.85)";
+          c.font = "16px system-ui, sans-serif";
+          c.textAlign = "center";
+          c.textBaseline = "middle";
+          c.fillText("Audio visualizer unavailable", w / 2, h / 2 - 14);
+          c.fillStyle = "rgba(255,255,255,0.55)";
+          c.font = "12px monospace";
+          c.fillText(String(message || ""), w / 2, h / 2 + 14);
+        }} catch (_) {{}}
+      }}
+
+      function pickPresetNames(allMap) {{
+        // Curated calm allow-list, hand-matched against the actual
+        // butterchurn-presets v2.4.7 bundle (~85 presets). Names
+        // chosen on two signals:
+        //   - "calm" thematic words in the filename (drift, frosty,
+        //     glass, stormy sea, organic, glowsticks, songflower,
+        //     reaction diffusion, etc.).
+        //   - Author trends: Eo.S. + Amandio C. consistently calm;
+        //     Martin's slower titles (excluding "extreme heat"-type
+        //     names); Geiss's reaction-diffusion + radial work.
+        // Specific titles excluded that match an author prefix but
+        // are clearly fast (e.g. martin's "extreme heat", "disco
+        // mix", "acid wiring", "chain breaker", "fruit machine").
+        // Fall back to all-presets if the bundle has shifted under
+        // us so the visualizer never goes silent.
+        // Operator's hand-picked favorites injected by the Python
+        // template (single source of truth via piframe_client.py
+        // AUDIO_VISUALIZER_PRESETS - same list also reported to the
+        // orchestrator in the heartbeat). Falls back to all presets
+        // if the bundle has shifted under us so the visualizer never
+        // goes silent.
+        const NAMED_ALLOW = {visualizer_presets_json};
+        const all = Object.keys(allMap);
+        const curated = all.filter((n) => {{
+          const low = n.toLowerCase();
+          for (const allow of NAMED_ALLOW) {{
+            if (low.includes(allow.toLowerCase())) return true;
+          }}
+          return false;
+        }});
+        return curated.length ? curated : all;
+      }}
+
+      function ensureViz() {{
+        if (viz) return true;
+        if (!libAvailable()) {{
+          vizDiag("lib_missing", "butterchurn or presets bundle didn't load");
+          paintVizError("vendor scripts didn't load");
+          return false;
+        }}
+        // Probe WebGL availability up front so we get a useful error
+        // message instead of "createVisualizer threw." Also report
+        // which renderer Chromium picked - SwiftShader / ANGLE
+        // software fallbacks are valid WebGL contexts but render on
+        // CPU at fractional speed, so the diag log distinguishes
+        // hardware paths from software ones.
+        try {{
+          const probe = document.createElement("canvas");
+          const gl = probe.getContext("webgl2") || probe.getContext("webgl");
+          if (!gl) {{
+            vizDiag("webgl_unavailable", "no WebGL context");
+            paintVizError("WebGL unavailable on this device");
+            return false;
+          }}
+          let rendererInfo = "unknown";
+          try {{
+            const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+            if (dbg) {{
+              const vendor = gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL);
+              const renderer = gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+              rendererInfo = String(vendor || "?") + " | " + String(renderer || "?");
+            }} else {{
+              rendererInfo = "vendor=" + gl.getParameter(gl.VENDOR)
+                + " renderer=" + gl.getParameter(gl.RENDERER);
+            }}
+          }} catch (_) {{}}
+          vizDiag("webgl_renderer", rendererInfo);
+        }} catch (probeErr) {{
+          vizDiag("webgl_probe_threw", probeErr && probeErr.message);
+          paintVizError("WebGL probe failed: " + (probeErr && probeErr.message || ""));
+          return false;
+        }}
+        try {{
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          if (!Ctx) {{
+            vizDiag("audio_ctx_missing", "no AudioContext constructor");
+            paintVizError("AudioContext unavailable");
+            return false;
+          }}
+          audioCtx = new Ctx();
+          analyserAudio = document.createElement("audio");
+          analyserAudio.crossOrigin = "anonymous";
+          // CRITICAL: do NOT set muted=true or volume=0. Chromium's
+          // MediaElementAudioSourceNode skips actual decoding when the
+          // element has no audible destination, which makes the
+          // AnalyserNode read all zeros (every reactivity_heartbeat
+          // sample landed at max=0 with this on). The element's
+          // audio output is already diverted away from the default
+          // sink the moment we connect it to a Web Audio source node
+          // - Chromium stops routing it to speakers automatically.
+          // No redundant muting needed.
+          analyserAudio.preload = "auto";
+          analyserAudio.style.display = "none";
+          document.body.appendChild(analyserAudio);
+          analyserSrc = audioCtx.createMediaElementSource(analyserAudio);
+
+          const dpr = Math.min(window.devicePixelRatio || 1, 2);
+          const rot = (({rotation_degrees} % 360) + 360) % 360;
+          const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+          const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+          root.style.width = w + "px";
+          root.style.height = h + "px";
+          // Render at RENDER_SCALE * viewport pixels; CSS scales the
+          // canvas back up to fill. ~36% as much shader work for
+          // RENDER_SCALE=0.6 since pixel work is the bottleneck.
+          canvas.width = Math.max(1, Math.round(w * dpr * RENDER_SCALE));
+          canvas.height = Math.max(1, Math.round(h * dpr * RENDER_SCALE));
+
+          // The vendored butterchurn UMD wraps its export under
+          // `.default` (webpack's namespace marker). We tolerate
+          // either shape so a future bundle change doesn't break us.
+          const Butterchurn = (window.butterchurn && window.butterchurn.default)
+            || window.butterchurn;
+          if (!Butterchurn || typeof Butterchurn.createVisualizer !== "function") {{
+            vizDiag("api_shape_unexpected",
+              "shape=" + (Butterchurn ? Object.keys(Butterchurn).join(",") : "null"));
+            paintVizError("Butterchurn API mismatch");
+            return false;
+          }}
+          viz = Butterchurn.createVisualizer(audioCtx, canvas, {{
+            width: canvas.width,
+            height: canvas.height,
+            pixelRatio: dpr,
+            meshWidth: VIZ_MESH_SIZE,
+            meshHeight: VIZ_MESH_SIZE,
+          }});
+          viz.connectAudio(analyserSrc);
+
+          // Presets bundle exports the class directly (CommonJS path)
+          // but we accept either shape for symmetry.
+          const Presets = (window.butterchurnPresets && window.butterchurnPresets.default)
+            || window.butterchurnPresets;
+          if (!Presets || typeof Presets.getPresets !== "function") {{
+            vizDiag("presets_api_shape_unexpected",
+              "shape=" + (Presets ? Object.keys(Presets).join(",") : "null"));
+            paintVizError("Butterchurn presets API mismatch");
+            return false;
+          }}
+          presets = Presets.getPresets();
+          presetNames = pickPresetNames(presets);
+          loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
+          vizDiag("ready", "preset_count=" + presetNames.length);
+          return true;
+        }} catch (err) {{
+          viz = null;
+          audioCtx = null;
+          vizDiag("init_threw", err && (err.stack || err.message) || "(unknown)");
+          paintVizError("init failed: " + (err && err.message || "unknown"));
+          return false;
+        }}
+      }}
+
+      function loadPresetByIdx(idx) {{
+        if (!viz || !presets || !presetNames.length) return;
+        presetIdx = ((idx % presetNames.length) + presetNames.length) % presetNames.length;
+        const name = presetNames[presetIdx];
+        const preset = presets[name];
+        if (preset) {{
+          // Shorter blend (0.6s) since the cycle interval is short -
+          // a longer dissolve makes consecutive presets all look
+          // like the same dissolving mush.
+          viz.loadPreset(preset, 0.6);
+          // Start sampling AFTER the blend completes so the blend
+          // dissolve doesn't get charged against the new preset's
+          // FPS budget.
+          presetSampleStart = 0;
+          window.setTimeout(() => {{
+            if (!active) return;
+            presetSampleStart = performance.now();
+            presetFrameCount = 0;
+          }}, 800);
+        }}
+      }}
+
+      function nextPreset() {{
+        loadPresetByIdx(presetIdx + 1);
+      }}
+
+      function startAnalyser(src) {{
+        if (!analyserAudio) return;
+        try {{
+          if (audioCtx && audioCtx.state === "suspended") {{
+            audioCtx.resume().then(
+              () => vizDiag("audio_ctx_resumed", "state=" + audioCtx.state),
+              (e) => vizDiag("audio_ctx_resume_failed", e && e.message)
+            );
+          }}
+          if (analyserAudio.src !== src) {{
+            analyserAudio.src = src;
+            analyserAudio.load();
+          }}
+          analyserAudio.play().then(
+            () => vizDiag("analyser_playing", "src=" + (src || "").slice(-40)),
+            (err) => vizDiag("analyser_play_rejected", err && err.message || "(unknown)")
+          );
+        }} catch (err) {{
+          vizDiag("analyser_start_threw", err && err.message);
+        }}
+      }}
+
+      // Pause/resume the silent analyser to mirror the audible
+      // <video>'s pause state. Without this, visual reactivity
+      // continues while the music is paused (analyser keeps
+      // decoding) and looks broken.
+      function setAnalyserPaused(paused) {{
+        if (!analyserAudio) return;
+        try {{
+          if (paused) {{
+            analyserAudio.pause();
+          }} else {{
+            if (audioCtx && audioCtx.state === "suspended") {{
+              audioCtx.resume().catch(() => {{}});
+            }}
+            analyserAudio.play().catch(() => {{}});
+          }}
+        }} catch (_) {{}}
+      }}
+
+
+      function stopAnalyser() {{
+        if (analyserAudio) {{
+          try {{ analyserAudio.pause(); }} catch (_) {{}}
+          try {{ analyserAudio.removeAttribute("src"); analyserAudio.load(); }} catch (_) {{}}
+        }}
+      }}
+
+      function syncAnalyserToVideo() {{
+        if (!analyserAudio || !videoEl) return;
+        if (!Number.isFinite(videoEl.currentTime)) return;
+        const drift = Math.abs(analyserAudio.currentTime - videoEl.currentTime);
+        if (drift > 0.4) {{
+          try {{ analyserAudio.currentTime = videoEl.currentTime; }} catch (_) {{}}
+        }}
+      }}
+
+      function resize() {{
+        if (!viz || !root || !canvas) return;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const rot = (({rotation_degrees} % 360) + 360) % 360;
+        const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+        const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+        root.style.width = w + "px";
+        root.style.height = h + "px";
+        canvas.width = Math.max(1, Math.round(w * dpr * RENDER_SCALE));
+        canvas.height = Math.max(1, Math.round(h * dpr * RENDER_SCALE));
+        viz.setRendererSize(canvas.width, canvas.height);
+      }}
+
+      function render(now) {{
+        if (!active || !viz) return;
+        // FPS cap. rAF can fire >60 times/s on some Chromium builds;
+        // skipping draws when we haven't accumulated FRAME_MIN_MS
+        // keeps GPU load down and prevents heavy presets from
+        // melting the V3D core trying to draw 60fps.
+        if (now - lastFrameTime < FRAME_MIN_MS) {{
+          rafHandle = window.requestAnimationFrame(render);
+          return;
+        }}
+        lastFrameTime = now;
+        viz.render();
+        // FPS measurement only - we report a sample to journalctl so
+        // the operator can decide which presets to keep / drop. No
+        // auto-blacklist; the curated list is small enough that
+        // manual evaluation works better than a heuristic.
+        if (presetSampleStart > 0) {{
+          presetFrameCount++;
+          const elapsed = now - presetSampleStart;
+          if (elapsed >= FPS_SAMPLE_MS) {{
+            const fps = (presetFrameCount * 1000) / elapsed;
+            presetSampleStart = 0;
+            vizDiag("preset_fps",
+              "name=" + (presetNames[presetIdx] || "?") + " fps=" + fps.toFixed(1));
+          }}
+        }}
+        rafHandle = window.requestAnimationFrame(render);
+      }}
+
+      // Per-playlist visualizer pick. 'none' suppresses the overlay
+      // entirely, 'random' picks a random preset and cycles every
+      // PRESET_CYCLE_MS, anything else is treated as a preset name
+      // to lock onto with no cycling. applyChoice() is called by the
+      // state-poll loop whenever state.visualizer changes mid-stream.
+      let currentChoice = "random";
+
+      function applyChoice(choice) {{
+        const next = (choice || "random").toString().trim() || "random";
+        if (next === currentChoice && active) return;
+        currentChoice = next;
+        // If we're not currently active there's nothing to act on -
+        // start() will pick up currentChoice the next time it runs.
+        if (!active || !viz) return;
+        rewireForChoice();
+      }}
+
+      function rewireForChoice() {{
+        // Clear any existing cycle / heartbeat - they get rebuilt
+        // below if the new choice wants them.
+        if (presetCycleHandle) {{
+          window.clearInterval(presetCycleHandle);
+          presetCycleHandle = null;
+        }}
+        if (currentChoice === "none") {{
+          // Tear down the overlay so the page reads as "no visual."
+          if (root) {{
+            root.classList.remove("is-active");
+            root.setAttribute("aria-hidden", "true");
+          }}
+          if (artEl) artEl.classList.remove("is-loaded");
+          return;
+        }}
+        // Active overlay (random or named).
+        if (root) {{
+          root.classList.add("is-active");
+          root.setAttribute("aria-hidden", "false");
+        }}
+        if (artEl) artEl.classList.add("is-loaded");
+        if (currentChoice === "random") {{
+          if (presetNames.length) {{
+            loadPresetByIdx(Math.floor(Math.random() * presetNames.length));
+          }}
+          presetCycleHandle = window.setInterval(nextPreset, PRESET_CYCLE_MS);
+        }} else {{
+          // Named preset: find by case-insensitive substring match
+          // against the curated list, fall back to first preset.
+          const wanted = currentChoice.toLowerCase();
+          let idx = presetNames.findIndex((n) => n.toLowerCase().includes(wanted));
+          if (idx < 0) idx = 0;
+          loadPresetByIdx(idx);
+        }}
+      }}
+
+      function start(itemRef, video) {{
+        item = itemRef;
+        videoEl = video;
+        // 'none' = skip ensureViz entirely so we don't even spin up
+        // the WebGL context for surfaces that don't want a visual.
+        if (currentChoice === "none") {{
+          active = true;  // mark active so applyChoice can react if it flips
+          if (root) {{
+            root.classList.remove("is-active");
+            root.setAttribute("aria-hidden", "true");
+          }}
+          return;
+        }}
+        if (!ensureViz()) {{
+          if (root) {{
+            root.classList.add("is-active");
+            root.setAttribute("aria-hidden", "false");
+          }}
+          return;
+        }}
+        active = true;
+        rewireForChoice();
+        if (itemRef && itemRef.src) startAnalyser(itemRef.src);
+        // Track-name OSD: show the (prettified) filename for ~5s on
+        // every new audio item. Re-triggers on each renderItem call,
+        // so playlist advance / next press always pulses the name.
+        showTrackName(itemRef && itemRef.label);
+        if (start.syncTimer) window.clearInterval(start.syncTimer);
+        start.syncTimer = window.setInterval(syncAnalyserToVideo, 1500);
+        if (rafHandle == null) {{
+          rafHandle = window.requestAnimationFrame(render);
+        }}
+      }}
+
+      function stop() {{
+        active = false;
+        item = null;
+        videoEl = null;
+        if (root) {{
+          root.classList.remove("is-active");
+          root.setAttribute("aria-hidden", "true");
+        }}
+        if (artEl) artEl.classList.remove("is-loaded");
+        hideTrackName();
+        stopAnalyser();
+        if (start.syncTimer) {{
+          window.clearInterval(start.syncTimer);
+          start.syncTimer = null;
+        }}
+        if (presetCycleHandle) {{
+          window.clearInterval(presetCycleHandle);
+          presetCycleHandle = null;
+        }}
+        if (rafHandle != null) {{
+          window.cancelAnimationFrame(rafHandle);
+          rafHandle = null;
+        }}
+      }}
+
+      window.addEventListener("resize", () => {{
+        if (active) resize();
+      }});
+
+      return {{ start, stop, applyChoice, setPaused: setAnalyserPaused }};
+    }})();
+
     function renderItem(item, state, perItemSeconds) {{
       if (!item) {{
         return;
@@ -841,6 +1526,13 @@ def render_browser_html(
       const targetStage = getInactiveStage();
       prepareStage(targetStage, item, state, perItemSeconds);
       activateStage(targetStage);
+      // Audio items: paint the visualizer over the (otherwise blank)
+      // <video>. Video / image items: kill the visualizer.
+      if (item && item.is_audio) {{
+        audioVis.start(item, targetStage.video);
+      }} else {{
+        audioVis.stop();
+      }}
       const previousStage = getInactiveStage();
       if (previousStage.resetHandle) {{
         window.clearTimeout(previousStage.resetHandle);
@@ -1043,15 +1735,19 @@ def render_browser_html(
         advancePlaylist(-1);
       }} else if (control.action === "pause") {{
         const activeStage = getActiveStage();
-        if (activeStage.video.style.display === "block") {{
-          if (activeStage.video.paused) {{
+        const videoVisible = activeStage.video.style.display === "block";
+        const wasPaused = activeStage.video.paused;
+        if (videoVisible) {{
+          if (wasPaused) {{
             activeStage.video.play().catch(() => {{}});
             hideOsd();
             notifyPauseState(false);
+            try {{ audioVis.setPaused(false); }} catch (_) {{}}
           }} else {{
             activeStage.video.pause();
             showOsd("pause", "", "", null, 1000);
             notifyPauseState(true);
+            try {{ audioVis.setPaused(true); }} catch (_) {{}}
           }}
         }} else {{
           if (intervalHandle) {{
@@ -1096,6 +1792,11 @@ def render_browser_html(
         activeState = state;
         applyLiveAudioState(state);
         applyCompanionState(state);
+        // Per-playlist visualizer pick lives on the state file. Apply
+        // every poll - applyChoice short-circuits if the value hasn't
+        // changed, so this is cheap on idle ticks and active mid-
+        // stream toggles flip the visual without stopping audio.
+        try {{ audioVis.applyChoice(state.visualizer || "random"); }} catch (_) {{}}
       }} catch (error) {{
         // ignore transient read errors while state file is being replaced
       }}

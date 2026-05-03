@@ -14,6 +14,7 @@ This client now uses one browser-based renderer for:
 
 - `piframe_client.py` - WebSocket client + browser orchestrator + audio companion sidecar
 - `browser_renderer_template.py` - Chromium kiosk HTML/JS template
+- `vendor/butterchurn/` - Butterchurn (MilkDrop port) + preset bundle for the audio visualizer overlay
 - `update.sh` - in-place self-updater (see Self-update below)
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
@@ -77,6 +78,9 @@ Current browser renderer features include:
 - idle fallback image when nothing is playing
 - top-of-screen rotated status banner for runtime issues
 - bottom OSD for pause / volume / mute state
+- audio visualizer overlay (Butterchurn / MilkDrop) during audio
+  playback, with per-playlist preset selection and a track-name
+  OSD pulse on each new song
 
 ## Media Guidance
 
@@ -427,6 +431,87 @@ journalctl -u piframe-client -b | grep companion_chromium_mute
 # Expected: count=1 muted=True (when override on),
 #           count=1 muted=False (when override off / cleared)
 ```
+
+## Audio Visualizer
+
+When an audio playlist plays, the renderer overlays a Butterchurn
+(WebGL port of MilkDrop) visualization on top of the otherwise-blank
+`<video>` element. The vendored bundle ships with the client under
+`vendor/butterchurn/`; `_write_html` copies the two minified scripts
+to `/tmp/` next to the kiosk HTML and references them via `file://`.
+
+### Curated preset list
+
+`piframe_client.py` defines `AUDIO_VISUALIZER_PRESETS` - the source
+of truth for which presets the renderer offers. The list is
+advertised to the orchestrator in every heartbeat
+(`status.visualizer_presets`) so the orchestrator can populate a
+per-playlist visualizer dropdown without hard-coding the list itself.
+Adding / removing a preset is a one-line change in this constant
+plus a friendly-name entry in the orchestrator's
+`visualizerDisplayName` map.
+
+### Per-playlist pick
+
+Audio playlists carry a `visualizer` field (string, default
+`"random"`). The orchestrator forwards this on the `audio_playlist`
+WebSocket command; the Pi reads it and applies one of:
+- `"none"` - visualizer overlay suppressed entirely
+- `"random"` - random pick + 5s cycle (legacy behavior)
+- `"<preset name>"` - lock to that preset, no cycling
+
+The renderer's `audioVis.applyChoice()` is also called on every
+state-poll tick, so changing the dropdown mid-playback flips the
+visual within ~250ms without dropping audio.
+
+### Reactivity (silent parallel decode)
+
+The visualizer needs FFT data, but `createMediaElementSource()` on
+the audible `<video>` would seize its audio output. So the renderer
+spins up a second silent `<audio>` element decoding the same source
+and routes it through an `AnalyserNode` purely for FFT samples. The
+silent element does NOT have `muted=true` / `volume=0` set -
+Chromium's `MediaElementAudioSourceNode` short-circuits decode on
+muted elements, leaving the analyser reading all zeros. The element
+stays inaudible because we never connect the analyser to
+`audioCtx.destination`. Drift between the audible / analyser streams
+is corrected every 1.5s via a sync timer.
+
+### Pause/stop sync
+
+`applyControl("pause")` calls `audioVis.setPaused(true/false)` so
+the analyser tracks the audible video's state. Without this the
+visualizer keeps reacting while the music is paused. `showIdle()`
+calls `audioVis.stop()` when the playlist ends with no idle media
+(otherwise the visualizer kept painting indefinitely).
+
+### Performance knobs
+
+Two constants in `browser_renderer_template.py` control the GPU
+budget: `RENDER_SCALE` (canvas size as fraction of viewport;
+default 0.4 = 16% of native shader work) and `VIZ_MESH_SIZE`
+(Butterchurn warp/comp grid; default 24, vs Butterchurn's default
+of 48 = 25% of default vertex work).
+
+Chromium's vsync is disabled (`--disable-gpu-vsync` +
+`--disable-frame-rate-limit`) since cage+wayland's compositor caps
+real fps at ~40 with vsync on, masking the actual render budget.
+With both off, light presets reach 60+ and heavier ones drop
+honestly to whatever they can sustain.
+
+The init path probes WebGL via `WEBGL_debug_renderer_info` and logs
+the renderer string under `audio_visualizer_status stage=webgl_renderer`
+so it's verifiable that the V3D hardware path is active (vs a
+SwiftShader software fallback). Per-preset FPS is sampled over a
+4-second window and logged under `stage=preset_fps name=<...>
+fps=<X>` for ongoing curation.
+
+### Track-name OSD
+
+When a new audio item starts, a glassy bottom-anchored pill shows
+the prettified filename (extension dropped, underscores -> spaces,
+leading "01. " / "12 - " track-number prefixes stripped). Auto-
+hides after ~5s. Re-triggers on playlist advance / next press.
 
 ## Persisted Client Settings
 
