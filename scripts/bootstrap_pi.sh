@@ -172,12 +172,13 @@ EOF
 loginctl enable-linger "${SERVICE_USER}"
 
 # Pi's default HDMI sink volume defaults vary (some boards come up at
-# ~40%). Force the user-default sink to 100% so the OVR mute path and
-# companion playback are audible without per-Pi tweaks. Runs as the
-# service user because sinks are per-user under PipeWire.
+# ~40%). Pin to 50% as a sane TV-friendly ceiling - 100% was uncomfor-
+# tably loud on the displays we deploy to. Operators can still nudge
+# higher per-device via `pactl set-sink-volume @DEFAULT_SINK@ <N>%`.
+# Runs as the service user because sinks are per-user under PipeWire.
 sudo -u "${SERVICE_USER}" \
   XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
-  pactl set-sink-volume @DEFAULT_SINK@ 100% 2>/dev/null || true
+  pactl set-sink-volume @DEFAULT_SINK@ 50% 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable --now seatd
