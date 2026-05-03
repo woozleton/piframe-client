@@ -586,6 +586,38 @@ def _clear_stale_wayland_sockets(runtime_dir: str) -> None:
         _log("wayland_sockets_cleared", runtime_dir=runtime_dir, removed=",".join(removed))
 
 
+def _suppress_chromium_crash_dialog(profile_dir: Path) -> None:
+    """Tell Chromium it shut down cleanly so the next launch doesn't show
+    the "Restore session?" dialog. piframe-client kills Chromium with
+    SIGTERM on every mode swap, which Chromium records as a crash in
+    Preferences.exit_type. The flags --disable-session-crashed-bubble
+    and --hide-crash-restore-bubble suppress some variants of the
+    dialog but not all - the canonical fix is rewriting exit_type +
+    exited_cleanly in the profile's Preferences JSON before launch.
+    """
+    prefs_path = profile_dir / "Default" / "Preferences"
+    if not prefs_path.exists():
+        return
+    try:
+        prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    profile = prefs.setdefault("profile", {})
+    changed = False
+    if profile.get("exit_type") != "Normal":
+        profile["exit_type"] = "Normal"
+        changed = True
+    if profile.get("exited_cleanly") is not True:
+        profile["exited_cleanly"] = True
+        changed = True
+    if not changed:
+        return
+    try:
+        prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    except OSError as exc:
+        _log("chromium_prefs_rewrite_failed", error=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -733,6 +765,7 @@ class BrowserController:
         _clear_stale_wayland_sockets(runtime_dir)
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         BROWSER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _suppress_chromium_crash_dialog(BROWSER_PROFILE_DIR)
         _rotate_log(
             BROWSER_LOG_FILE,
             max_bytes=BROWSER_LOG_MAX_BYTES,
@@ -750,6 +783,7 @@ class BrowserController:
             f"--disk-cache-dir={BROWSER_CACHE_DIR}",
             "--disk-cache-size=268435456",
             "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
             "--disable-infobars",
             "--noerrdialogs",
             "--disable-background-networking",
@@ -780,23 +814,23 @@ class BrowserController:
             # V3D driver shows up in the blocklist by default.
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
-            # Drop both Chromium's frame-rate ceiling AND vsync. The
-            # earlier vsync test found stormy / heavy presets reported
-            # 58fps while visually running at ~10 - we've since
-            # culled the worst offenders, so the remaining set runs
-            # smoothly enough that the unbounded path gives a real
-            # quality bump on the lighter presets.
-            "--disable-frame-rate-limit",
-            "--disable-gpu-vsync",
         ]
         if self._browser_mode == "webview":
             # Windowed Chromium with chrome (address bar + tabs) so an
             # operator on VNC can navigate freely. --start-maximized
             # ensures it fills the cage output without --kiosk hiding
-            # the chrome we want visible.
+            # the chrome we want visible. Vsync stays at Chromium's
+            # default in webview mode - the kiosk's vsync overrides
+            # are tuned for Butterchurn and stutter HTML5 video.
             chromium_args.append("--start-maximized")
             chromium_args.append(self._webview_url or "about:blank")
         else:
+            # Kiosk mode: drop frame-rate ceiling and vsync so the
+            # Butterchurn audio visualizer can render at unbounded
+            # fps. cage+wayland's vsync caps the visualizer at ~40fps
+            # otherwise, masking the actual GPU budget.
+            chromium_args.append("--disable-frame-rate-limit")
+            chromium_args.append("--disable-gpu-vsync")
             chromium_args.append("--kiosk")
             chromium_args.append(BROWSER_HTML_FILE.as_uri())
         wlrctl_path = shutil.which(WLRCTL_BIN)

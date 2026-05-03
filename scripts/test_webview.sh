@@ -31,8 +31,33 @@ fi
 
 cleanup() {
   echo
+  echo "[test_webview] tearing down test webview..."
+  # Make sure no orphaned cage / chromium owns the Wayland socket
+  # before systemd starts piframe-client - otherwise piframe-client's
+  # cage gets "Unable to open Wayland socket" and the run loop sits
+  # silent for a long time before retrying.
+  pkill -TERM -f "/usr/bin/cage" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if ! pgrep -f "/usr/bin/cage" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.5
+  done
+  pkill -KILL -f "/usr/bin/cage" 2>/dev/null || true
+  rm -f "/run/user/${SERVICE_UID}/wayland-"*
   echo "[test_webview] restoring piframe-client..."
   systemctl start piframe-client || true
+  echo "[test_webview] waiting for kiosk Chromium to come back..."
+  for _ in $(seq 1 30); do
+    if pgrep -af "chromium.*--kiosk" >/dev/null 2>&1; then
+      echo "[test_webview] kiosk back up."
+      return
+    fi
+    sleep 1
+  done
+  echo "[test_webview] kiosk did not return within 30s. Check:"
+  echo "  systemctl status piframe-client --no-pager"
+  echo "  journalctl -u piframe-client -n 30 --no-pager"
 }
 trap cleanup EXIT
 
