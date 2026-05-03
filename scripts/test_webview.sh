@@ -45,20 +45,24 @@ echo
 
 # Run the BrowserController as the service user so XDG_RUNTIME_DIR /
 # Wayland socket / PipeWire all match the normal piframe-client env.
+# URL passes through as an env var so empty / quotes / special chars
+# can't break the embedded Python.
 sudo -u "${SERVICE_USER}" \
   XDG_RUNTIME_DIR="/run/user/${SERVICE_UID}" \
-  "${VENV_PYTHON}" -c "
-import signal, sys, os
-sys.path.insert(0, '${REPO_DIR}')
+  PIFRAME_TEST_URL="${URL}" \
+  PIFRAME_REPO_DIR="${REPO_DIR}" \
+  "${VENV_PYTHON}" -c '
+import os, signal, sys
+sys.path.insert(0, os.environ["PIFRAME_REPO_DIR"])
 from piframe_client import BrowserController
+url = os.environ.get("PIFRAME_TEST_URL") or None
 bc = BrowserController()
-url = ${URL:+\"${URL}\"} or None
-ok = bc.set_browser_mode('webview', url)
+ok = bc.set_browser_mode("webview", url)
 if not ok:
-    print('[test_webview] set_browser_mode returned False', file=sys.stderr)
+    print("[test_webview] set_browser_mode returned False", file=sys.stderr)
     sys.exit(1)
-print(f'[test_webview] webview running (pid={os.getpid()}). Ctrl-C to exit.')
+print(f"[test_webview] webview running (pid={os.getpid()}). Ctrl-C to exit.")
 signal.signal(signal.SIGINT, lambda *a: (bc.shutdown(), sys.exit(0)))
 signal.signal(signal.SIGTERM, lambda *a: (bc.shutdown(), sys.exit(0)))
 signal.pause()
-"
+'
