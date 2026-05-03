@@ -760,6 +760,15 @@ class BrowserController:
             # V3D driver shows up in the blocklist by default.
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
+            # Lift Chromium's frame-rate ceiling. Default is to gate
+            # rendering on vblank (~60Hz at HD on Pi but compositor
+            # path under cage/wayland tops out around 40fps). The two
+            # flags below let the visualizer's rAF loop fire as fast
+            # as the GPU can produce frames; if perf is fragment-
+            # shader-bound this changes nothing, if it's compositor-
+            # bound we'll see fps jump toward 60.
+            "--disable-frame-rate-limit",
+            "--disable-gpu-vsync",
             BROWSER_HTML_FILE.as_uri(),
         ]
         wlrctl_path = shutil.which(WLRCTL_BIN)
