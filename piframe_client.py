@@ -52,6 +52,13 @@ WLR_RANDR_BIN = os.environ.get("PIFRAME_WLR_RANDR_BIN", "wlr-randr").strip() or 
 # rotation would double-rotate against the compositor transform.
 OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "90"
 BROWSER_ROTATION_DEGREES = 0
+# Bundled Chromium extension that forces video sites off AV1.
+# Loaded only in webview mode (kiosk renderer's content is from
+# the NAS and never AV1, so kiosk mode runs without it). The Pi 5
+# has no AV1 hardware decode and libdav1d on the CPU caps 1080p60
+# AV1 at ~50% delivered frames; H.264 / VP9 are dramatically
+# lighter here.
+H264IFY_EXTENSION_DIR = Path(__file__).resolve().parent / "vendor" / "h264ify"
 BROWSER_STATE_FILE = Path("/tmp/piframe_browser_state.json")
 BROWSER_HTML_FILE = Path("/tmp/piframe_browser.html")
 BROWSER_PROFILE_DIR = Path("/tmp/piframe_chromium_profile")
@@ -823,6 +830,11 @@ class BrowserController:
             # default in webview mode - the kiosk's vsync overrides
             # are tuned for Butterchurn and stutter HTML5 video.
             chromium_args.append("--start-maximized")
+            # Load h264ify so YouTube / Vimeo / etc. stop advertising
+            # AV1. Conditional on the vendor dir being present so a
+            # half-checked-out tree doesn't crash Chromium.
+            if (H264IFY_EXTENSION_DIR / "manifest.json").exists():
+                chromium_args.append(f"--load-extension={H264IFY_EXTENSION_DIR}")
             chromium_args.append(self._webview_url or "about:blank")
         else:
             # Kiosk mode: drop frame-rate ceiling and vsync so the

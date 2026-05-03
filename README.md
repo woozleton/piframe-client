@@ -205,6 +205,15 @@ Notes:
 - The VNC viewer disconnects briefly during the mode swap and most
   clients auto-reconnect. Connecting only after the mode change
   avoids the disconnect entirely.
+- A bundled Chromium extension at `vendor/h264ify/` is auto-loaded
+  in webview mode (only). It overrides
+  `MediaSource.isTypeSupported` to return false for AV1, so video
+  sites (YouTube, Vimeo, Twitch, etc.) fall back to H.264 / VP9.
+  The Pi 5 has no AV1 hardware decoder and libdav1d on the CPU
+  caps 1080p60 AV1 at roughly half the source framerate; H.264
+  software decode on the Pi 5's CPU is far lighter. Kiosk mode
+  doesn't load the extension because NAS-sourced playlist content
+  is never AV1.
 
 ### Testing webview mode without the manager
 

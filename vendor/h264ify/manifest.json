@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "PiFrame h264ify",
+  "version": "1.0",
+  "description": "Forces video sites to serve H.264 / VP9 instead of AV1 by lying about MediaSource.isTypeSupported. Pi 5 has no AV1 hardware decode and libdav1d on the CPU caps real-world 1080p60 playback. Loaded only in webview mode (kiosk renderer's content is from the NAS / not AV1).",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["override.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    }
+  ]
+}
