@@ -897,6 +897,7 @@ class BrowserController:
         wlrctl_path = shutil.which(WLRCTL_BIN)
         wlr_randr_path = shutil.which(WLR_RANDR_BIN)
         rotate_cmd = ""
+        rotate_watch_cmd = ""
         if wlr_randr_path and OUTPUT_TRANSFORM and OUTPUT_TRANSFORM != "normal":
             # Apply the compositor-side rotation to every output cage
             # exposes. wlr-randr's plain output starts each output with
@@ -908,11 +909,30 @@ class BrowserController:
                 f"--output \"$o\" --transform {shlex.quote(OUTPUT_TRANSFORM)} "
                 ">/dev/null 2>&1 || true; done"
             )
+            # Re-apply on drift. When the TV suspends, HDMI link drops
+            # and cage forgets the output transform; on resume it comes
+            # back at "normal". Polling every second keeps the visible
+            # landscape flash short and the cost is negligible (one
+            # Wayland round-trip plus an awk per second).
+            rotate_watch_cmd = (
+                "while sleep 1; do "
+                f"current=$({shlex.quote(wlr_randr_path)} 2>/dev/null | "
+                "awk '/^[^ \\t]/ { name=$1 } /^  Transform:/ "
+                f"{{ print name, $2 }}'); "
+                "echo \"$current\" | while read o t; do "
+                f"if [ -n \"$o\" ] && [ \"$t\" != {shlex.quote(OUTPUT_TRANSFORM)} ]; then "
+                f"{shlex.quote(wlr_randr_path)} --output \"$o\" "
+                f"--transform {shlex.quote(OUTPUT_TRANSFORM)} "
+                ">/dev/null 2>&1 || true; "
+                "fi; done; done"
+            )
         if wlrctl_path:
             park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])
             launcher_lines = ["set -eu"]
             if rotate_cmd:
                 launcher_lines.append(rotate_cmd)
+            if rotate_watch_cmd:
+                launcher_lines.append(f"({rotate_watch_cmd}) &")
             launcher_lines.extend(
                 [
                     f"{shlex.join(chromium_args)} &",
@@ -929,9 +949,11 @@ class BrowserController:
             launcher_script = "\n".join(launcher_lines)
             args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
         elif rotate_cmd:
-            launcher_script = "\n".join(
-                ["set -eu", rotate_cmd, f"exec {shlex.join(chromium_args)}"]
-            )
+            lines = ["set -eu", rotate_cmd]
+            if rotate_watch_cmd:
+                lines.append(f"({rotate_watch_cmd}) &")
+            lines.append(f"exec {shlex.join(chromium_args)}")
+            launcher_script = "\n".join(lines)
             args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
         else:
             args = [CAGE_BIN, "-d", "--", *chromium_args]
