@@ -34,7 +34,14 @@ At startup, the client:
 6. binds a tiny loopback HTTP server on `127.0.0.1:18888` (configurable via
    `PIFRAME_BROWSER_EVENT_PORT`) that the kiosk JS POSTs to whenever it
    advances a slide or toggles pause - lets the manager UI reflect the
-   actual on-screen state instead of guessing from playback timestamps
+   actual on-screen state instead of guessing from playback timestamps.
+   The same endpoint also accepts manager-shaped commands at
+   `POST /control` for local automation (see
+   [Remote Control](#remote-control-vnc))
+7. starts a sibling `wayvnc` instance (separate systemd unit) that
+   attaches to the same cage Wayland session, so an operator can
+   drive the screen with mouse/keyboard from any VNC viewer on the
+   LAN (see [Remote Control](#remote-control-vnc))
 
 The browser polls the state file and renders media fullscreen on the
 attached display. State changes (pause / resume / slide rotation) wake
@@ -809,9 +816,10 @@ These can be set in the service file or shell environment.
 - `PIFRAME_BROWSER_VIDEO_FILL_MODE`
 - `PIFRAME_BROWSER_LOG_MAX_BYTES`
 - `PIFRAME_BROWSER_LOG_BACKUPS`
-- `PIFRAME_BROWSER_EVENT_PORT` (default `18888`) - loopback port the
-  kiosk JS POSTs slide-change and pause events to so they reach the
-  manager in real time
+- `PIFRAME_BROWSER_EVENT_PORT` (default `18888`) - loopback port for
+  the kiosk JS to POST slide-change / pause events to (so the
+  manager sees them in real time), and for the local control
+  endpoint at `POST /control` (see [Remote Control](#remote-control-vnc))
 
 ### Current Useful Values
 
