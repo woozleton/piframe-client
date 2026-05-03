@@ -206,6 +206,25 @@ Notes:
   clients auto-reconnect. Connecting only after the mode change
   avoids the disconnect entirely.
 
+### Testing webview mode without the manager
+
+`scripts/test_webview.sh` drives `BrowserController.set_browser_mode()`
+directly so you can exercise webview mode from an SSH session before
+the manager is wired up to send `webview_open` / `webview_close`.
+
+```bash
+sudo ./scripts/test_webview.sh                       # opens about:blank
+sudo ./scripts/test_webview.sh https://youtube.com   # opens that URL
+```
+
+What it does:
+
+- stops `piframe-client` (the device shows offline in the manager)
+- spins up cage + a windowed Chromium pointed at the URL (or
+  `about:blank`); VNC into `<pi-ip>:5900` to use the address bar
+- on Ctrl-C tears down the webview and restarts `piframe-client`
+  so the device returns to normal manager-driven operation
+
 ## Media Guidance
 
 For this Raspberry Pi 5 browser renderer, the practical house format is:
