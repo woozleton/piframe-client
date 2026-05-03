@@ -103,8 +103,15 @@ AUDIO_VISUALIZER_PRESETS = [
     "martin - witchcraft reloaded",
     "martin - reflections on black tiles",
     "flexi + amandio c - organic12-3d-2",
-    "martin - chain breaker",
-    "martin [shadow harlequins shape code] - fata morgana",
+    "Eo.S. + Zylot - skylight",
+    "Flexi + amandio c - piercing 05",
+    "flexi + geiss - pogo cubes vs. tokamak vs. game of life",
+    "Flexi, martin + geiss - dedicated to the sherwin maxawow",
+    "martin - disco mix 4",
+    "martin - mandelbox explorer",
+    "martin - mucus cervix",
+    "martin - stormy sea",
+    "suksma - heretical crosscut playpen",
 ]
 
 
