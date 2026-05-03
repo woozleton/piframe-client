@@ -13,6 +13,9 @@ VNC_SERVICE_NAME="piframe-vnc"
 VNC_LISTEN_ADDRESS="0.0.0.0"
 VNC_LISTEN_PORT="5900"
 INSTALL_SYSTEM_PACKAGES=1
+# Display orientation. Friendly name; mapped to a wlr-randr transform
+# below. Empty here means "ask, or inherit from existing service file".
+ORIENTATION=""
 
 usage() {
   cat <<EOF
@@ -24,6 +27,13 @@ Options:
                          Default: ${SERVER_URL}
   --nas-root <path>      NAS mount root. Default: ${NAS_ROOT}
   --mount-unit <unit>    systemd mount unit name. Default: ${MOUNT_UNIT}
+  --orientation <name>   Display orientation. One of:
+                           landscape       (TV mounted normally)
+                           portrait        (TV rotated 90° clockwise from landscape)
+                           portrait-ccw    (TV rotated 90° counter-clockwise)
+                           upside-down     (TV rotated 180°)
+                         If omitted, prompts interactively on first run
+                         and reuses the existing setting on re-runs.
   --skip-apt             Skip apt package installation.
   -h, --help             Show this help.
 EOF
@@ -45,6 +55,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --mount-unit)
       MOUNT_UNIT="$2"
+      shift 2
+      ;;
+    --orientation)
+      ORIENTATION="$2"
       shift 2
       ;;
     --skip-apt)
@@ -78,6 +92,76 @@ USER_GID="$(id -g "${SERVICE_USER}")"
 USER_HOME="$(getent passwd "${SERVICE_USER}" | cut -d: -f6)"
 VENV_DIR="${REPO_DIR}/api-env"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# ----------------------------------------------------------------
+# Resolve display orientation -> wlr-randr transform value.
+# Precedence:
+#   1. --orientation flag (explicit, always wins)
+#   2. existing PIFRAME_OUTPUT_TRANSFORM in the installed service
+#      file (re-run on a Pi that's already configured: keep what's
+#      there so we don't surprise the operator)
+#   3. interactive prompt if stdin is a terminal
+#   4. fallback: portrait (matches the most common deployment)
+# ----------------------------------------------------------------
+orientation_to_transform() {
+  case "$1" in
+    landscape)    echo "normal" ;;
+    portrait)     echo "90" ;;
+    portrait-ccw) echo "270" ;;
+    upside-down)  echo "180" ;;
+    *) return 1 ;;
+  esac
+}
+
+OUTPUT_TRANSFORM_VALUE=""
+if [[ -n "${ORIENTATION}" ]]; then
+  if ! OUTPUT_TRANSFORM_VALUE="$(orientation_to_transform "${ORIENTATION}")"; then
+    echo "Unknown orientation: ${ORIENTATION}" >&2
+    echo "Expected: landscape | portrait | portrait-ccw | upside-down" >&2
+    exit 1
+  fi
+elif [[ -f "${SERVICE_FILE}" ]]; then
+  EXISTING_TRANSFORM="$(grep -oE 'PIFRAME_OUTPUT_TRANSFORM=[a-z0-9-]+' "${SERVICE_FILE}" | head -1 | cut -d= -f2 || true)"
+  if [[ -n "${EXISTING_TRANSFORM}" ]]; then
+    OUTPUT_TRANSFORM_VALUE="${EXISTING_TRANSFORM}"
+    echo "Reusing existing orientation (transform=${OUTPUT_TRANSFORM_VALUE}) from ${SERVICE_FILE}"
+  else
+    # Existing service file but no PIFRAME_OUTPUT_TRANSFORM line -
+    # this is a Pi bootstrapped before the orientation prompt was
+    # added. Inherit the historical default (portrait) silently
+    # rather than prompting out of nowhere on a re-run.
+    OUTPUT_TRANSFORM_VALUE="90"
+    echo "Existing ${SERVICE_FILE} has no PIFRAME_OUTPUT_TRANSFORM; defaulting to portrait (transform=90). Pass --orientation to override."
+  fi
+fi
+if [[ -z "${OUTPUT_TRANSFORM_VALUE}" ]]; then
+  if [[ -t 0 ]]; then
+    cat <<'EOF'
+
+How is the TV physically mounted?
+  1) landscape       (TV in its normal horizontal position)
+  2) portrait        (TV rotated 90° clockwise from landscape)
+  3) portrait-ccw    (TV rotated 90° counter-clockwise)
+  4) upside-down     (TV rotated 180°)
+
+EOF
+    while true; do
+      read -r -p "Select [1-4, default 2 = portrait]: " choice
+      choice="${choice:-2}"
+      case "${choice}" in
+        1|landscape)    OUTPUT_TRANSFORM_VALUE="normal"; break ;;
+        2|portrait)     OUTPUT_TRANSFORM_VALUE="90"; break ;;
+        3|portrait-ccw) OUTPUT_TRANSFORM_VALUE="270"; break ;;
+        4|upside-down)  OUTPUT_TRANSFORM_VALUE="180"; break ;;
+        *) echo "Invalid choice. Enter 1, 2, 3, or 4." ;;
+      esac
+    done
+  else
+    OUTPUT_TRANSFORM_VALUE="90"
+    echo "No --orientation flag and no terminal; defaulting to portrait (transform=90)."
+  fi
+fi
+
 VNC_SERVICE_FILE="/etc/systemd/system/${VNC_SERVICE_NAME}.service"
 VNC_CONFIG_DIR="${USER_HOME}/.config/wayvnc"
 VNC_CONFIG_FILE="${VNC_CONFIG_DIR}/config"
@@ -176,6 +260,11 @@ Environment=PYTHONUNBUFFERED=1
 Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
 Environment=PIFRAME_SERVER=${SERVER_URL}
 Environment=PIFRAME_NAS_ROOT=${NAS_ROOT}
+# Output rotation applied to the cage compositor at kiosk start.
+# normal=landscape, 90=portrait (default mount), 270=portrait-ccw,
+# 180=upside-down. See README "Remote Control (VNC)" for why this
+# is at the compositor instead of in CSS.
+Environment=PIFRAME_OUTPUT_TRANSFORM=${OUTPUT_TRANSFORM_VALUE}
 
 [Install]
 WantedBy=multi-user.target
@@ -254,6 +343,7 @@ Service user:    ${SERVICE_USER}
 Service file:    ${SERVICE_FILE}
 Server URL:      ${SERVER_URL}
 NAS root:        ${NAS_ROOT}
+Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}
 

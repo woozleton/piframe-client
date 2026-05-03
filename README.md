@@ -457,6 +457,10 @@ Useful flags:
 
 - `--nas-root /mnt/nas`
 - `--mount-unit mnt-nas.mount`
+- `--orientation <name>` - one of `landscape`, `portrait` (default
+  on first run), `portrait-ccw`, `upside-down`. If omitted the
+  bootstrap prompts on first run and reuses the existing setting
+  from the installed service file on re-runs.
 - `--skip-apt`
 
 ## Logging
