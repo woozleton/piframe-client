@@ -9,6 +9,9 @@ SERVER_URL="ws://192.168.100.100:8080/ws"
 NAS_ROOT="/mnt/nas"
 MOUNT_UNIT="mnt-nas.mount"
 SERVICE_NAME="piframe-client"
+VNC_SERVICE_NAME="piframe-vnc"
+VNC_LISTEN_ADDRESS="0.0.0.0"
+VNC_LISTEN_PORT="5900"
 INSTALL_SYSTEM_PACKAGES=1
 
 usage() {
@@ -72,8 +75,12 @@ fi
 
 USER_UID="$(id -u "${SERVICE_USER}")"
 USER_GID="$(id -g "${SERVICE_USER}")"
+USER_HOME="$(getent passwd "${SERVICE_USER}" | cut -d: -f6)"
 VENV_DIR="${REPO_DIR}/api-env"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+VNC_SERVICE_FILE="/etc/systemd/system/${VNC_SERVICE_NAME}.service"
+VNC_CONFIG_DIR="${USER_HOME}/.config/wayvnc"
+VNC_CONFIG_FILE="${VNC_CONFIG_DIR}/config"
 ORIGIN_URL="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
 
 if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then
@@ -83,6 +90,8 @@ if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then
     cage \
     seatd \
     wlrctl \
+    wlr-randr \
+    wayvnc \
     gh \
     python3 \
     python3-venv \
@@ -94,6 +103,14 @@ if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then
     wireplumber \
     pulseaudio-utils
 fi
+
+# The wayvnc package on Raspberry Pi OS ships its own systemd unit
+# that runs as user `vnc` with a private XDG_RUNTIME_DIR. That's the
+# wrong shape for us - we need wayvnc to attach to the cage Wayland
+# session running under ${SERVICE_USER}, otherwise it captures an
+# empty headless session instead of the kiosk.
+systemctl disable --now wayvnc.service 2>/dev/null || true
+systemctl mask wayvnc.service 2>/dev/null || true
 
 if [[ -n "${ORIGIN_URL}" && "${ORIGIN_URL}" == https://github.com/* ]]; then
   if ! sudo -u "${SERVICE_USER}" gh auth status >/dev/null 2>&1; then
@@ -180,10 +197,53 @@ sudo -u "${SERVICE_USER}" \
   XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
   pactl set-sink-volume @DEFAULT_SINK@ 50% 2>/dev/null || true
 
+# wayvnc config + system unit for remote control of the kiosk display.
+# The unit attaches to the cage Wayland session owned by ${SERVICE_USER}
+# so VNC viewers see the actual kiosk content (not a headless session).
+# Auth is left disabled for v1 to match the existing LAN-trust posture
+# documented in README.md - the port should not be exposed beyond the
+# LAN. Enable wayvnc auth + TLS later by editing ${VNC_CONFIG_FILE}.
+install -d -m 0755 -o "${USER_UID}" -g "${USER_GID}" "${VNC_CONFIG_DIR}"
+if [[ ! -f "${VNC_CONFIG_FILE}" ]]; then
+  cat > "${VNC_CONFIG_FILE}" <<EOF
+address=${VNC_LISTEN_ADDRESS}
+enable_auth=false
+EOF
+  chown "${USER_UID}:${USER_GID}" "${VNC_CONFIG_FILE}"
+  chmod 0644 "${VNC_CONFIG_FILE}"
+fi
+
+cat > "${VNC_SERVICE_FILE}" <<EOF
+[Unit]
+Description=PiFrame VNC (wayvnc attached to the cage kiosk)
+After=${SERVICE_NAME}.service
+Wants=${SERVICE_NAME}.service
+# Cage gets torn down whenever the client switches between kiosk and
+# webview modes, which makes wayvnc lose its Wayland socket. Disable
+# systemd's start-limit rate cap so wayvnc keeps retrying after the
+# mode swap rather than giving up after the default ~5 fails / 10s.
+StartLimitIntervalSec=0
+
+[Service]
+User=${SERVICE_USER}
+# Match the cage session's runtime / wayland socket so wayvnc captures
+# the kiosk output instead of starting a headless session.
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/wayvnc --config=${VNC_CONFIG_FILE} ${VNC_LISTEN_ADDRESS} ${VNC_LISTEN_PORT}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
 systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
+systemctl enable "${VNC_SERVICE_NAME}"
+systemctl restart "${VNC_SERVICE_NAME}"
 
 cat <<EOF
 
@@ -194,10 +254,13 @@ Service user:    ${SERVICE_USER}
 Service file:    ${SERVICE_FILE}
 Server URL:      ${SERVER_URL}
 NAS root:        ${NAS_ROOT}
+VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
+VNC config:      ${VNC_CONFIG_FILE}
 
 Useful checks:
   systemctl status ${SERVICE_NAME} --no-pager
   journalctl -u ${SERVICE_NAME} -f
+  systemctl status ${VNC_SERVICE_NAME} --no-pager
 
 If audio does not work on the target Pi, verify the ALSA default device for that TV.
 EOF

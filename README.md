@@ -34,7 +34,14 @@ At startup, the client:
 6. binds a tiny loopback HTTP server on `127.0.0.1:18888` (configurable via
    `PIFRAME_BROWSER_EVENT_PORT`) that the kiosk JS POSTs to whenever it
    advances a slide or toggles pause - lets the manager UI reflect the
-   actual on-screen state instead of guessing from playback timestamps
+   actual on-screen state instead of guessing from playback timestamps.
+   The same endpoint also accepts manager-shaped commands at
+   `POST /control` for local automation (see
+   [Remote Control](#remote-control-vnc))
+7. starts a sibling `wayvnc` instance (separate systemd unit) that
+   attaches to the same cage Wayland session, so an operator can
+   drive the screen with mouse/keyboard from any VNC viewer on the
+   LAN (see [Remote Control](#remote-control-vnc))
 
 The browser polls the state file and renders media fullscreen on the
 attached display. State changes (pause / resume / slide rotation) wake
@@ -55,6 +62,8 @@ The client currently handles these server-side commands:
 - `stop` (also accepts `is_companion: true` to halt only the companion)
 - `volume`
 - `update_self` (see Self-update below)
+- `webview_open` (optional `url` field; see [Remote Control](#remote-control-vnc))
+- `webview_close`
 
 Single-video note:
 
@@ -71,16 +80,191 @@ Audio companion note:
 
 Current browser renderer features include:
 
-- 270-degree rotation for portrait-mounted displays
+- compositor-level rotation for portrait-mounted displays (`wlr-randr`
+  applied to cage at startup, see [Remote Control](#remote-control-vnc))
 - crossfade-style transitions using double-buffered stages
 - mixed-media playlist support
 - hidden cursor via compositor-level pointer parking with `wlrctl`
 - idle fallback image when nothing is playing
-- top-of-screen rotated status banner for runtime issues
+- top-of-screen status banner for runtime issues
 - bottom OSD for pause / volume / mute state
 - audio visualizer overlay (Butterchurn / MilkDrop) during audio
   playback, with per-playlist preset selection and a track-name
   OSD pulse on each new song
+
+## Remote Control (VNC)
+
+Each Pi runs a `wayvnc` instance attached to the cage Wayland session
+so an operator can drive the kiosk screen with mouse and keyboard
+from any VNC viewer on the LAN. This is useful for:
+
+- interacting with arbitrary websites loaded into the kiosk
+- nudging Chromium when a page needs a click to recover
+- debugging what the kiosk is actually rendering, in real time
+
+### Architecture
+
+- `wayvnc` runs under the same user as `cage` (e.g. `woozleton`) so
+  it captures the active kiosk output instead of starting a headless
+  session of its own
+- managed by a dedicated systemd unit (`piframe-vnc.service`) so it
+  starts at boot alongside `piframe-client.service`
+- listens on `0.0.0.0:5900` by default
+- the Raspberry Pi OS package ships its own `wayvnc.service` running
+  as user `vnc` against a private runtime dir; bootstrap masks that
+  unit because it would not capture the kiosk
+
+### Why compositor-side rotation
+
+The kiosk renderer used to apply a 270-degree CSS rotation so a
+portrait-mounted display read upright while cage produced a landscape
+framebuffer. That worked for the Pi's HDMI output, but VNC clients
+mirror what cage actually produces - so a remote viewer would see a
+landscape framebuffer with sideways content, and most VNC clients
+(RealVNC Viewer, TigerVNC, macOS Screen Sharing, Remmina) do not
+expose a client-side rotation toggle.
+
+Rotating at the compositor instead (`wlr-randr --transform 90` on
+the cage output) makes the framebuffer itself portrait, so:
+
+- the physical TV reads upright
+- VNC viewers see the screen upright with no client-side rotation
+- the renderer no longer applies a CSS rotation
+  (`BROWSER_ROTATION_DEGREES = 0`)
+
+The transform direction (90, 180, 270) is configurable via the
+`PIFRAME_OUTPUT_TRANSFORM` environment variable. Default is `90`.
+
+### Connecting
+
+Any VNC viewer that speaks RFB will work. Tested setups:
+
+- iPhone: RealVNC Viewer (App Store) - point it at
+  `<pi-ip>:5900`, no password by default
+- macOS: Finder -> `Cmd+K` -> `vnc://<pi-ip>:5900`
+- Linux desktop: TigerVNC, Remmina
+- Windows: TightVNC, RealVNC
+
+### Auth and trust posture
+
+V1 ships with `enable_auth=false` to match the existing LAN-trust
+posture: the manager -> client WebSocket has no per-device tokens
+either. Do not expose `5900/tcp` outside the LAN.
+
+To turn on authentication later, edit
+`/home/<user>/.config/wayvnc/config` and follow `man wayvnc` -
+`enable_auth=true` requires TLS keys + a username/password (the
+packaged `wayvnc-generate-keys.sh` covers the keys).
+
+### Useful checks
+
+```bash
+systemctl status piframe-vnc --no-pager
+journalctl -u piframe-vnc -f
+ss -ltnp | grep 5900
+```
+
+### Compositor compatibility
+
+Cage exposes the wlroots protocols `wayvnc` requires
+(`wlr-screencopy-unstable-v1`, `wlr-virtual-pointer-unstable-v1`,
+`virtual-keyboard-unstable-v1`). Verified on cage 0.x running on
+Raspberry Pi OS Trixie with the Pi 5's V3D path.
+
+### Webview mode (operator-driven web browsing)
+
+VNC alone only lets you click on whatever the kiosk happens to be
+showing - and the kiosk normally renders its own self-generated
+HTML, which has nothing meaningful to click. Webview mode swaps the
+kiosk Chromium for a windowed Chromium with chrome (address bar +
+tabs) so an operator on VNC can browse arbitrary websites.
+
+Switching modes restarts Chromium under cage with a different arg
+set; `--kiosk` is mutually exclusive with showing chrome, so a
+process restart is the only way to toggle. The TV shows ~2-3s blank
+during each transition.
+
+Commands:
+
+- `webview_open` (optional `url`) - tear down the kiosk Chromium,
+  start a windowed Chromium pointed at the URL (or `about:blank` so
+  the operator types it via VNC). Stops the audio companion as a
+  side effect since the operator's intent is a clean web session.
+- `webview_close` - tear down the windowed Chromium, restart the
+  kiosk renderer, return to idle. Playback does not auto-resume -
+  the operator picks the next item from the manager.
+
+Heartbeat fields the manager reads to reflect mode:
+
+- `browser_mode` - `"kiosk"` or `"webview"`
+- `webview_url` - the URL the windowed Chromium loaded (null in
+  kiosk mode)
+- `playback_state` - reads `"webview"` while in webview mode
+
+Notes:
+
+- The Chromium user data dir is shared across modes, so cookies,
+  history, bookmarks, and saved passwords persist when toggling
+- The compositor-side rotation stays applied in webview mode, so
+  websites render in the same portrait orientation as the kiosk
+  (Chromium's chrome adapts; most modern sites adapt; a few will
+  look awkward in portrait)
+- The VNC viewer disconnects briefly during the mode swap and most
+  clients auto-reconnect. Connecting only after the mode change
+  avoids the disconnect entirely.
+- A bundled Chromium extension at `vendor/h264ify/` is auto-loaded
+  in webview mode (only). It overrides
+  `MediaSource.isTypeSupported` to return false for AV1, so video
+  sites (YouTube, Vimeo, Twitch, etc.) fall back to VP9 / H.264.
+  Measured impact on a Pi 5 playing YouTube 1080p60: CPU went
+  from ~80% (AV1 / libdav1d) to ~60% (VP9), and the visual
+  experience is meaningfully smoother. The Pi 5 has no AV1 / VP9
+  / H.264 hardware decode block at all (only HEVC), so all video
+  decode is on the CPU; AV1 is just the most expensive of the
+  three. 1080p60 is still software-bound after the swap and
+  YouTube's "dropped frames" counter remains high - if smoothness
+  matters more than 60fps, prefer 1080p30 sources. Kiosk mode
+  does not load the extension because NAS-sourced playlist
+  content is never AV1.
+
+### Loopback control endpoint
+
+The browser-event server on `127.0.0.1:18888` also accepts
+manager-shaped commands at `POST /control`. Same in-process
+dispatcher the manager WebSocket uses, so it's the fast path
+(~700ms total mode swap on a Pi 5, measured) - no service
+restart, no cage cold start.
+
+Example:
+
+```bash
+curl -H 'Content-Type: application/json' \
+  -d '{"cmd":"webview_open","params":{"url":"https://example.com"}}' \
+  http://127.0.0.1:18888/control
+curl -H 'Content-Type: application/json' \
+  -d '{"cmd":"webview_close"}' \
+  http://127.0.0.1:18888/control
+```
+
+Loopback-only (`127.0.0.1`), no auth - same security posture as
+the existing browser-event endpoint. Useful for local automation
+and for the test script below.
+
+### Testing webview mode without the manager
+
+`scripts/test_webview.sh` posts `webview_open` to the loopback
+control endpoint and on Ctrl-C posts `webview_close`. Lets you
+exercise the same in-process fast path the manager would use,
+without needing the manager wired up.
+
+```bash
+sudo ./scripts/test_webview.sh                       # about:blank
+sudo ./scripts/test_webview.sh https://youtube.com   # specific URL
+sudo ./scripts/test_webview.sh --close               # close any active webview and exit
+```
+
+Requires `piframe-client.service` to be running. Mode swap takes
+~700ms (same as the manager-driven path).
 
 ## Media Guidance
 
@@ -238,16 +422,26 @@ What it does:
 
 - installs `gh` and `git`
 - installs required apt packages (chromium, cage, seatd, wlrctl,
-  alsa-utils, mpv for the audio companion)
+  wlr-randr, wayvnc, alsa-utils, mpv for the audio companion)
 - installs and enables `seatd`
 - installs `wlrctl` for compositor-level cursor parking
+- installs `wlr-randr` so the client can rotate the cage output to
+  match the physical mount (see [Remote Control](#remote-control-vnc))
+- installs `wayvnc` and writes the `piframe-vnc.service` unit so the
+  kiosk display is reachable from a VNC viewer on the LAN
+- masks the packaged `wayvnc.service` (it runs as a separate `vnc`
+  user against a private headless session, which would not capture
+  the kiosk)
 - creates `/home/<user>/piframe_client/api-env`
 - installs Python requirements from `requirements.txt`
 - writes `/etc/systemd/system/piframe-client.service`
+- writes `/etc/systemd/system/piframe-vnc.service`
+- writes `/home/<user>/.config/wayvnc/config` (only if absent, so
+  later edits survive re-runs)
 - enables user lingering via `loginctl enable-linger` so
   `/run/user/<uid>` exists at boot for cage / Chromium's Wayland
   socket
-- enables and restarts the service
+- enables and restarts both services
 
 Audio mixer (one-time, recommended):
 
@@ -598,6 +792,12 @@ These can be set in the service file or shell environment.
 - `PIFRAME_IDLE_MEDIA`
 - `PIFRAME_CHROMIUM_BIN`
 - `PIFRAME_CAGE_BIN`
+- `PIFRAME_WLR_RANDR_BIN` (default `wlr-randr`) - used to apply
+  `PIFRAME_OUTPUT_TRANSFORM` to the cage output at startup
+- `PIFRAME_OUTPUT_TRANSFORM` (default `90`) - cage output rotation,
+  applied via `wlr-randr --transform`. Accepts `normal`, `90`,
+  `180`, `270`, `flipped`, `flipped-90`, `flipped-180`,
+  `flipped-270`. See [Remote Control](#remote-control-vnc).
 - `PIFRAME_COMPANION_MPV_BIN` (default `mpv`) - sidecar binary for the audio companion
 - `PIFRAME_COMPANION_MPV_SOCKET` (default `/tmp/piframe_companion_mpv.sock`)
 
@@ -616,9 +816,10 @@ These can be set in the service file or shell environment.
 - `PIFRAME_BROWSER_VIDEO_FILL_MODE`
 - `PIFRAME_BROWSER_LOG_MAX_BYTES`
 - `PIFRAME_BROWSER_LOG_BACKUPS`
-- `PIFRAME_BROWSER_EVENT_PORT` (default `18888`) - loopback port the
-  kiosk JS POSTs slide-change and pause events to so they reach the
-  manager in real time
+- `PIFRAME_BROWSER_EVENT_PORT` (default `18888`) - loopback port for
+  the kiosk JS to POST slide-change / pause events to (so the
+  manager sees them in real time), and for the local control
+  endpoint at `POST /control` (see [Remote Control](#remote-control-vnc))
 
 ### Current Useful Values
 

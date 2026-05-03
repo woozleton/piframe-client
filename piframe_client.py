@@ -44,7 +44,21 @@ NAS_ROOT = os.environ.get("PIFRAME_NAS_ROOT", "/mnt/nas").rstrip("/") or "/mnt/n
 CHROMIUM_BIN = os.environ.get("PIFRAME_CHROMIUM_BIN", "chromium").strip() or "chromium"
 CAGE_BIN = os.environ.get("PIFRAME_CAGE_BIN", "cage").strip() or "cage"
 WLRCTL_BIN = os.environ.get("PIFRAME_WLRCTL_BIN", "wlrctl").strip() or "wlrctl"
-BROWSER_ROTATION_DEGREES = 270
+WLR_RANDR_BIN = os.environ.get("PIFRAME_WLR_RANDR_BIN", "wlr-randr").strip() or "wlr-randr"
+# Output rotation is applied at the compositor (cage) via wlr-randr so the
+# framebuffer is natively portrait. This makes VNC viewers see the screen
+# upright without any client-side rotation, which most VNC clients don't
+# support. Set BROWSER_ROTATION_DEGREES to 0 because the renderer's CSS
+# rotation would double-rotate against the compositor transform.
+OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "90"
+BROWSER_ROTATION_DEGREES = 0
+# Bundled Chromium extension that forces video sites off AV1.
+# Loaded only in webview mode (kiosk renderer's content is from
+# the NAS and never AV1, so kiosk mode runs without it). The Pi 5
+# has no AV1 hardware decode and libdav1d on the CPU caps 1080p60
+# AV1 at ~50% delivered frames; H.264 / VP9 are dramatically
+# lighter here.
+H264IFY_EXTENSION_DIR = Path(__file__).resolve().parent / "vendor" / "h264ify"
 BROWSER_STATE_FILE = Path("/tmp/piframe_browser_state.json")
 BROWSER_HTML_FILE = Path("/tmp/piframe_browser.html")
 BROWSER_PROFILE_DIR = Path("/tmp/piframe_chromium_profile")
@@ -579,6 +593,38 @@ def _clear_stale_wayland_sockets(runtime_dir: str) -> None:
         _log("wayland_sockets_cleared", runtime_dir=runtime_dir, removed=",".join(removed))
 
 
+def _suppress_chromium_crash_dialog(profile_dir: Path) -> None:
+    """Tell Chromium it shut down cleanly so the next launch doesn't show
+    the "Restore session?" dialog. piframe-client kills Chromium with
+    SIGTERM on every mode swap, which Chromium records as a crash in
+    Preferences.exit_type. The flags --disable-session-crashed-bubble
+    and --hide-crash-restore-bubble suppress some variants of the
+    dialog but not all - the canonical fix is rewriting exit_type +
+    exited_cleanly in the profile's Preferences JSON before launch.
+    """
+    prefs_path = profile_dir / "Default" / "Preferences"
+    if not prefs_path.exists():
+        return
+    try:
+        prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    profile = prefs.setdefault("profile", {})
+    changed = False
+    if profile.get("exit_type") != "Normal":
+        profile["exit_type"] = "Normal"
+        changed = True
+    if profile.get("exited_cleanly") is not True:
+        profile["exited_cleanly"] = True
+        changed = True
+    if not changed:
+        return
+    try:
+        prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    except OSError as exc:
+        _log("chromium_prefs_rewrite_failed", error=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -602,6 +648,12 @@ class BrowserController:
         self.slideshow_active = False
         self.slideshow_images: List[str] = []
         self.last_command: str = ""
+        # Browser mode toggles between the kiosk renderer and a windowed
+        # Chromium with chrome visible (address bar + tabs) for ad-hoc
+        # web browsing via VNC. Switching modes restarts the browser
+        # process under cage with a different arg set.
+        self._browser_mode: str = "kiosk"
+        self._webview_url: Optional[str] = None
         self._settings_path = CLIENT_SETTINGS_FILE
         self._last_volume: float = 75.0
         self._last_mute: bool = False
@@ -712,20 +764,24 @@ class BrowserController:
             chromium=CHROMIUM_BIN,
             html=BROWSER_HTML_FILE,
             state=BROWSER_STATE_FILE,
+            mode=self._browser_mode,
+            webview_url=self._webview_url or "",
         )
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
         _log("browser_runtime", xdg_runtime_dir=runtime_dir)
         _clear_stale_wayland_sockets(runtime_dir)
         BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
         BROWSER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _suppress_chromium_crash_dialog(BROWSER_PROFILE_DIR)
         _rotate_log(
             BROWSER_LOG_FILE,
             max_bytes=BROWSER_LOG_MAX_BYTES,
             backups=BROWSER_LOG_BACKUPS,
         )
+        # Args common to both kiosk and webview modes. Mode-specific
+        # bits (--kiosk, target URL) are added below.
         chromium_args = [
             CHROMIUM_BIN,
-            "--kiosk",
             "--ozone-platform=wayland",
             "--enable-features=UseOzonePlatform",
             "--no-first-run",
@@ -734,6 +790,7 @@ class BrowserController:
             f"--disk-cache-dir={BROWSER_CACHE_DIR}",
             "--disk-cache-size=268435456",
             "--disable-session-crashed-bubble",
+            "--hide-crash-restore-bubble",
             "--disable-infobars",
             "--noerrdialogs",
             "--disable-background-networking",
@@ -758,22 +815,51 @@ class BrowserController:
             # V3D driver shows up in the blocklist by default.
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
-            # Drop both Chromium's frame-rate ceiling AND vsync. The
-            # earlier vsync test found stormy / heavy presets reported
-            # 58fps while visually running at ~10 - we've since
-            # culled the worst offenders, so the remaining set runs
-            # smoothly enough that the unbounded path gives a real
-            # quality bump on the lighter presets.
-            "--disable-frame-rate-limit",
-            "--disable-gpu-vsync",
-            BROWSER_HTML_FILE.as_uri(),
         ]
+        if self._browser_mode == "webview":
+            # Windowed Chromium with chrome (address bar + tabs) so an
+            # operator on VNC can navigate freely. --start-maximized
+            # ensures it fills the cage output without --kiosk hiding
+            # the chrome we want visible. Vsync stays at Chromium's
+            # default in webview mode - the kiosk's vsync overrides
+            # are tuned for Butterchurn and stutter HTML5 video.
+            chromium_args.append("--start-maximized")
+            # Load h264ify so YouTube / Vimeo / etc. stop advertising
+            # AV1. Conditional on the vendor dir being present so a
+            # half-checked-out tree doesn't crash Chromium.
+            if (H264IFY_EXTENSION_DIR / "manifest.json").exists():
+                chromium_args.append(f"--load-extension={H264IFY_EXTENSION_DIR}")
+            chromium_args.append(self._webview_url or "about:blank")
+        else:
+            # Kiosk mode: drop frame-rate ceiling and vsync so the
+            # Butterchurn audio visualizer can render at unbounded
+            # fps. cage+wayland's vsync caps the visualizer at ~40fps
+            # otherwise, masking the actual GPU budget.
+            chromium_args.append("--disable-frame-rate-limit")
+            chromium_args.append("--disable-gpu-vsync")
+            chromium_args.append("--kiosk")
+            chromium_args.append(BROWSER_HTML_FILE.as_uri())
         wlrctl_path = shutil.which(WLRCTL_BIN)
+        wlr_randr_path = shutil.which(WLR_RANDR_BIN)
+        rotate_cmd = ""
+        if wlr_randr_path and OUTPUT_TRANSFORM and OUTPUT_TRANSFORM != "normal":
+            # Apply the compositor-side rotation to every output cage
+            # exposes. wlr-randr's plain output starts each output with
+            # its name at column 0, indented detail lines follow.
+            rotate_cmd = (
+                f"{shlex.quote(wlr_randr_path)} 2>/dev/null | "
+                "awk '/^[^ \\t]/ { print $1 }' | "
+                f"while read o; do {shlex.quote(wlr_randr_path)} "
+                f"--output \"$o\" --transform {shlex.quote(OUTPUT_TRANSFORM)} "
+                ">/dev/null 2>&1 || true; done"
+            )
         if wlrctl_path:
             park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])
-            launcher_script = "\n".join(
+            launcher_lines = ["set -eu"]
+            if rotate_cmd:
+                launcher_lines.append(rotate_cmd)
+            launcher_lines.extend(
                 [
-                    "set -eu",
                     f"{shlex.join(chromium_args)} &",
                     "pid=$!",
                     "(",
@@ -784,6 +870,12 @@ class BrowserController:
                     ") &",
                     "wait \"$pid\"",
                 ]
+            )
+            launcher_script = "\n".join(launcher_lines)
+            args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
+        elif rotate_cmd:
+            launcher_script = "\n".join(
+                ["set -eu", rotate_cmd, f"exec {shlex.join(chromium_args)}"]
             )
             args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
         else:
@@ -814,6 +906,54 @@ class BrowserController:
         if self.is_running:
             return True
         return self._start_browser()
+
+    def set_browser_mode(self, mode: str, webview_url: Optional[str] = None) -> bool:
+        """Switch between kiosk and webview modes.
+
+        Tearing down + relaunching cage+Chromium is the only way to
+        toggle --kiosk; Chromium does not expose a runtime flag for
+        this. The blank screen between teardown and respawn is brief
+        (~2-3s) and only happens on operator-triggered mode changes.
+        """
+        if mode not in ("kiosk", "webview"):
+            _log("browser_mode_invalid", mode=mode)
+            return False
+        normalized_url = webview_url.strip() if webview_url else None
+        if (
+            mode == self._browser_mode
+            and normalized_url == self._webview_url
+            and self.is_running
+        ):
+            return True
+        _log(
+            "browser_mode_change",
+            from_mode=self._browser_mode,
+            to_mode=mode,
+            webview_url=normalized_url or "",
+        )
+        self._browser_mode = mode
+        self._webview_url = normalized_url
+        t0 = time.time()
+        self.shutdown()
+        t1 = time.time()
+        ok = self._start_browser()
+        t2 = time.time()
+        _log(
+            "browser_mode_timing",
+            shutdown_s=f"{t1 - t0:.2f}",
+            start_s=f"{t2 - t1:.2f}",
+            total_s=f"{t2 - t0:.2f}",
+            ok=ok,
+        )
+        return ok
+
+    @property
+    def browser_mode(self) -> str:
+        return self._browser_mode
+
+    @property
+    def webview_url(self) -> Optional[str]:
+        return self._webview_url
 
     @staticmethod
     def _pick_existing_idle_media(idle_url: str) -> str:
@@ -1420,6 +1560,13 @@ class _BrowserEventState:
 # can stash events for the PiFrameClient instance to read.
 BROWSER_EVENT_STATE = _BrowserEventState()
 
+# Module-level reference to the PiFrameClient so the loopback HTTP
+# control endpoint (POST /control) can dispatch commands without going
+# through the manager WebSocket. Used by test scripts and for any
+# local automation that wants to drive the kiosk without standing up
+# a fake manager.
+_CLIENT_REF: Optional[Any] = None
+
 
 class _BrowserEventHandler(BaseHTTPRequestHandler):
     """Tiny POST endpoint the kiosk fetch()es on every slide change."""
@@ -1434,6 +1581,34 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
+    def _handle_control(self) -> None:
+        """Dispatch a Woozlescape-shaped command into the running client.
+
+        Lets local tools (test_webview.sh, debugging shells) drive the
+        kiosk without needing a manager WebSocket connection. Same
+        in-process fast path as the manager - no service restart, no
+        cage teardown beyond what the command itself does.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            length = 0
+        body = self.rfile.read(length) if length > 0 else b""
+        try:
+            payload = json.loads(body.decode("utf-8") or "{}")
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        client = _CLIENT_REF
+        if client is None:
+            self._send(503)
+            return
+        try:
+            client.on_message(None, json.dumps(payload))
+            self._send(204)
+        except Exception as exc:
+            _log("control_dispatch_failed", error=str(exc))
+            self._send(500)
+
     def do_OPTIONS(self) -> None:  # noqa: N802 (BaseHTTPRequestHandler API)
         # CORS preflight - browser fetch() to a different origin (file:// page
         # to http://127.0.0.1) treats this as cross-origin.
@@ -1445,6 +1620,9 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == "/control":
+            self._handle_control()
+            return
         if self.path != "/browser-event":
             self._send(404)
             return
@@ -1613,6 +1791,8 @@ class PiFrameClient:
             "slideshow": self._handle_slideshow,
             "volume": self._handle_volume,
             "update_self": self._handle_update_self,
+            "webview_open": self._handle_webview_open,
+            "webview_close": self._handle_webview_close,
         }.get(cmd)
         if handler:
             handler(data, params)
@@ -1960,6 +2140,48 @@ class PiFrameClient:
         except OSError as exc:
             _log("update_self_spawn_failed", error=exc)
 
+    def _handle_webview_open(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:
+        """Switch the kiosk into a windowed Chromium with chrome
+        visible (address bar + tabs) so an operator on VNC can browse.
+        Optional `url` field jumps straight to that page; without it
+        Chromium opens to about:blank and the operator types in the
+        address bar via VNC."""
+        url = (params.get("url") or data.get("url") or "").strip() or None
+        _log("webview_open_command", url=url or "")
+        # Stop any audio companion first - the operator's expectation
+        # when "open URL" is clicked is a clean web session, not
+        # background music continuing to play.
+        self._set_companion_state([], repeat=False, mute_visual=False)
+        self.playback_state = "webview"
+        self.current_video = ""
+        self.current_slideshow = []
+        self.current_playlist_name = ""
+        self.current_playlist_id = ""
+        self.slideshow_started_at = None
+        BROWSER_EVENT_STATE.clear_slideshow_index()
+        BROWSER_EVENT_STATE.set_paused(False)
+        self.renderer.set_browser_mode("webview", url)
+        BROWSER_EVENT_STATE.wakeup.set()
+
+    def _handle_webview_close(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:  # pylint: disable=unused-argument
+        """Return from webview mode to the kiosk renderer. Playback
+        does not auto-resume - the operator picks the next thing to
+        play from the manager. Same shape as `_handle_stop` for the
+        post-mode state."""
+        _log("webview_close_command")
+        self.playback_state = "stopped"
+        self.current_video = ""
+        self.current_slideshow = []
+        self.renderer.set_browser_mode("kiosk", None)
+        # Once the kiosk renderer is back up, show idle so the screen
+        # has something to display rather than a blank page.
+        self.renderer.ensure_idle(self._get_idle_media())
+        BROWSER_EVENT_STATE.wakeup.set()
+
     def on_close(self, ws, close_status_code, close_msg) -> None:  # pylint: disable=unused-argument
         _log("websocket_closed", code=close_status_code, message=close_msg)
         self.ws_connection = None
@@ -2103,6 +2325,8 @@ class PiFrameClient:
                 "current_playlist": self.current_playlist_name,
                 "current_playlist_id": self.current_playlist_id,
                 "playback_state": effective_state,
+                "browser_mode": self.renderer.browser_mode,
+                "webview_url": self.renderer.webview_url,
                 "shuffle": self.current_shuffle,
                 "volume": renderer_volume,
                 "muted": renderer_muted,
@@ -2174,13 +2398,16 @@ def parse_args() -> ClientConfig:
 
 
 def main() -> None:
+    global _CLIENT_REF
     config = parse_args()
     client = PiFrameClient(config)
+    _CLIENT_REF = client
     try:
         client.run()
     except KeyboardInterrupt:
         _log("client_stopping")
     finally:
+        _CLIENT_REF = None
         client.shutdown()
 
 
