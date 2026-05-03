@@ -97,11 +97,16 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 # Resolve display orientation -> wlr-randr transform value.
 # Precedence:
 #   1. --orientation flag (explicit, always wins)
-#   2. existing PIFRAME_OUTPUT_TRANSFORM in the installed service
-#      file (re-run on a Pi that's already configured: keep what's
-#      there so we don't surprise the operator)
-#   3. interactive prompt if stdin is a terminal
-#   4. fallback: portrait (matches the most common deployment)
+#   2. existing service file with PIFRAME_OUTPUT_TRANSFORM line
+#      (re-run on a configured Pi: keep that value)
+#   3. existing service file without that line (re-run on a Pi
+#      bootstrapped before this prompt was added: silent default
+#      to portrait so we don't surprise the operator with a prompt
+#      on a routine bootstrap re-run)
+#   4. no service file yet AND stdin is a terminal (first-time
+#      install on a fresh Pi): prompt interactively
+#   5. no service file yet AND no terminal (unattended install):
+#      silent default to portrait
 # ----------------------------------------------------------------
 orientation_to_transform() {
   case "$1" in
@@ -145,8 +150,17 @@ How is the TV physically mounted?
   4) upside-down     (TV rotated 180°)
 
 EOF
+    choice=""
     while true; do
-      read -r -p "Select [1-4, default 2 = portrait]: " choice
+      # If read fails (e.g. EOF / piped stdin closes), default to
+      # portrait rather than looping forever. set -u makes the
+      # post-read expansion below safe with this initialization.
+      if ! read -r -p "Select [1-4, default 2 = portrait]: " choice; then
+        OUTPUT_TRANSFORM_VALUE="90"
+        echo
+        echo "(no input; defaulting to portrait)"
+        break
+      fi
       choice="${choice:-2}"
       case "${choice}" in
         1|landscape)    OUTPUT_TRANSFORM_VALUE="normal"; break ;;
