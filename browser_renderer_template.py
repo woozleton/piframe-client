@@ -1048,13 +1048,12 @@ def render_browser_html(
       // Render at a fixed lower resolution and upscale via CSS - cuts
       // shader work proportionally to the area ratio. The canvas
       // CSS size still fills the wrapper so the visual is fullscreen.
-      const RENDER_SCALE = 0.5;     // 50% of viewport pixels (~25% of native shader work)
+      const RENDER_SCALE = 0.4;     // 40% of viewport pixels (~16% of native shader work)
       const TARGET_FPS = 60;
       // Butterchurn warp/comp mesh density. Default is 48; 24 cuts
-      // vertex-shader work to ~25% of default. With Chromium's vsync
-      // lifted (compositor was the bottleneck, not shaders) we can
-      // afford to bump quality back up from the earlier 16-mesh
-      // setting without losing the 60fps target.
+      // vertex-shader work to ~25% of default. Tuned in concert with
+      // RENDER_SCALE for headroom across the 10-preset curated list
+      // with Chromium's vsync + frame-rate-limit both lifted.
       const VIZ_MESH_SIZE = 24;
       const FRAME_MIN_MS = 1000 / TARGET_FPS;
       let lastFrameTime = 0;

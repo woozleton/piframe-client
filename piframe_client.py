@@ -100,7 +100,6 @@ IDLE_MEDIA_DEFAULT_CANDIDATES = (
 # browser_renderer_template.py uses this same list to filter the
 # Butterchurn preset map at runtime.
 AUDIO_VISUALIZER_PRESETS = [
-    "martin - witchcraft reloaded",
     "martin - reflections on black tiles",
     "flexi + amandio c - organic12-3d-2",
     "Eo.S. + Zylot - skylight",
@@ -759,14 +758,14 @@ class BrowserController:
             # V3D driver shows up in the blocklist by default.
             "--ignore-gpu-blocklist",
             "--enable-gpu-rasterization",
-            # Drop Chromium's artificial frame-rate ceiling but KEEP
-            # vsync. Without vsync, slow shaders (e.g. stormy) made
-            # the rAF counter report 58fps while the eye saw ~10fps -
-            # rAF was ticking faster than the GPU could present, and
-            # frames piled up unrendered. With vsync re-enabled,
-            # heavy presets gate to 30/20/15fps cleanly and the
-            # measured fps matches what's on screen.
+            # Drop both Chromium's frame-rate ceiling AND vsync. The
+            # earlier vsync test found stormy / heavy presets reported
+            # 58fps while visually running at ~10 - we've since
+            # culled the worst offenders, so the remaining set runs
+            # smoothly enough that the unbounded path gives a real
+            # quality bump on the lighter presets.
             "--disable-frame-rate-limit",
+            "--disable-gpu-vsync",
             BROWSER_HTML_FILE.as_uri(),
         ]
         wlrctl_path = shutil.which(WLRCTL_BIN)
