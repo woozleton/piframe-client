@@ -208,12 +208,17 @@ Notes:
 - A bundled Chromium extension at `vendor/h264ify/` is auto-loaded
   in webview mode (only). It overrides
   `MediaSource.isTypeSupported` to return false for AV1, so video
-  sites (YouTube, Vimeo, Twitch, etc.) fall back to H.264 / VP9.
-  The Pi 5 has no AV1 hardware decoder and libdav1d on the CPU
-  caps 1080p60 AV1 at roughly half the source framerate; H.264
-  software decode on the Pi 5's CPU is far lighter. Kiosk mode
-  doesn't load the extension because NAS-sourced playlist content
-  is never AV1.
+  sites (YouTube, Vimeo, Twitch, etc.) fall back to VP9 / H.264.
+  Measured impact on a Pi 5 playing YouTube 1080p60: CPU went
+  from ~80% (AV1 / libdav1d) to ~60% (VP9), and the visual
+  experience is meaningfully smoother. The Pi 5 has no AV1 / VP9
+  / H.264 hardware decode block at all (only HEVC), so all video
+  decode is on the CPU; AV1 is just the most expensive of the
+  three. 1080p60 is still software-bound after the swap and
+  YouTube's "dropped frames" counter remains high - if smoothness
+  matters more than 60fps, prefer 1080p30 sources. Kiosk mode
+  does not load the extension because NAS-sourced playlist
+  content is never AV1.
 
 ### Testing webview mode without the manager
 
