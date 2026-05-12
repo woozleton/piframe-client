@@ -2116,6 +2116,8 @@ class PiFrameClient:
         self.renderer.show_idle(self._get_idle_media())
         self.current_video = ""
         self.current_slideshow = []
+        self.current_playlist_name = ""
+        self.current_playlist_id = ""
         self.playback_state = "stopped"
         self.slideshow_started_at = None
         BROWSER_EVENT_STATE.clear_slideshow_index()
@@ -2276,6 +2278,20 @@ class PiFrameClient:
         self._stop_status_updates()
         self.renderer.show_idle(self._get_idle_media())
         self.renderer.set_banner("Server disconnected", level="error")
+        # Renderer is now idle - clear the playback bookkeeping so the
+        # next heartbeat (after reconnect) reports the truth instead of
+        # the stale slideshow/playing state from before the disconnect.
+        # Without this, the manager's Now Playing panel paints PLAYING
+        # against the last content for every reconnect, even though the
+        # Pi has been on idle.html the whole time.
+        self.current_video = ""
+        self.current_slideshow = []
+        self.current_playlist_name = ""
+        self.current_playlist_id = ""
+        self.playback_state = "stopped"
+        self.slideshow_started_at = None
+        BROWSER_EVENT_STATE.clear_slideshow_index()
+        BROWSER_EVENT_STATE.set_paused(False)
 
     def on_error(self, ws, error: Exception) -> None:  # pylint: disable=unused-argument
         _log("websocket_error", error=error)
