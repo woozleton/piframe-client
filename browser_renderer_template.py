@@ -1061,20 +1061,22 @@ def render_browser_html(
       // CSS size still fills the wrapper so the visual is fullscreen.
       const RENDER_SCALE = 0.4;     // 40% of viewport pixels (~16% of native shader work)
       const TARGET_FPS = 60;
-      // Butterchurn warp/comp mesh density. Default is 48; 24 cuts
-      // vertex-shader work to ~25% of default. Tuned in concert with
-      // RENDER_SCALE for headroom across the 10-preset curated list
-      // with Chromium's vsync + frame-rate-limit both lifted.
-      const VIZ_MESH_SIZE = 24;
+      // Butterchurn warp/comp mesh density. Default is 48; 16 cuts
+      // vertex-shader work to ~11% of default. Milkdrop's coarser
+      // warp grid is visually indistinguishable from 24 or 48 once
+      // CSS upscaling is applied on top, so we trade vertices for
+      // headroom on 4K targets.
+      const VIZ_MESH_SIZE = 16;
       // Absolute cap on the visualizer's backing-store pixel count.
       // On a 1080p frame, viewport * dpr * RENDER_SCALE already lands
       // under this (~330k pixels at dpr=1). On a 4K frame (43" TVs)
-      // the same math runs to ~6M pixels at dpr=2 - way above the
-      // V3D core's sustainable shader budget for Butterchurn presets.
-      // 1280x720 = ~921k pixels is the cap; CSS upscales the canvas
-      // back to fullscreen and the resulting blur is invisible against
-      // Milkdrop's already-blurry feedback patterns.
-      const VIZ_MAX_PIXELS = 1280 * 720;
+      // the uncapped math runs to ~6M pixels at dpr=2 - way above
+      // the V3D core's sustainable Butterchurn shader budget. 854x480
+      // (~410k pixels) keeps the cap below the 1080p case so even
+      // the 4K frames stay in the same shader-work envelope. CSS
+      // upscales the canvas back to fullscreen and the blur is
+      // invisible against Milkdrop's already-blurry feedback patterns.
+      const VIZ_MAX_PIXELS = 854 * 480;
 
       // Compute the visualizer canvas backing-store size for the
       // current viewport, applying both the RENDER_SCALE downscale
