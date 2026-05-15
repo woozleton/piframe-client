@@ -1282,10 +1282,18 @@ def render_browser_html(
             paintVizError("Butterchurn API mismatch");
             return false;
           }}
+          // pixelRatio: 1 is intentional. We've already applied the
+          // device-pixel-ratio in computeVizCanvasSize when sizing the
+          // canvas backing store; passing dpr here a second time made
+          // Butterchurn inflate its internal render targets by another
+          // factor of dpr (so a 854x480 canvas on a 4K screen with
+          // dpr=2 ended up with 1708x960 internal buffers - quietly
+          // undoing the VIZ_MAX_PIXELS cap). The canvas itself IS the
+          // final render target as far as Butterchurn is concerned.
           viz = Butterchurn.createVisualizer(audioCtx, canvas, {{
             width: canvas.width,
             height: canvas.height,
-            pixelRatio: dpr,
+            pixelRatio: 1,
             meshWidth: VIZ_MESH_SIZE,
             meshHeight: VIZ_MESH_SIZE,
           }});
