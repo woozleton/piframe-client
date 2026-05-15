@@ -355,7 +355,7 @@ pcm.!default {
 
 ctl.!default {
   type hw
-  card $(echo "${ALSA_DEVICE}" | cut -d: -f2)
+  card $(echo "${ALSA_DEVICE}" | cut -d: -f2 | cut -d, -f1)
 }
 ASOUNDRC
 chown "${USER_UID}:${USER_GID}" "${USER_HOME}/.asoundrc"
