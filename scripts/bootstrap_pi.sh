@@ -16,6 +16,10 @@ INSTALL_SYSTEM_PACKAGES=1
 # Display orientation. Friendly name; mapped to a wlr-randr transform
 # below. Empty here means "ask, or inherit from existing service file".
 ORIENTATION=""
+# ALSA device for audio output. Pi 5 has two HDMI ports (0 and 1) with
+# different audio characteristics. Port 0 produces better audio.
+# Format: plughw:X,Y where X is card number, Y is device number.
+ALSA_DEVICE="plughw:0,0"
 
 usage() {
   cat <<EOF
@@ -34,6 +38,9 @@ Options:
                            upside-down     (TV rotated 180°)
                          If omitted, prompts interactively on first run
                          and reuses the existing setting on re-runs.
+  --alsa-device <dev>    ALSA device for audio (plughw:card,device).
+                         Default: ${ALSA_DEVICE}
+                         The Pi 5 has two HDMI ports: 0 (better audio) and 1.
   --skip-apt             Skip apt package installation.
   -h, --help             Show this help.
 EOF
@@ -59,6 +66,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --orientation)
       ORIENTATION="$2"
+      shift 2
+      ;;
+    --alsa-device)
+      ALSA_DEVICE="$2"
       shift 2
       ;;
     --skip-apt)
@@ -291,19 +302,18 @@ EOF
 # the runtime dir is created and chromium fails to open a window.
 loginctl enable-linger "${SERVICE_USER}"
 
-# Configure ALSA to use HDMI port 0. The Pi 5 has two HDMI ports with
+# Configure ALSA device. The Pi 5 has two HDMI ports (0 and 1) with
 # different audio characteristics; port 0 produces better audio output.
-# This matches the historical setup and ensures consistent audio levels
-# across all deployed Pis.
-cat > "${USER_HOME}/.asoundrc" <<'ASOUNDRC'
+# Default is plughw:0,0 (HDMI port 0) but can be overridden with --alsa-device.
+cat > "${USER_HOME}/.asoundrc" <<ASOUNDRC
 pcm.!default {
   type plug
-  slave.pcm "plughw:0,0"
+  slave.pcm "${ALSA_DEVICE}"
 }
 
 ctl.!default {
   type hw
-  card 0
+  card $(echo "${ALSA_DEVICE}" | cut -d: -f2)
 }
 ASOUNDRC
 chown "${USER_UID}:${USER_GID}" "${USER_HOME}/.asoundrc"
@@ -386,6 +396,7 @@ Service file:    ${SERVICE_FILE}
 Server URL:      ${SERVER_URL}
 NAS root:        ${NAS_ROOT}
 Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
+Audio device:    ${ALSA_DEVICE}
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}
 
@@ -393,6 +404,7 @@ Useful checks:
   systemctl status ${SERVICE_NAME} --no-pager
   journalctl -u ${SERVICE_NAME} -f
   systemctl status ${VNC_SERVICE_NAME} --no-pager
+  pactl get-sink-volume @DEFAULT_SINK@
 
-If audio does not work on the target Pi, verify the ALSA default device for that TV.
+If audio does not work on the target Pi, verify the ALSA device with: aplay -l
 EOF
