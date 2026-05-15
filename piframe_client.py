@@ -1868,6 +1868,7 @@ class PiFrameClient:
             "slideshow": self._handle_slideshow,
             "volume": self._handle_volume,
             "update_self": self._handle_update_self,
+            "restart_service": self._handle_restart_service,
             "webview_open": self._handle_webview_open,
             "webview_close": self._handle_webview_close,
         }.get(cmd)
@@ -2201,6 +2202,25 @@ class PiFrameClient:
             BROWSER_EVENT_STATE.wakeup.set()
         except Exception:
             pass
+
+    def _handle_restart_service(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
+        """Server-pushed `Settings -> Clients -> Restart` action. Just
+        runs `sudo systemctl restart piframe-client`; systemd kills
+        this process and respawns it on the same SHA. No git pull -
+        for that the operator uses Update self (which routes through
+        update.sh and ends with the same restart). Detached so the
+        restart doesn't have to wait for the WS reader thread to
+        unwind before systemd can exec."""
+        _log("restart_service_starting")
+        try:
+            subprocess.Popen(
+                ["sudo", "systemctl", "restart", "piframe-client"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            _log("restart_service_spawn_failed", error=exc)
 
     def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
         """Server-pushed in-place update. Spawns `update.sh` from the
