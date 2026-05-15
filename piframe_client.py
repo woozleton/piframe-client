@@ -548,6 +548,11 @@ def _set_chromium_sink_input_volume(level: float) -> None:
     if long_result.returncode != 0:
         return
     chromium_ids: list[str] = []
+    # Capture current volume per Chromium sink-input so we can skip
+    # the pactl set call when the stream is already at the target.
+    # Avoids journal spam from the heartbeat-loop drift-correction
+    # path that re-checks every ~30s.
+    current_volumes: Dict[str, int] = {}
     current_id: Optional[str] = None
     for raw in (long_result.stdout or "").splitlines():
         line = raw.strip()
@@ -555,6 +560,15 @@ def _set_chromium_sink_input_volume(level: float) -> None:
             current_id = line.split("#", 1)[1].strip()
             continue
         lower = line.lower()
+        # Volume line shape:
+        #   Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: ...
+        # We only need to know percent; grab the first occurrence.
+        if current_id is not None and line.startswith("Volume:") and current_id not in current_volumes:
+            try:
+                pct_token = line.split("/", 2)[1].strip()  # "100%"
+                current_volumes[current_id] = int(pct_token.rstrip("%"))
+            except (IndexError, ValueError):
+                pass
         if current_id is not None and (
             'application.name = "chromium' in lower
             or 'application.process.binary = "chromium' in lower
@@ -563,16 +577,22 @@ def _set_chromium_sink_input_volume(level: float) -> None:
             chromium_ids.append(current_id)
             current_id = None
     clamped = max(0.0, min(100.0, float(level)))
-    pct = f"{clamped:.0f}%"
+    target_pct = int(round(clamped))
+    pct = f"{target_pct}%"
+    changed = 0
     for sid in chromium_ids:
+        if current_volumes.get(sid) == target_pct:
+            continue
         try:
             subprocess.run(
                 [pactl, "set-sink-input-volume", sid, pct],
                 capture_output=True, timeout=2, check=False,
             )
+            changed += 1
         except (OSError, subprocess.SubprocessError):
             continue
-    _log("chromium_volume_set", count=len(chromium_ids), level=clamped)
+    if changed:
+        _log("chromium_volume_set", count=changed, level=clamped)
 
 
 def _load_client_settings(path: Path) -> Dict[str, Any]:
@@ -2397,6 +2417,14 @@ class PiFrameClient:
         self.browser_event_thread = None
 
     def _status_loop(self) -> None:
+        # Periodic counter for the Chromium sink-input volume reassertion
+        # below. Every ~30s in kiosk mode we force the per-stream volume
+        # back to 100% to catch drift from any source (PipeWire
+        # stream-restore picking up a stale value at session start,
+        # media keys forwarded over VNC, manual pactl, etc). The user-
+        # visible volume control is <video>.volume from the renderer
+        # state file; the sink-input shouldn't be doing any attenuation.
+        sink_input_pin_counter = 0
         while self.status_running:
             # Wake on either the periodic tick OR an explicit event from
             # the browser (pause toggle, slide change). Lets state changes
@@ -2406,6 +2434,19 @@ class PiFrameClient:
             BROWSER_EVENT_STATE.wakeup.clear()
             if not self.status_running or not self.ws_connection:
                 continue
+            # Reassert kiosk Chromium's sink-input volume to 100% every
+            # ~30 seconds (15 ticks * 2s). Skipped in webview mode where
+            # the sink-input IS the operator's volume control. Best-effort
+            # via pactl; silent no-op if no Chromium sink-input exists
+            # yet (e.g. idle screen with no audio).
+            sink_input_pin_counter += 1
+            if sink_input_pin_counter >= 15:
+                sink_input_pin_counter = 0
+                if self.playback_state != "webview":
+                    try:
+                        _set_chromium_sink_input_volume(100)
+                    except Exception:
+                        pass
             # Pick up an update marker dropped by update.sh while we're
             # running. The boot path already reads + consumes the file
             # in __init__, but the noop case (before==after) doesn't

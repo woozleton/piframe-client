@@ -629,6 +629,39 @@ Both mute actions are needed:
   videos load with their own audio that competes until the next
   re-evaluation runs
 
+### Chromium sink-input drift correction
+
+The user-facing volume slider in the manager controls
+`<video>.volume` in the kiosk renderer (software gain applied to
+the HTML5 media element). PipeWire's per-stream sink-input volume
+for Chromium is supposed to stay at 100% so the renderer's
+`<video>.volume` is the only attenuation in the chain. In
+practice, the sink-input can drift below 100% from several
+sources:
+
+- PipeWire's `module-stream-restore` remembering an older session
+  where the stream was at a lower level
+- Media keys (volume-down) forwarded over VNC, which most
+  compositors deliver to the active sink-input rather than the sink
+- Stray `pactl set-sink-input-volume` commands during debugging
+
+When Chromium's sink-input drifts below 100%, every Pi is quieter
+than nominal even though the manager slider says "100%". The
+status heartbeat loop reasserts the Chromium sink-input back to
+100% every ~30 seconds in kiosk mode (`_set_chromium_sink_input_volume`).
+Webview mode skips the reassertion because there the sink-input
+IS the operator's volume control.
+
+To inspect the current state on a Pi:
+
+```bash
+sudo -u woozleton XDG_RUNTIME_DIR=/run/user/1000 \
+  pactl list sink-inputs | grep -B 8 -A 1 'application.name = "Chromium"'
+```
+
+The reassertion logs at info level only when it actually changes
+something - quiet during normal operation.
+
 ### Per-Pi setup
 
 - ALSA default output must point at the active HDMI device when
