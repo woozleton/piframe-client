@@ -1066,6 +1066,36 @@ def render_browser_html(
       // RENDER_SCALE for headroom across the 10-preset curated list
       // with Chromium's vsync + frame-rate-limit both lifted.
       const VIZ_MESH_SIZE = 24;
+      // Absolute cap on the visualizer's backing-store pixel count.
+      // On a 1080p frame, viewport * dpr * RENDER_SCALE already lands
+      // under this (~330k pixels at dpr=1). On a 4K frame (43" TVs)
+      // the same math runs to ~6M pixels at dpr=2 - way above the
+      // V3D core's sustainable shader budget for Butterchurn presets.
+      // 1280x720 = ~921k pixels is the cap; CSS upscales the canvas
+      // back to fullscreen and the resulting blur is invisible against
+      // Milkdrop's already-blurry feedback patterns.
+      const VIZ_MAX_PIXELS = 1280 * 720;
+
+      // Compute the visualizer canvas backing-store size for the
+      // current viewport, applying both the RENDER_SCALE downscale
+      // and the absolute pixel cap. Returns an object with w/h
+      // (backing-store), viewW/viewH (CSS layout, rotation-aware),
+      // and dpr.
+      function computeVizCanvasSize() {{
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const rot = (({rotation_degrees} % 360) + 360) % 360;
+        const viewW = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
+        const viewH = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
+        let w = Math.max(1, Math.round(viewW * dpr * RENDER_SCALE));
+        let h = Math.max(1, Math.round(viewH * dpr * RENDER_SCALE));
+        const product = w * h;
+        if (product > VIZ_MAX_PIXELS) {{
+          const factor = Math.sqrt(VIZ_MAX_PIXELS / product);
+          w = Math.max(1, Math.round(w * factor));
+          h = Math.max(1, Math.round(h * factor));
+        }}
+        return {{ w, h, viewW, viewH, dpr }};
+      }}
       const FRAME_MIN_MS = 1000 / TARGET_FPS;
       let lastFrameTime = 0;
       // FPS sampling - measured over a 4-second window after each
@@ -1229,17 +1259,15 @@ def render_browser_html(
           document.body.appendChild(analyserAudio);
           analyserSrc = audioCtx.createMediaElementSource(analyserAudio);
 
-          const dpr = Math.min(window.devicePixelRatio || 1, 2);
-          const rot = (({rotation_degrees} % 360) + 360) % 360;
-          const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
-          const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
-          root.style.width = w + "px";
-          root.style.height = h + "px";
-          // Render at RENDER_SCALE * viewport pixels; CSS scales the
-          // canvas back up to fill. ~36% as much shader work for
-          // RENDER_SCALE=0.6 since pixel work is the bottleneck.
-          canvas.width = Math.max(1, Math.round(w * dpr * RENDER_SCALE));
-          canvas.height = Math.max(1, Math.round(h * dpr * RENDER_SCALE));
+          const sz = computeVizCanvasSize();
+          root.style.width = sz.viewW + "px";
+          root.style.height = sz.viewH + "px";
+          // Backing-store size driven by computeVizCanvasSize so the
+          // VIZ_MAX_PIXELS cap kicks in on 4K frames. CSS scales the
+          // canvas back up to fill its wrapper.
+          canvas.width = sz.w;
+          canvas.height = sz.h;
+          const dpr = sz.dpr;
 
           // The vendored butterchurn UMD wraps its export under
           // `.default` (webpack's namespace marker). We tolerate
@@ -1370,14 +1398,11 @@ def render_browser_html(
 
       function resize() {{
         if (!viz || !root || !canvas) return;
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const rot = (({rotation_degrees} % 360) + 360) % 360;
-        const w = (rot === 90 || rot === 270) ? window.innerHeight : window.innerWidth;
-        const h = (rot === 90 || rot === 270) ? window.innerWidth : window.innerHeight;
-        root.style.width = w + "px";
-        root.style.height = h + "px";
-        canvas.width = Math.max(1, Math.round(w * dpr * RENDER_SCALE));
-        canvas.height = Math.max(1, Math.round(h * dpr * RENDER_SCALE));
+        const sz = computeVizCanvasSize();
+        root.style.width = sz.viewW + "px";
+        root.style.height = sz.viewH + "px";
+        canvas.width = sz.w;
+        canvas.height = sz.h;
         viz.setRendererSize(canvas.width, canvas.height);
       }}
 
