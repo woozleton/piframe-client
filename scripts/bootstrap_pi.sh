@@ -22,13 +22,11 @@ ORIENTATION=""
 ALSA_DEVICE=""
 
 detect_alsa_device() {
-  """Auto-detect which HDMI port has a display connected.
-
-  Checks /sys/class/drm/ to see which HDMI ports are physically connected,
-  then maps them to ALSA card numbers (vc4hdmi0, vc4hdmi1). Returns the
-  ALSA device for the first connected port found. Defaults to plughw:0,0
-  if no display is detected or detection fails.
-  """
+  # Auto-detect which HDMI port has a display connected.
+  # Checks /sys/class/drm/ to see which HDMI ports are physically connected,
+  # then maps them to ALSA card numbers (vc4hdmi0, vc4hdmi1). Returns the
+  # ALSA device for the first connected port found. Defaults to plughw:0,0
+  # if no display is detected or detection fails.
   local hdmi_a1_status hdmi_a2_status card
 
   # Check physical HDMI port status via kernel DRM interface
