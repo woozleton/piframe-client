@@ -291,6 +291,24 @@ EOF
 # the runtime dir is created and chromium fails to open a window.
 loginctl enable-linger "${SERVICE_USER}"
 
+# Configure ALSA to use HDMI port 0. The Pi 5 has two HDMI ports with
+# different audio characteristics; port 0 produces better audio output.
+# This matches the historical setup and ensures consistent audio levels
+# across all deployed Pis.
+cat > "${USER_HOME}/.asoundrc" <<'ASOUNDRC'
+pcm.!default {
+  type plug
+  slave.pcm "plughw:0,0"
+}
+
+ctl.!default {
+  type hw
+  card 0
+}
+ASOUNDRC
+chown "${USER_UID}:${USER_GID}" "${USER_HOME}/.asoundrc"
+chmod 0644 "${USER_HOME}/.asoundrc"
+
 # Enable and start the PipeWire audio server for the service user.
 # This is required for audio companion to work: Chromium locks the
 # audio device while <video> plays (even when muted), which prevents
