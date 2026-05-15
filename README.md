@@ -494,6 +494,13 @@ Useful flags:
   on first run), `portrait-ccw`, `upside-down`. If omitted the
   bootstrap prompts on first run and reuses the existing setting
   from the installed service file on re-runs.
+- `--output-mode <mode>` - force the cage framebuffer mode via
+  `wlr-randr --mode`. Empty / omitted = honor the TV's EDID-native
+  mode. Useful on 4K TVs to drop output to 1080p so the visualizer
+  + Chromium composite at 1/4 the pixels and the TV's built-in
+  scaler upsamples to native. Example: `--output-mode 1920x1080@60`.
+  Survives reboots + `update_self`; re-runs of bootstrap without
+  the flag inherit the existing value from the service file.
 - `--skip-apt`
 
 ## Logging
@@ -876,6 +883,18 @@ These can be set in the service file or shell environment.
   four common orientations (landscape / portrait / portrait-ccw /
   upside-down); the `flipped*` values are only reachable by setting
   this env var directly. See [Remote Control](#remote-control-vnc).
+- `PIFRAME_OUTPUT_MODE` (default empty) - optional cage framebuffer
+  mode, applied via `wlr-randr --mode` alongside the transform.
+  Empty = honor the TV's EDID-native mode (typical). Set to a
+  `WIDTHxHEIGHT` or `WIDTHxHEIGHT@RATE` string to override - e.g.
+  `1920x1080@60` on 4K TVs so the kiosk + Butterchurn visualizer
+  composite at 1/4 the pixels (the TV's scaler upsamples to native
+  with no perceptible loss at typical viewing distance). The
+  rotation watcher reapplies BOTH the transform and the mode on
+  drift (after TV suspend/resume) so the framebuffer can't land in
+  a half-fixed state. Bootstrap's `--output-mode` flag covers the
+  common case; setting this env var directly works for unusual
+  modes the TV's EDID still exposes.
 - `PIFRAME_COMPANION_MPV_BIN` (default `mpv`) - sidecar binary for the audio companion
 - `PIFRAME_COMPANION_MPV_SOCKET` (default `/tmp/piframe_companion_mpv.sock`)
 
