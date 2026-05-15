@@ -16,6 +16,12 @@ INSTALL_SYSTEM_PACKAGES=1
 # Display orientation. Friendly name; mapped to a wlr-randr transform
 # below. Empty here means "ask, or inherit from existing service file".
 ORIENTATION=""
+# Optional framebuffer-mode override (matches wlr-randr --mode). Empty
+# means honor the TV's EDID-native mode. Set to e.g. "1920x1080" on
+# 4K TVs to drop the Pi's output to 1080p and let the TV upscale -
+# Chromium + Butterchurn run at 1/4 the pixels and the Pi 5's V3D
+# core stays in budget; the TV's built-in scaler handles the upsample.
+OUTPUT_MODE=""
 # ALSA device for audio output. Pi 5 has two HDMI ports (0 and 1) with
 # different audio characteristics. Auto-detected from connected display.
 # Format: plughw:X,Y where X is card number, Y is device number.
@@ -72,6 +78,12 @@ Options:
                            upside-down     (TV rotated 180°)
                          If omitted, prompts interactively on first run
                          and reuses the existing setting on re-runs.
+  --output-mode <mode>   Force framebuffer mode (wlr-randr --mode).
+                         Examples: "1920x1080" or "1920x1080@60".
+                         Empty/omitted = honor the TV's native EDID
+                         mode. Useful on 4K TVs to drop output to
+                         1080p; Chromium + visualizer composite at
+                         1/4 the pixels and the TV upscales.
   --alsa-device <dev>    ALSA device for audio (plughw:card,device).
                          Auto-detected from connected display if omitted.
                          The Pi 5 has two HDMI ports: 0 and 1.
@@ -100,6 +112,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --orientation)
       ORIENTATION="$2"
+      shift 2
+      ;;
+    --output-mode)
+      OUTPUT_MODE="$2"
       shift 2
       ;;
     --alsa-device)
@@ -190,6 +206,19 @@ elif [[ -f "${SERVICE_FILE}" ]]; then
     echo "Existing ${SERVICE_FILE} has no PIFRAME_OUTPUT_TRANSFORM; defaulting to portrait (transform=90). Pass --orientation to override."
   fi
 fi
+# Same inheritance pattern for OUTPUT_MODE: explicit --output-mode
+# wins; otherwise re-runs inherit whatever is already baked into the
+# service file. Empty string means "honor TV's native mode" (no
+# wlr-randr --mode flag emitted at runtime); a value like
+# "1920x1080" forces 1080p on 4K-capable TVs.
+if [[ -z "${OUTPUT_MODE}" && -f "${SERVICE_FILE}" ]]; then
+  EXISTING_MODE="$(grep -oE 'PIFRAME_OUTPUT_MODE=[A-Za-z0-9@x.-]+' "${SERVICE_FILE}" | head -1 | cut -d= -f2 || true)"
+  if [[ -n "${EXISTING_MODE}" ]]; then
+    OUTPUT_MODE="${EXISTING_MODE}"
+    echo "Reusing existing output mode (${OUTPUT_MODE}) from ${SERVICE_FILE}"
+  fi
+fi
+
 if [[ -z "${OUTPUT_TRANSFORM_VALUE}" ]]; then
   if [[ -t 0 ]]; then
     cat <<'EOF'
@@ -330,6 +359,12 @@ Environment=PIFRAME_NAS_ROOT=${NAS_ROOT}
 # 180=upside-down. See README "Remote Control (VNC)" for why this
 # is at the compositor instead of in CSS.
 Environment=PIFRAME_OUTPUT_TRANSFORM=${OUTPUT_TRANSFORM_VALUE}
+# Optional framebuffer mode override (matches wlr-randr --mode).
+# Empty = honor the TV's EDID-native mode. "1920x1080" or
+# "1920x1080@60" forces 1080p output on 4K TVs so Chromium +
+# Butterchurn composite at 1/4 the pixels; the TV's built-in scaler
+# upsamples to native.
+Environment=PIFRAME_OUTPUT_MODE=${OUTPUT_MODE}
 
 [Install]
 WantedBy=multi-user.target

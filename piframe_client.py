@@ -51,6 +51,16 @@ WLR_RANDR_BIN = os.environ.get("PIFRAME_WLR_RANDR_BIN", "wlr-randr").strip() or 
 # support. Set BROWSER_ROTATION_DEGREES to 0 because the renderer's CSS
 # rotation would double-rotate against the compositor transform.
 OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "90"
+# Optional framebuffer-mode override applied alongside the transform.
+# Empty string = honor the TV's native mode (EDID-detected). Set to a
+# `WIDTHxHEIGHT` or `WIDTHxHEIGHT@RATE` string (matching `wlr-randr`'s
+# --mode argument) to force a lower output resolution. The intended
+# use case is dropping 4K (3840x2160) TVs to 1080p so Chromium / the
+# Butterchurn visualizer composite at 1/4 the pixels, letting the TV's
+# built-in scaler upsample to native. Big win on the V3D core; loss
+# of sharpness on photo content is acceptable at typical viewing
+# distances.
+OUTPUT_MODE = os.environ.get("PIFRAME_OUTPUT_MODE", "").strip()
 BROWSER_ROTATION_DEGREES = 0
 # Bundled Chromium extension that forces video sites off AV1.
 # Loaded only in webview mode (kiosk renderer's content is from
@@ -918,34 +928,50 @@ class BrowserController:
         wlr_randr_path = shutil.which(WLR_RANDR_BIN)
         rotate_cmd = ""
         rotate_watch_cmd = ""
-        if wlr_randr_path and OUTPUT_TRANSFORM and OUTPUT_TRANSFORM != "normal":
-            # Apply the compositor-side rotation to every output cage
-            # exposes. wlr-randr's plain output starts each output with
-            # its name at column 0, indented detail lines follow.
+        # OUTPUT_TRANSFORM=="normal" + no OUTPUT_MODE means there's
+        # nothing to enforce; skip the whole wlr-randr machinery.
+        needs_transform = bool(OUTPUT_TRANSFORM) and OUTPUT_TRANSFORM != "normal"
+        needs_mode = bool(OUTPUT_MODE)
+        if wlr_randr_path and (needs_transform or needs_mode):
+            # Apply the compositor-side rotation + (optional) framebuffer
+            # mode override to every output cage exposes. wlr-randr's
+            # plain output starts each output with its name at column 0,
+            # indented detail lines follow. Mode + transform are applied
+            # in the same wlr-randr call so they take effect atomically
+            # - splitting them caused a brief landscape flash between
+            # the two invocations on suspend/resume.
+            apply_args = ""
+            if needs_transform:
+                apply_args += f" --transform {shlex.quote(OUTPUT_TRANSFORM)}"
+            if needs_mode:
+                apply_args += f" --mode {shlex.quote(OUTPUT_MODE)}"
             rotate_cmd = (
                 f"{shlex.quote(wlr_randr_path)} 2>/dev/null | "
                 "awk '/^[^ \\t]/ { print $1 }' | "
                 f"while read o; do {shlex.quote(wlr_randr_path)} "
-                f"--output \"$o\" --transform {shlex.quote(OUTPUT_TRANSFORM)} "
+                f"--output \"$o\"{apply_args} "
                 ">/dev/null 2>&1 || true; done"
             )
             # Re-apply on drift. When the TV suspends, HDMI link drops
-            # and cage forgets the output transform; on resume it comes
-            # back at "normal". Polling every second keeps the visible
-            # landscape flash short and the cost is negligible (one
-            # Wayland round-trip plus an awk per second).
-            rotate_watch_cmd = (
-                "while sleep 1; do "
-                f"current=$({shlex.quote(wlr_randr_path)} 2>/dev/null | "
-                "awk '/^[^ \\t]/ { name=$1 } /^  Transform:/ "
-                f"{{ print name, $2 }}'); "
-                "echo \"$current\" | while read o t; do "
-                f"if [ -n \"$o\" ] && [ \"$t\" != {shlex.quote(OUTPUT_TRANSFORM)} ]; then "
-                f"{shlex.quote(wlr_randr_path)} --output \"$o\" "
-                f"--transform {shlex.quote(OUTPUT_TRANSFORM)} "
-                ">/dev/null 2>&1 || true; "
-                "fi; done; done"
-            )
+            # and cage forgets both transform AND mode; on resume the
+            # output comes back at "normal" + EDID-native mode. Watch
+            # the Transform line; if it doesn't match, reapply BOTH the
+            # transform and the mode in one wlr-randr call so the
+            # framebuffer never lands in a half-fixed state. When only
+            # the mode is overridden (no rotation), we skip the watch
+            # because there's nothing rotation-shaped to key off.
+            if needs_transform:
+                rotate_watch_cmd = (
+                    "while sleep 1; do "
+                    f"current=$({shlex.quote(wlr_randr_path)} 2>/dev/null | "
+                    "awk '/^[^ \\t]/ { name=$1 } /^  Transform:/ "
+                    f"{{ print name, $2 }}'); "
+                    "echo \"$current\" | while read o t; do "
+                    f"if [ -n \"$o\" ] && [ \"$t\" != {shlex.quote(OUTPUT_TRANSFORM)} ]; then "
+                    f"{shlex.quote(wlr_randr_path)} --output \"$o\"{apply_args} "
+                    ">/dev/null 2>&1 || true; "
+                    "fi; done; done"
+                )
         if wlrctl_path:
             park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])
             launcher_lines = ["set -eu"]
