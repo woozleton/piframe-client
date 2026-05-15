@@ -291,6 +291,16 @@ EOF
 # the runtime dir is created and chromium fails to open a window.
 loginctl enable-linger "${SERVICE_USER}"
 
+# Enable and start the PipeWire audio server for the service user.
+# This is required for audio companion to work: Chromium locks the
+# audio device while <video> plays (even when muted), which prevents
+# the mpv audio sidecar from claiming HDMI. PipeWire adds a userspace
+# mixer that lets both streams coexist. Without it, the audio
+# companion stays inaudible while video plays (bare ALSA is single-stream).
+sudo -u "${SERVICE_USER}" \
+  XDG_RUNTIME_DIR="/run/user/${USER_UID}" \
+  systemctl --user enable --now pipewire pipewire-pulse wireplumber 2>/dev/null || true
+
 # Pi's default HDMI sink volume defaults vary (some boards come up at
 # ~40%). Pin to 50% as a sane TV-friendly ceiling - 100% was uncomfor-
 # tably loud on the displays we deploy to. Operators can still nudge
