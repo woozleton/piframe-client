@@ -17,9 +17,45 @@ INSTALL_SYSTEM_PACKAGES=1
 # below. Empty here means "ask, or inherit from existing service file".
 ORIENTATION=""
 # ALSA device for audio output. Pi 5 has two HDMI ports (0 and 1) with
-# different audio characteristics. Port 0 produces better audio.
+# different audio characteristics. Auto-detected from connected display.
 # Format: plughw:X,Y where X is card number, Y is device number.
-ALSA_DEVICE="plughw:0,0"
+ALSA_DEVICE=""
+
+detect_alsa_device() {
+  """Auto-detect which HDMI port has a display connected.
+
+  Checks /sys/class/drm/ to see which HDMI ports are physically connected,
+  then maps them to ALSA card numbers (vc4hdmi0, vc4hdmi1). Returns the
+  ALSA device for the first connected port found. Defaults to plughw:0,0
+  if no display is detected or detection fails.
+  """
+  local hdmi_a1_status hdmi_a2_status card
+
+  # Check physical HDMI port status via kernel DRM interface
+  if [[ -f /sys/class/drm/card1-HDMI-A-1/status ]]; then
+    hdmi_a1_status=$(cat /sys/class/drm/card1-HDMI-A-1/status 2>/dev/null || echo "unknown")
+  fi
+  if [[ -f /sys/class/drm/card1-HDMI-A-2/status ]]; then
+    hdmi_a2_status=$(cat /sys/class/drm/card1-HDMI-A-2/status 2>/dev/null || echo "unknown")
+  fi
+
+  # Map DRM outputs to ALSA cards. On Pi 5:
+  #   card1-HDMI-A-1 typically maps to vc4hdmi0 (ALSA card 0)
+  #   card1-HDMI-A-2 typically maps to vc4hdmi1 (ALSA card 1)
+  # Try them in order and use the first connected one found.
+  if [[ "${hdmi_a1_status}" == "connected" ]]; then
+    echo "plughw:0,0"
+    return
+  fi
+
+  if [[ "${hdmi_a2_status}" == "connected" ]]; then
+    echo "plughw:1,0"
+    return
+  fi
+
+  # Fallback to port 0 if no display detected or detection failed
+  echo "plughw:0,0"
+}
 
 usage() {
   cat <<EOF
@@ -39,8 +75,8 @@ Options:
                          If omitted, prompts interactively on first run
                          and reuses the existing setting on re-runs.
   --alsa-device <dev>    ALSA device for audio (plughw:card,device).
-                         Default: ${ALSA_DEVICE}
-                         The Pi 5 has two HDMI ports: 0 (better audio) and 1.
+                         Auto-detected from connected display if omitted.
+                         The Pi 5 has two HDMI ports: 0 and 1.
   --skip-apt             Skip apt package installation.
   -h, --help             Show this help.
 EOF
@@ -96,6 +132,12 @@ fi
 if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   echo "User does not exist: ${SERVICE_USER}" >&2
   exit 1
+fi
+
+# Auto-detect ALSA device if not explicitly provided
+if [[ -z "${ALSA_DEVICE}" ]]; then
+  ALSA_DEVICE=$(detect_alsa_device)
+  echo "Auto-detected ALSA device: ${ALSA_DEVICE}"
 fi
 
 USER_UID="$(id -u "${SERVICE_USER}")"
