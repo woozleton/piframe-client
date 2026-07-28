@@ -12,7 +12,9 @@
 # changed and whether the restart took.
 #
 # Pi setup (one-time, per device):
-#   * Repo lives at a known path with a clean working tree.
+#   * Repo lives at a known path (~/piframe_client). Local drift is
+#     archived to the logfile and clobbered on update - this checkout
+#     is a deployment artifact, not a workspace.
 #   * Deploy key (or HTTPS creds) is configured so `git pull` doesn't prompt.
 #   * Sudoers entry allows the service user to restart without a password.
 #   * Service unit has `Restart=always` so the in-flight restart self-heals
@@ -50,15 +52,28 @@ git update-index --refresh >/dev/null 2>&1 || true
 
 dirty="$(git status --porcelain)"
 if [ -n "$dirty" ]; then
-  # Real content drift remains after refresh. Don't silently nuke local
-  # debugging changes - the operator should resolve via SSH. Spell out
-  # what's dirty so the logfile actually helps.
-  echo "[update] working tree is dirty - aborting"
+  # Real content drift remains after refresh. This checkout is a
+  # deployment artifact, not a workspace - the operator clicked Update,
+  # which means "run origin/main". Archive the drift into the logfile
+  # (status + full diff), then clobber. `git clean -fd` clears untracked
+  # non-ignored files too, so a stray file can't collide with a future
+  # tracked path; WITHOUT -x, so ignored state (api-env/, logs,
+  # client_settings.json) survives.
+  echo "[update] working tree is dirty - archiving drift to this log, then clobbering"
   echo "$dirty"
-  exit 2
+  echo "[update] ---- drift diff start ----"
+  git diff || true
+  echo "[update] ---- drift diff end ----"
+  git clean -fd || true
 fi
 
-git fetch --quiet origin main
+# Bound the fetch so a dead network path (DNS, IPv6 black-hole, GitHub
+# outage) fails loudly here instead of hanging forever and surfacing as
+# a generic server-side timeout with an empty log.
+if ! timeout 45 git fetch --quiet origin main; then
+  echo "[update] git fetch failed or timed out (network path to origin?) - aborting"
+  exit 3
+fi
 git reset --hard origin/main
 
 after_full="$(git rev-parse HEAD)"
