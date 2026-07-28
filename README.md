@@ -80,6 +80,47 @@ Audio companion note:
 - the visual `<video>` is muted (when `mute_visual: true`) so the companion is the only audio source the operator hears
 - see [Audio](#audio) for the OS-level audio mixer requirement
 
+## Clock-Synced Slideshows
+
+The `slideshow` command may carry an additive `sync` object:
+
+```json
+{ "images": ["... full playlist, server-authored order ..."],
+  "interval": 8.0,
+  "shuffle": false,
+  "sync": { "mode": "clock", "length": 45 } }
+```
+
+When present and valid (`mode == "clock"`, `length` a positive integer equal
+to the row length, valid interval), the kiosk runs the slideshow in
+wall-clock lockstep instead of free-running:
+
+- the displayed index is ALWAYS `floor(Date.now() / 1000 / interval) % length`,
+  recomputed at every flip (never incremented), so a pause, hang, reboot,
+  or missed server push self-heals at the next boundary
+- flips happen exactly at wall-clock multiples of `interval` (the fleet's
+  screens advance together; each screen holds a different server-authored
+  permutation of the same playlist, so no two screens ever show the same
+  image at the same moment)
+- the server re-sends a freshly shuffled row each lap
+  (`length * interval` seconds); the client swaps the row in place with a
+  normal cross-fade - no restart at index 0. If the push never arrives
+  (server down), the client keeps indexing its old row by the clock:
+  still collision-free, just repeating the same lap order
+- `shuffle` is always `false` in sync mode - the row order is
+  authoritative and is never reordered client-side
+- `next`/`previous` show the adjacent item as a momentary "peek"; the next
+  wall-clock boundary snaps back to the clock slot. `pause` freezes the
+  current image; resume snaps to the clock
+- a malformed `sync` object is dropped (logged as `slideshow_sync_ignored`)
+  and the slideshow free-runs exactly as it does for servers that never
+  send the key
+
+Requires NTP-synced clocks (standard Raspberry Pi OS setup). The
+server-side model (timetable generation, dedup registry, degradation
+ladder) is documented in the manager repo at
+`docs/subsystems/display-sync.md`.
+
 ## Display Features
 
 Current browser renderer features include:
@@ -355,8 +396,13 @@ Flow:
 2. server sends an `update_self` WebSocket command
 3. client spawns `update.sh` detached and continues running until
    systemd restarts it
-4. `update.sh` runs `git fetch origin main && git reset --hard
-   origin/main`, writes a marker file describing what changed, then
+4. `update.sh` archives any local drift into its logfile and clobbers
+   it (`git clean -fd`, sparing ignored state like `api-env/` and
+   `client_settings.json` - this checkout is a deployment artifact,
+   not a workspace), runs `git fetch origin main` (bounded by
+   `timeout 45` so a dead network path fails loudly instead of
+   hanging) `&& git reset --hard origin/main`, writes a marker file
+   describing what changed, then
    `exec sudo systemctl restart piframe-client`
 5. systemd respawns the client; on boot it reads the marker file,
    ships it home in the next status heartbeat, and deletes it
@@ -432,9 +478,11 @@ woozleton ALL=NOPASSWD: /bin/systemctl restart piframe-client
 from a Windows checkout (where `core.autocrlf=true` is the default)
 rewrites the script with CRLF on commit; the Pi checks it back out
 with LF and `git status --porcelain` then reports `update.sh` as
-permanently "modified," tripping `update.sh`'s own dirty-tree guard
-on every subsequent self-update. The script also runs `git config
---local core.autocrlf input` defensively on each invocation.
+permanently "modified" (historically that aborted every self-update;
+today it just triggers the archive-and-clobber path, but the pin
+keeps the noise out of the update log). The script also runs
+`git config --local core.autocrlf input` defensively on each
+invocation.
 
 ## Replicating To Another Pi
 

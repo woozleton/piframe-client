@@ -1203,6 +1203,7 @@ class BrowserController:
         loop: bool,
         shuffle: bool,
         idle_media: str,
+        sync: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not self._ensure_running():
             _log(
@@ -1227,6 +1228,11 @@ class BrowserController:
                     "loop": loop,
                     "interval": max(float(interval), BROWSER_MIN_ITEM_DURATION),
                     "shuffle": shuffle,
+                    # Additive clock-sync descriptor. None for every
+                    # non-synced mode (idle / single / video-playlist /
+                    # ad-hoc slideshow); the browser ignores a null sync
+                    # and free-runs. Old kiosk templates ignore the field.
+                    "sync": sync,
                     "transition": BROWSER_TRANSITION,
                     "transition_duration_ms": BROWSER_TRANSITION_DURATION_MS,
                     "video_fill_mode": BROWSER_VIDEO_FILL_MODE,
@@ -1304,12 +1310,21 @@ class BrowserController:
         return True
 
     def play_slideshow(
-        self, items: List[str], interval: float, *, shuffle: bool = False
+        self,
+        items: List[str],
+        interval: float,
+        *,
+        shuffle: bool = False,
+        sync: Optional[Dict[str, Any]] = None,
     ) -> bool:
         if not items:
             return False
         play_items = list(items)
-        if shuffle:
+        # In clock-sync mode the row order is authoritative (the server
+        # already shuffled it and sends shuffle=False), so never reorder
+        # it here. The shuffle guard already covers that, but keep the
+        # invariant explicit.
+        if shuffle and not sync:
             random.shuffle(play_items)
         if not self._set_items_state(
             mode="playlist",
@@ -1320,6 +1335,7 @@ class BrowserController:
             loop=False,
             shuffle=shuffle,
             idle_media=self._pick_existing_idle_media(_default_idle_media()),
+            sync=sync,
         ):
             return False
         self.slideshow_active = True
@@ -1780,6 +1796,15 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
                 has_butterchurn=bool(payload.get("has_butterchurn")),
                 has_presets=bool(payload.get("has_presets")),
             )
+        elif kind == "slideshow_sync":
+            # Browser dropped a malformed clock-sync object and fell back
+            # to the free-running slideshow; surface why in journalctl
+            # (Chromium's own console is not captured).
+            _log(
+                "slideshow_sync_ignored",
+                source="browser",
+                detail=str(payload.get("detail") or "")[:200],
+            )
         # Always return 204; CORS header lets the browser stop spamming
         # console errors when it crosses the file:// -> http:// boundary.
         self.send_response(204)
@@ -1802,6 +1827,12 @@ class PiFrameClient:
         self.current_slideshow: List[str] = []
         self.current_interval: float = 0.0
         self.current_shuffle: bool = False
+        # Clock-synced slideshow descriptor for the active playlist
+        # ({"mode": "clock", "length": N}) or None for a free-running /
+        # ad-hoc slideshow. Tracked so a lap re-send (same synced
+        # playlist, freshly shuffled row) is recognized and treated as
+        # continuous instead of an ad-hoc restart.
+        self.current_sync: Optional[Dict[str, Any]] = None
         # Wall-clock timestamp (epoch seconds, float) when the current
         # slideshow started rotating. Manager UI uses this + current_interval
         # to project which slide is on screen right now without needing the
@@ -1991,6 +2022,7 @@ class PiFrameClient:
             # per-video tile previews from the playlist - leave the
             # slideshow timer null for video playback.
             self.slideshow_started_at = None
+            self.current_sync = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
             BROWSER_EVENT_STATE.set_paused(False)
             self._send_render_command()
@@ -2083,6 +2115,7 @@ class PiFrameClient:
             # browser renderer doesn't need to know the difference.
             self.playback_state = "audio_playing"
             self.slideshow_started_at = None
+            self.current_sync = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
             BROWSER_EVENT_STATE.set_paused(False)
             # Starting direct audio playback supersedes any companion
@@ -2163,6 +2196,7 @@ class PiFrameClient:
         self.renderer.show_idle(self._get_idle_media())
         self.current_video = ""
         self.current_slideshow = []
+        self.current_sync = None
         self.current_playlist_name = ""
         self.current_playlist_id = ""
         self.playback_state = "stopped"
@@ -2173,6 +2207,37 @@ class PiFrameClient:
         # idle now.
         self._set_companion_state([], repeat=False, mute_visual=False)
 
+    @staticmethod
+    def _extract_sync(
+        data: Dict[str, Any], params: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Return a shape-valid clock-sync descriptor or None.
+
+        The slideshow command gained an additive `sync` object:
+        ``{"mode": "clock", "length": <int == len(images)>}``. Only the
+        SHAPE is validated here (dict, mode == "clock", length a positive
+        int) - the length-vs-row cross-check lives browser-side where the
+        actually-loaded row is authoritative. A malformed sync is dropped
+        so the client free-runs exactly as it does for old servers that
+        never send the key."""
+        raw = params.get("sync", data.get("sync"))
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            _log("slideshow_sync_ignored", reason="not_dict")
+            return None
+        mode = raw.get("mode")
+        if mode != "clock":
+            _log("slideshow_sync_ignored", reason="mode", mode=str(mode))
+            return None
+        length = raw.get("length")
+        # bool is an int subclass; reject it so a stray True/False length
+        # can't masquerade as a valid count.
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            _log("slideshow_sync_ignored", reason="length", length=str(length))
+            return None
+        return {"mode": "clock", "length": int(length)}
+
     def _handle_slideshow(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
         playlist_name, playlist_id = self._playlist_context(data, params)
         images = self._normalized_items(params.get("images"), data.get("images"))
@@ -2180,17 +2245,24 @@ class PiFrameClient:
         shuffle_flag = _coerce_bool(
             params.get("shuffle", data.get("shuffle", False)), default=False
         )
+        sync = self._extract_sync(data, params)
         _log(
             "slideshow_command",
             images=len(images),
             interval=params.get("interval", data.get("interval", "?")),
             shuffle=shuffle_flag,
+            sync=bool(sync),
             playlist_id=playlist_id or "",
         )
         try:
             interval = float(interval_raw)
         except (TypeError, ValueError):
             interval = 5.0
+        # Snapshot the prior slideshow identity BEFORE overwriting it so
+        # the lap-re-send check below can compare against it.
+        prev_sync = self.current_sync
+        prev_interval = self.current_interval
+        prev_playlist_id = self.current_playlist_id
         self.current_playlist_name = playlist_name
         self.current_playlist_id = playlist_id
         if (
@@ -2201,20 +2273,38 @@ class PiFrameClient:
             and images == self.current_slideshow
             and float(interval) == float(self.current_interval)
             and playlist_id == self.current_playlist_id
+            and sync == self.current_sync
         ):
             return
-        if images and self.renderer.play_slideshow(images, interval, shuffle=shuffle_flag):
+        if images and self.renderer.play_slideshow(
+            images, interval, shuffle=shuffle_flag, sync=sync
+        ):
             self.current_slideshow = list(self.renderer.slideshow_images) or images
             self.current_video = ""
             self.playback_state = "slideshow"
             self.current_interval = float(interval)
             self.current_shuffle = shuffle_flag
-            self.slideshow_started_at = time.time()
-            # Reset to None - browser will POST the actual index as soon as
-            # it shows the first slide, so the manager doesn't lock onto
-            # the previous slideshow's last-known index during the gap.
-            BROWSER_EVENT_STATE.clear_slideshow_index()
-            BROWSER_EVENT_STATE.set_paused(False)
+            self.current_sync = sync
+            # A clock-sync lap re-send is the SAME synced playlist with a
+            # freshly shuffled row - the slideshow is continuous, not
+            # restarted. Preserve the start time, the reported index, and
+            # the paused flag so the manager doesn't blink to "restarted"
+            # every lap; the browser recomputes the on-screen slide from
+            # the wall clock and re-reports the index itself.
+            is_sync_resend = (
+                bool(sync)
+                and bool(prev_sync)
+                and playlist_id == prev_playlist_id
+                and float(interval) == float(prev_interval)
+            )
+            if not is_sync_resend:
+                self.slideshow_started_at = time.time()
+                # Reset to None - browser will POST the actual index as
+                # soon as it shows the first slide, so the manager doesn't
+                # lock onto the previous slideshow's last-known index
+                # during the gap.
+                BROWSER_EVENT_STATE.clear_slideshow_index()
+                BROWSER_EVENT_STATE.set_paused(False)
             self._send_render_command()
 
     def _handle_volume(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -2270,11 +2360,12 @@ class PiFrameClient:
 
     def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
         """Server-pushed in-place update. Spawns `update.sh` from the
-        repo root (which does git fetch + reset --hard origin/main, then
-        execs `sudo systemctl restart piframe-client`). The current
-        process gets killed by the restart and systemd respawns us with
-        the new code. If `update.sh` is missing or git is dirty the
-        script exits non-zero; we log it and stay running on the old
+        repo root (which archives + clobbers any local drift, does git
+        fetch + reset --hard origin/main, then execs `sudo systemctl
+        restart piframe-client`). The current process gets killed by the
+        restart and systemd respawns us with the new code. If
+        `update.sh` is missing or the fetch fails/times out the script
+        exits non-zero; we log it and stay running on the old
         version."""
         repo_dir = Path(__file__).resolve().parent
         script = repo_dir / "update.sh"
@@ -2313,6 +2404,7 @@ class PiFrameClient:
         self.playback_state = "webview"
         self.current_video = ""
         self.current_slideshow = []
+        self.current_sync = None
         self.current_playlist_name = ""
         self.current_playlist_id = ""
         self.slideshow_started_at = None
@@ -2332,6 +2424,7 @@ class PiFrameClient:
         self.playback_state = "stopped"
         self.current_video = ""
         self.current_slideshow = []
+        self.current_sync = None
         self.renderer.set_browser_mode("kiosk", None)
         # Once the kiosk renderer is back up, show idle so the screen
         # has something to display rather than a blank page.
@@ -2352,6 +2445,7 @@ class PiFrameClient:
         # Pi has been on idle.html the whole time.
         self.current_video = ""
         self.current_slideshow = []
+        self.current_sync = None
         self.current_playlist_name = ""
         self.current_playlist_id = ""
         self.playback_state = "stopped"

@@ -507,6 +507,16 @@ def render_browser_html(
     let activeState = null;
     let activeIndex = 0;
     let intervalHandle = null;
+    // Clock-synced slideshow (params.sync.mode === "clock"). This path
+    // owns a wall-clock boundary timer that is distinct from the
+    // free-running intervalHandle so the two never fight over a slot.
+    let syncTimeoutHandle = null;
+    let syncPaused = false;
+    // Src of the image currently painted on screen. The sync path
+    // repaints only when the clock slot resolves to a genuinely
+    // different image (a lap row-swap or a manual next/prev "peek" can
+    // otherwise leave the wrong one showing).
+    let lastPaintedSrc = null;
     let activeStageIndex = 0;
     let pendingAdvanceToken = 0;
     let osdTimer = null;
@@ -714,6 +724,7 @@ def render_browser_html(
     function stopTimers() {{
       window.clearInterval(intervalHandle);
       intervalHandle = null;
+      clearSyncTimer();
       pendingAdvanceToken += 1;
     }}
 
@@ -1569,6 +1580,7 @@ def render_browser_html(
       if (!item) {{
         return;
       }}
+      lastPaintedSrc = item.src || null;
       const targetStage = getInactiveStage();
       prepareStage(targetStage, item, state, perItemSeconds);
       activateStage(targetStage);
@@ -1593,7 +1605,14 @@ def render_browser_html(
         // HTML idles are static iframes - no interval, no preload.
         stopTimers();
       }} else {{
-        scheduleImageAdvance(perItemSeconds);
+        // Clock-synced mode arms its own wall-clock boundary timer
+        // (scheduleSyncFlip, driven from the sync entry / soft-swap /
+        // boundary paths), so don't start the free-running interval
+        // here. A manual next/prev "peek" repaints through renderItem
+        // but must leave that boundary timer untouched.
+        if (!syncActive()) {{
+          scheduleImageAdvance(perItemSeconds);
+        }}
         preloadNextImage();
       }}
       hideCursor();
@@ -1765,11 +1784,165 @@ def render_browser_html(
         return;
       }}
       const perItemSeconds = state.interval || 5.0;
+      // Clock-synced slideshow: drive flips off the wall clock and paint
+      // the current clock slot rather than restarting at index 0. A
+      // malformed sync object (bad length / interval) falls through to
+      // the normal free-running path and is logged once.
+      if (state.sync) {{
+        if (syncConfigValid(state)) {{
+          startSync();
+          notifyPauseState(false);
+          return;
+        }}
+        logSyncFallback(state);
+      }}
       renderItem(state.items[activeIndex], state, perItemSeconds);
       notifySlideChange(activeIndex);
       notifyPauseState(false);
     }}
     startFromState.lastItemSrcs = null;
+
+    /* ================================================================
+       Clock-synced slideshow (params.sync.mode === "clock").
+       ----------------------------------------------------------------
+       Every screen in the fleet holds the full playlist as its own
+       server-authored row and displays
+         items[floor(now / interval) % length]
+       flipping exactly at wall-clock multiples of interval. The index
+       is ALWAYS recomputed from the clock at each flip - never
+       incremented - so a pause, a hang, a reboot, a GC pause, or a
+       missed lap push self-heals on the very next boundary. No runtime
+       coordination: everything derives from the NTP-synced wall clock.
+       ================================================================ */
+    function syncConfigValid(state) {{
+      const s = state && state.sync;
+      if (!s || s.mode !== "clock") return false;
+      const items = state.items;
+      if (!Array.isArray(items) || !items.length) return false;
+      const len = s.length;
+      if (typeof len !== "number" || !Number.isInteger(len) || len <= 0) return false;
+      if (len !== items.length) return false;
+      const interval = Number(state.interval);
+      if (!isFinite(interval) || interval <= 0) return false;
+      return true;
+    }}
+
+    function syncActive() {{
+      return syncConfigValid(activeState);
+    }}
+
+    function syncIntervalMs() {{
+      // Only ever called on an activeState already validated by
+      // syncActive() / syncConfigValid().
+      return Math.max(1, Number(activeState.interval) * 1000);
+    }}
+
+    function syncClockSlot() {{
+      // floor(now / intervalMs) % length is identical to
+      // floor(now / 1000 / interval) % length from the wire contract.
+      return Math.floor(Date.now() / syncIntervalMs()) % activeState.items.length;
+    }}
+
+    function clearSyncTimer() {{
+      if (syncTimeoutHandle !== null) {{
+        window.clearTimeout(syncTimeoutHandle);
+        syncTimeoutHandle = null;
+      }}
+    }}
+
+    function scheduleSyncFlip() {{
+      clearSyncTimer();
+      if (!syncActive() || syncPaused) return;
+      const intervalMs = syncIntervalMs();
+      const now = Date.now();
+      // Next wall-clock multiple of the interval. Recomputed from
+      // Date.now() every time, so re-arming after a peek or a lap swap
+      // always lands on the true boundary.
+      const nextBoundary = (Math.floor(now / intervalMs) + 1) * intervalMs;
+      syncTimeoutHandle = window.setTimeout(onSyncBoundary, Math.max(0, nextBoundary - now));
+    }}
+
+    function paintSyncSlot(slot) {{
+      const items = activeState.items;
+      if (!items || !items.length) return;
+      const bounded = ((slot % items.length) + items.length) % items.length;
+      const item = items[bounded];
+      const nextSrc = item ? (item.src || null) : null;
+      activeIndex = bounded;
+      // Repaint only when the on-screen image actually changes - a lap
+      // swap or a peek can resolve back to what's already showing, and a
+      // needless cross-fade of the same file reads as a flicker.
+      // renderItem records lastPaintedSrc + preloads the next slot.
+      if (nextSrc !== lastPaintedSrc) {{
+        renderItem(item, activeState, Number(activeState.interval) || 5.0);
+      }}
+      notifySlideChange(bounded);
+    }}
+
+    function onSyncBoundary() {{
+      syncTimeoutHandle = null;
+      if (!syncActive() || syncPaused) return;
+      // Always recompute from the clock; never assume exactly one slot
+      // elapsed. An oversleep / long paint simply lands on the correct
+      // current slot.
+      paintSyncSlot(syncClockSlot());
+      scheduleSyncFlip();
+    }}
+
+    function startSync() {{
+      // Enter clock-synced mode: paint the current clock slot (not index
+      // 0) and arm the boundary timer. Force the entry paint so the
+      // correct slide always shows on a fresh start / mode change.
+      syncPaused = false;
+      lastPaintedSrc = null;
+      paintSyncSlot(syncClockSlot());
+      scheduleSyncFlip();
+    }}
+
+    function softSwapSyncRow(state) {{
+      // Lap rollover: the server re-sent the same synced playlist with a
+      // freshly shuffled row (same interval + length). Swap the row in
+      // place and recompute the clock slot against the NEW row - no
+      // restart at 0, no white flash. paintSyncSlot repaints only if the
+      // current slot's image actually changed, using the normal
+      // cross-fade.
+      activeState = state;
+      showBanner(
+        state.banner ? state.banner.message : "",
+        state.banner ? state.banner.level : "warning"
+      );
+      if (syncPaused) {{
+        // Frozen: keep the new row for when we resume but don't repaint
+        // or re-arm. Resume snaps to the clock slot in this new row.
+        return;
+      }}
+      paintSyncSlot(syncClockSlot());
+      scheduleSyncFlip();
+    }}
+
+    function logSyncFallback(state) {{
+      // A sync object was present but failed validation (needs a positive
+      // integer length equal to the row length + a valid interval). We
+      // fall back to the free-running slideshow; surface why. Chromium's
+      // own console isn't captured, so also POST to the event server
+      // (piframe_client logs it via _log), mirroring the visualizer's
+      // diagnostic path.
+      const s = state && state.sync;
+      const detail = "sync ignored: mode=" + (s && s.mode)
+        + " length=" + (s && s.length)
+        + " items=" + ((state && state.items) ? state.items.length : 0)
+        + " interval=" + (state && state.interval);
+      try {{ console.warn("[slideshow-sync] " + detail); }} catch (_) {{}}
+      if (!eventEndpoint) return;
+      try {{
+        fetch(eventEndpoint, {{
+          method: "POST",
+          headers: {{"Content-Type": "application/json"}},
+          body: JSON.stringify({{type: "slideshow_sync", detail: detail}}),
+          keepalive: true,
+        }}).catch(() => {{}});
+      }} catch (_) {{ /* ignore */ }}
+    }}
 
     function applyControl(control) {{
       if (!control) {{
@@ -1794,6 +1967,24 @@ def render_browser_html(
             showOsd("pause", "", "", null, 1000);
             notifyPauseState(true);
             try {{ audioVis.setPaused(true); }} catch (_) {{}}
+          }}
+        }} else if (syncActive()) {{
+          // Clock-synced slideshow: pause freezes the current image by
+          // stopping the wall-clock boundary timer; resume snaps to the
+          // clock slot and re-arms. Reporting goes through the same
+          // plumbing as every other path (notifyPauseState -> event
+          // server -> BROWSER_EVENT_STATE.set_paused).
+          if (!syncPaused) {{
+            syncPaused = true;
+            clearSyncTimer();
+            showOsd("pause", "", "", null, 1000);
+            notifyPauseState(true);
+          }} else {{
+            syncPaused = false;
+            paintSyncSlot(syncClockSlot());
+            scheduleSyncFlip();
+            hideOsd();
+            notifyPauseState(false);
           }}
         }} else {{
           if (intervalHandle) {{
@@ -1821,6 +2012,9 @@ def render_browser_html(
           loop: state.loop,
           interval: state.interval,
           shuffle: state.shuffle,
+          // Included so toggling clock-sync on/off over an otherwise
+          // identical row re-applies (a plain items match wouldn't fire).
+          sync: state.sync,
           transition: state.transition,
           transition_duration_ms: state.transition_duration_ms,
           video_fill_mode: state.video_fill_mode,
@@ -1828,9 +2022,23 @@ def render_browser_html(
           banner: state.banner,
         }});
         if (signature !== currentSignature) {{
+          const prevState = activeState;
           currentSignature = signature;
           currentControlToken = state.control ? state.control.token : -1;
-          startFromState(state);
+          // A clock-sync lap re-send is the same synced playlist with a
+          // freshly shuffled row (same interval + length). Swap the row
+          // in place instead of restarting at index 0, so the flip stays
+          // a normal soft cross-fade and the clock index carries over.
+          if (
+            syncConfigValid(state) &&
+            syncConfigValid(prevState) &&
+            Number(prevState.interval) === Number(state.interval) &&
+            prevState.sync.length === state.sync.length
+          ) {{
+            softSwapSyncRow(state);
+          }} else {{
+            startFromState(state);
+          }}
         }} else if (state.control && state.control.token !== currentControlToken) {{
           currentControlToken = state.control.token;
           applyControl(state.control);
