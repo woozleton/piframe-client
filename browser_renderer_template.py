@@ -414,21 +414,34 @@ def render_browser_html(
       opacity: 1;
       transform: translate(-50%, 0);
     }}
-    /* Mural sprite overlay (Road B). One compositor-friendly box moved
-       by translate3d from a rAF loop; nothing else about the page
-       changes while it runs.
-       Stacking: z-index 30 puts it ABOVE the media stages (z auto,
-       inside .frame) and above the audio-visualizer layer (z 4), but
-       BELOW the banner (40) and the OSD (45) so an error banner or a
-       volume pop is never hidden by a passing creature. It sits outside
-       .frame so its z-index competes in the root stacking context with
-       those two - .frame itself is z auto, so the sprite always wins
-       against everything inside it.
+    /* Mural sprite overlay (Road B). A POOL of compositor-friendly boxes
+       (one per entity, created lazily, max 8) moved by translate3d from a
+       single rAF loop; nothing else about the page changes while it runs.
+       Stacking: the pool's container carries z-index 30, which puts every
+       box ABOVE the media stages (z auto, inside .frame) and above the
+       audio-visualizer layer (z 4), but BELOW the banner (40) and the OSD
+       (45) so an error banner or a volume pop is never hidden by a passing
+       creature. The container sits outside .frame so its z-index competes
+       in the root stacking context with those two - .frame itself is z
+       auto, so the sprites always win against everything inside it.
+       The container is a zero-size, non-transformed anchor on purpose:
+       the boxes are position:fixed and must stay anchored to the VIEWPORT,
+       and any transform / filter / will-change on an ancestor would make
+       it their containing block instead and break the mapping.
        visibility (not display) is used for the off-window state: it
        keeps the layer promoted and costs no layout.
        The radius / background here are only the circle-kind defaults -
        spriteFrame() rewrites border-radius, background-color and
-       background-image per kind whenever the sprite config changes. */
+       background-image per kind whenever an entity's config changes. */
+    .sprite-layer {{
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 0;
+      height: 0;
+      pointer-events: none;
+      z-index: 30;
+    }}
     .sprite {{
       position: fixed;
       left: 0;
@@ -442,7 +455,6 @@ def render_browser_html(
       visibility: hidden;
       will-change: transform;
       transform: translate3d(0, 0, 0);
-      z-index: 30;
     }}
   </style>
 </head>
@@ -479,10 +491,11 @@ def render_browser_html(
       <div id="audioVisTrackName" class="audio-vis__track-name" aria-hidden="true"></div>
     </div>
   </div>
-  <!-- Mural sprite overlay (Road B): a single box driven by the shared
-       wall clock, drawn over whatever the stages are showing. Outside
+  <!-- Mural sprite overlay (Road B): a pool of boxes (one per entity,
+       appended lazily by the sprite module) driven by the shared wall
+       clock and drawn over whatever the stages are showing. Outside
        .frame so it stacks against the banner / OSD directly. -->
-  <div id="sprite" class="sprite" aria-hidden="true"></div>
+  <div id="spriteLayer" class="sprite-layer" aria-hidden="true"></div>
   <div id="banner" class="banner"></div>
   <div id="osd" class="osd">
     <div class="osd-head">
@@ -2175,23 +2188,29 @@ def render_browser_html(
        part of the render signature in pollState, so slideshow flips and
        content changes leave it running untouched.
 
-       Every screen knows the shared world size, its own window rect in
-       that world, and a parametric motion, and derives the sprite's
-       world position from the NTP wall clock on every animation frame
-       (spriteW / spriteH are the sprite's world dimensions - w/h for an
-       image sprite, size for both on a circle):
+       The descriptor is a shared ENVELOPE (world / window / latency_ms /
+       epoch) plus a list of ENTITIES, each with its own sprite box and
+       its own motion. Every screen knows the shared world size, its own
+       window rect in that world, and each entity's parametric motion, and
+       derives that entity's world position from the NTP wall clock on
+       every animation frame (spriteW / spriteH are the entity's world
+       dimensions - w/h for an image, size for both on a circle; for an
+       animated image they are the dimensions of ONE frame):
 
-         worldX(t) = mod(t / sweep_s, 1) * (world.w + spriteW) - spriteW
+         t_e(t)    = t + phase_s
+         worldX(t) = mod(t_e / sweep_s, 1) * (world.w + spriteW) - spriteW
          worldY(t) = (world.h - spriteH) / 2
-                     + world.h * y_amp_frac * sin(2 * PI * t / y_period_s)
+                     + world.h * y_amp_frac * sin(2 * PI * t_e / y_period_s)
 
        (both are the ball path from scripts/mural/make_test_master.py, so
        sprite runs and pre-rendered masters describe the same motion.)
        t is the wall clock plus this surface's optional latency_ms/1000,
-       so a POSITIVE latency renders the sprite FURTHER ALONG its path -
-       the compensation for a display that presents late.
+       so a POSITIVE latency renders the sprites FURTHER ALONG their paths
+       - the compensation for a display that presents late. phase_s is the
+       per-entity offset on top of that, which is what lets one wire spread
+       a school of fish along the same path.
        World lengths map to screen pixels with scaleX = vw / window.w,
-       scaleY = vh / window.h, and the box is hidden whenever it does not
+       scaleY = vh / window.h, and a box is hidden whenever it does not
        intersect this screen's window. No screen ever talks to another -
        the wall clock is the only shared state, exactly like the
        clock-synced slideshow.
@@ -2204,24 +2223,39 @@ def render_browser_html(
 
        Two sprite kinds: `circle` (size + color, drawn with a background
        color and a 50% radius) and `image` (w/h + a file:// src, painted
-       as a background-image scaled to the box). The element stays a
-       single div either way - background-image keeps the compositor path
-       and needs no load-event plumbing.
+       as a background-image scaled to the box). An image may also carry
+       `anim` {{frames, fps}}: the src is then a HORIZONTAL strip of
+       equal-width frames, painted by stretching the background to
+       frames * boxW and stepping background-position-x one box per frame
+       index (floor(t_e * fps) mod frames). Every entity stays a single
+       div either way - background-image keeps the compositor path and
+       needs no load-event plumbing.
 
-       Cheapness: the loop writes only `transform` (compositor path) and
-       `visibility`, and only when the value actually changed; while the
-       sprite is off-window it does no DOM writes at all. Config is read
+       Pooling: one div per entity, created lazily into #spriteLayer, at
+       most SPRITE_MAX_ENTITIES of them, claimed BY ENTITY ID and released
+       (hidden) the first frame their id stops appearing in the live
+       state. There is exactly ONE rAF loop no matter how many entities
+       run.
+
+       Cheapness: per entity the loop writes only `transform` (compositor
+       path), `background-position-x` when an animation frame actually
+       flips, and `visibility` - and only when the value changed; while an
+       entity is off-window it does no DOM writes at all. Config is read
        from the LIVE polled state every frame, so a re-send with new
-       parameters - including a kind switch or a swapped image url -
-       converges with no re-render and no restart.
+       parameters - including added / removed entities, a kind switch or a
+       swapped image url - converges with no re-render and no restart.
        ================================================================ */
-    const spriteEl = document.getElementById("sprite");
+    const spriteLayer = document.getElementById("spriteLayer");
+    const SPRITE_MAX_ENTITIES = 8;
+    // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched }}.
+    // id === null means the slot is free for the next new entity.
+    const spriteSlots = [];
+    // Distinct image srcs already warmed, so a school of identical fish
+    // costs exactly one preload.
+    const spritePreloaded = Object.create(null);
     let spriteRafHandle = null;
     let spriteViewportW = window.innerWidth;
     let spriteViewportH = window.innerHeight;
-    let spriteLastVisible = null;
-    let spriteLastBoxKey = "";
-    let spriteLastPreloadSrc = "";
 
     function spriteMod(x, m) {{
       return ((x % m) + m) % m;
@@ -2232,17 +2266,27 @@ def render_browser_html(
       return isFinite(n) ? n : NaN;
     }}
 
-    function spriteConfigValid(sp) {{
-      if (!sp || typeof sp !== "object") return false;
-      const world = sp.world;
-      const win = sp.window;
-      const motion = sp.motion;
-      const box = sp.sprite;
-      if (!world || !win || !motion || !box) return false;
+    function spriteAnimOf(box) {{
+      // Normalized {{frames, fps}} for a sprite-sheet entity, else null.
+      // A junk anim degrades to a STATIC paint rather than dropping the
+      // creature - the client-side validator is the real gatekeeper here,
+      // and a still fish beats a missing one.
+      if (!box || box.kind !== "image") return null;
+      const anim = box.anim;
+      if (!anim || typeof anim !== "object") return null;
+      const frames = Math.floor(spriteNum(anim.frames));
+      const fps = spriteNum(anim.fps);
+      if (!(frames >= 2) || !(fps > 0)) return null;
+      return {{ frames: frames, fps: fps }};
+    }}
+
+    function spriteEntityValid(ent) {{
+      if (!ent || typeof ent !== "object") return false;
+      if (typeof ent.id !== "string" || !ent.id) return false;
+      const motion = ent.motion;
+      const box = ent.sprite;
+      if (!motion || !box) return false;
       // NaN fails every comparison, so these cover missing / junk values.
-      if (!(spriteNum(world.w) > 0) || !(spriteNum(world.h) > 0)) return false;
-      if (!isFinite(spriteNum(win.x)) || !isFinite(spriteNum(win.y))) return false;
-      if (!(spriteNum(win.w) > 0) || !(spriteNum(win.h) > 0)) return false;
       if (motion.mode !== "sweep") return false;
       if (!(spriteNum(motion.sweep_s) > 0)) return false;
       if (!(spriteNum(motion.y_period_s) > 0)) return false;
@@ -2260,29 +2304,190 @@ def render_browser_html(
       return false;
     }}
 
+    function spriteConfigValid(sp) {{
+      if (!sp || typeof sp !== "object") return false;
+      const world = sp.world;
+      const win = sp.window;
+      if (!world || !win) return false;
+      // NaN fails every comparison, so these cover missing / junk values.
+      if (!(spriteNum(world.w) > 0) || !(spriteNum(world.h) > 0)) return false;
+      if (!isFinite(spriteNum(win.x)) || !isFinite(spriteNum(win.y))) return false;
+      if (!(spriteNum(win.w) > 0) || !(spriteNum(win.h) > 0)) return false;
+      const list = sp.entities;
+      if (!Array.isArray(list) || !list.length) return false;
+      // One usable entity is enough to keep the layer running; the frame
+      // loop skips the rest individually.
+      for (let i = 0; i < list.length; i++) {{
+        if (spriteEntityValid(list[i])) return true;
+      }}
+      return false;
+    }}
+
     function spritePreload(box) {{
       // A brand-new image url takes a moment to fetch and background-image
       // simply pops in when it lands - no load event, no half-drawn frame.
       // Warming the cache the moment a new src appears (which is typically
       // while the sprite is still off this screen's window) makes the pop
-      // invisible in practice. One string compare per frame otherwise.
+      // invisible in practice. One map lookup per entity per frame
+      // otherwise, and each distinct src is warmed exactly once.
       if (!box || box.kind !== "image") return;
       if (typeof box.src !== "string" || !box.src) return;
-      if (box.src === spriteLastPreloadSrc) return;
-      spriteLastPreloadSrc = box.src;
+      if (spritePreloaded[box.src]) return;
+      spritePreloaded[box.src] = true;
       const warm = new Image();
       warm.src = box.src;
     }}
 
-    function spriteSetVisible(visible) {{
+    function spriteSetVisible(slot, visible) {{
       const flag = !!visible;
-      if (flag === spriteLastVisible) return;
-      spriteLastVisible = flag;
-      spriteEl.style.visibility = flag ? "visible" : "hidden";
+      if (flag === slot.visible) return;
+      slot.visible = flag;
+      slot.el.style.visibility = flag ? "visible" : "hidden";
+    }}
+
+    function spriteResetSlot(slot) {{
+      // Forget the painted look so the next entity to use this box
+      // repaints from scratch instead of inheriting the last one's.
+      slot.boxKey = "";
+      slot.frameIndex = -1;
+      slot.isAnim = false;
+    }}
+
+    function spriteClaimSlot(id) {{
+      for (let i = 0; i < spriteSlots.length; i++) {{
+        if (spriteSlots[i].id === id) return spriteSlots[i];
+      }}
+      for (let i = 0; i < spriteSlots.length; i++) {{
+        if (spriteSlots[i].id === null) {{
+          const reused = spriteSlots[i];
+          reused.id = id;
+          spriteResetSlot(reused);
+          return reused;
+        }}
+      }}
+      if (spriteSlots.length >= SPRITE_MAX_ENTITIES) return null;
+      const el = document.createElement("div");
+      el.className = "sprite";
+      el.setAttribute("aria-hidden", "true");
+      spriteLayer.appendChild(el);
+      const slot = {{
+        el: el,
+        id: id,
+        visible: null,
+        boxKey: "",
+        frameIndex: -1,
+        isAnim: false,
+        touched: false
+      }};
+      spriteSlots.push(slot);
+      return slot;
+    }}
+
+    function spriteReleaseSlot(slot) {{
+      // An entity that stopped arriving in the live state: hide its box
+      // and hand the slot back. Cheap no-op once already free.
+      if (slot.id === null) return;
+      slot.id = null;
+      spriteResetSlot(slot);
+      spriteSetVisible(slot, false);
+    }}
+
+    function spriteHideAll() {{
+      for (let i = 0; i < spriteSlots.length; i++) {{
+        spriteSetVisible(spriteSlots[i], false);
+      }}
     }}
 
     function spriteRunning() {{
       return spriteRafHandle !== null;
+    }}
+
+    function spriteDrawEntity(slot, sp, ent, tBase) {{
+      const box = ent.sprite;
+      const motion = ent.motion;
+      const isImage = box.kind === "image";
+      spritePreload(box);
+      // Per-entity time: the shared, latency-compensated clock plus this
+      // entity's phase offset. Missing / junk phase degrades to 0, which
+      // simply puts the entity in step with an unphased one.
+      const phaseRaw = Number(motion.phase_s);
+      const t = tBase + (isFinite(phaseRaw) ? phaseRaw : 0);
+      // World dimensions per kind: a circle is square (size drives both),
+      // an image carries independent w/h (of a SINGLE frame when it is a
+      // sprite sheet). Width feeds the offscreen sweep bounds, height the
+      // vertical centering - identical math after this.
+      const spriteW = isImage ? Number(box.w) : Number(box.size);
+      const spriteH = isImage ? Number(box.h) : Number(box.size);
+      const worldW = Number(sp.world.w);
+      const worldH = Number(sp.world.h);
+      const worldX =
+        spriteMod(t / Number(motion.sweep_s), 1) * (worldW + spriteW) - spriteW;
+      const ampRaw = Number(motion.y_amp_frac);
+      const amp = isFinite(ampRaw) ? ampRaw : 0;
+      const worldY =
+        (worldH - spriteH) / 2 +
+        worldH * amp * Math.sin((2 * Math.PI * t) / Number(motion.y_period_s));
+      const scaleX = spriteViewportW / Number(sp.window.w);
+      const scaleY = spriteViewportH / Number(sp.window.h);
+      const boxW = spriteW * scaleX;
+      const boxH = spriteH * scaleY;
+      const x = (worldX - Number(sp.window.x)) * scaleX;
+      const y = (worldY - Number(sp.window.y)) * scaleY;
+      const intersects =
+        x + boxW > 0 && x < spriteViewportW && y + boxH > 0 && y < spriteViewportH;
+      if (!intersects) {{
+        // Off this screen's window: hide once, write nothing else.
+        spriteSetVisible(slot, false);
+        return;
+      }}
+      const anim = spriteAnimOf(box);
+      // Change detection covers kind + look as well as the box size, so a
+      // mid-show circle <-> image switch, a swapped url or a strip whose
+      // frame count changed repaints once.
+      const boxKey =
+        boxW.toFixed(1) + "x" + boxH.toFixed(1) + "|" + box.kind + "|" +
+        (isImage ? box.src : box.color) + (anim ? "|a" + anim.frames : "");
+      if (boxKey !== slot.boxKey) {{
+        slot.boxKey = boxKey;
+        slot.el.style.width = boxW.toFixed(1) + "px";
+        slot.el.style.height = boxH.toFixed(1) + "px";
+        if (isImage) {{
+          // JSON.stringify quotes + escapes the url for the CSS string.
+          slot.el.style.backgroundImage = "url(" + JSON.stringify(box.src) + ")";
+          if (anim) {{
+            // The strip is stretched so ONE frame fills the box exactly;
+            // background-position-x then slides the strip frame by frame.
+            slot.el.style.backgroundSize =
+              (anim.frames * boxW).toFixed(1) + "px " + boxH.toFixed(1) + "px";
+            // boxW just changed, so the offset must be rewritten below
+            // even if the frame index itself did not move.
+            slot.frameIndex = -1;
+          }} else {{
+            slot.el.style.backgroundSize = "100% 100%";
+            if (slot.isAnim) slot.el.style.backgroundPositionX = "0px";
+          }}
+          slot.el.style.backgroundColor = "transparent";
+          slot.el.style.borderRadius = "0";
+        }} else {{
+          slot.el.style.backgroundImage = "none";
+          if (slot.isAnim) slot.el.style.backgroundPositionX = "0px";
+          slot.el.style.backgroundColor = box.color;
+          slot.el.style.borderRadius = "50%";
+        }}
+        slot.isAnim = !!anim;
+      }}
+      if (anim) {{
+        // Frame index off the same per-entity clock as the position, so
+        // the walk cycle is in phase across screens by construction.
+        const index = spriteMod(Math.floor(t * anim.fps), anim.frames);
+        if (index !== slot.frameIndex) {{
+          slot.frameIndex = index;
+          slot.el.style.backgroundPositionX = (-(index * boxW)).toFixed(1) + "px";
+        }}
+      }}
+      slot.el.style.transform =
+        "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)";
+      spriteSetVisible(slot, true);
     }}
 
     function spriteFrame() {{
@@ -2291,74 +2496,33 @@ def render_browser_html(
       spriteRafHandle = window.requestAnimationFrame(spriteFrame);
       const sp = activeState && activeState.sprite;
       if (!spriteConfigValid(sp)) {{
-        spriteSetVisible(false);
+        spriteHideAll();
         return;
       }}
-      const world = sp.world;
-      const win = sp.window;
-      const motion = sp.motion;
-      const box = sp.sprite;
-      const isImage = box.kind === "image";
-      spritePreload(box);
-      // World dimensions per kind: a circle is square (size drives both),
-      // an image carries independent w/h. Width feeds the offscreen sweep
-      // bounds, height the vertical centering - identical math after this.
-      const spriteW = isImage ? Number(box.w) : Number(box.size);
-      const spriteH = isImage ? Number(box.h) : Number(box.size);
-      const worldW = Number(world.w);
-      const worldH = Number(world.h);
       // Per-surface display-lag compensation, read LIVE every frame like
       // every other sprite parameter: a POSITIVE latency_ms renders the
-      // sprite FURTHER ALONG its path, compensating a display that
+      // sprites FURTHER ALONG their paths, compensating a display that
       // presents late. Missing / junk (an older manager, which never sends
       // it) degrades to 0 - uncompensated, never broken.
       const spriteLatencyRaw = Number(sp.latency_ms);
       const spriteLatency = isFinite(spriteLatencyRaw) ? spriteLatencyRaw : 0;
-      const t = Date.now() / 1000 + spriteLatency / 1000;
-      const worldX =
-        spriteMod(t / Number(motion.sweep_s), 1) * (worldW + spriteW) - spriteW;
-      const ampRaw = Number(motion.y_amp_frac);
-      const amp = isFinite(ampRaw) ? ampRaw : 0;
-      const worldY =
-        (worldH - spriteH) / 2 +
-        worldH * amp * Math.sin((2 * Math.PI * t) / Number(motion.y_period_s));
-      const scaleX = spriteViewportW / Number(win.w);
-      const scaleY = spriteViewportH / Number(win.h);
-      const boxW = spriteW * scaleX;
-      const boxH = spriteH * scaleY;
-      const x = (worldX - Number(win.x)) * scaleX;
-      const y = (worldY - Number(win.y)) * scaleY;
-      const intersects =
-        x + boxW > 0 && x < spriteViewportW && y + boxH > 0 && y < spriteViewportH;
-      if (!intersects) {{
-        // Off this screen's window: hide once, write nothing else.
-        spriteSetVisible(false);
-        return;
+      const tBase = Date.now() / 1000 + spriteLatency / 1000;
+      for (let i = 0; i < spriteSlots.length; i++) spriteSlots[i].touched = false;
+      const list = sp.entities;
+      let drawn = 0;
+      for (let i = 0; i < list.length && drawn < SPRITE_MAX_ENTITIES; i++) {{
+        const ent = list[i];
+        if (!spriteEntityValid(ent)) continue;
+        const slot = spriteClaimSlot(ent.id);
+        if (!slot) continue;
+        slot.touched = true;
+        drawn += 1;
+        spriteDrawEntity(slot, sp, ent, tBase);
       }}
-      // Change detection covers kind + look as well as the box size, so a
-      // mid-show circle <-> image switch or a swapped url repaints once.
-      const boxKey =
-        boxW.toFixed(1) + "x" + boxH.toFixed(1) + "|" + box.kind + "|" +
-        (isImage ? box.src : box.color);
-      if (boxKey !== spriteLastBoxKey) {{
-        spriteLastBoxKey = boxKey;
-        spriteEl.style.width = boxW.toFixed(1) + "px";
-        spriteEl.style.height = boxH.toFixed(1) + "px";
-        if (isImage) {{
-          // JSON.stringify quotes + escapes the url for the CSS string.
-          spriteEl.style.backgroundImage = "url(" + JSON.stringify(box.src) + ")";
-          spriteEl.style.backgroundSize = "100% 100%";
-          spriteEl.style.backgroundColor = "transparent";
-          spriteEl.style.borderRadius = "0";
-        }} else {{
-          spriteEl.style.backgroundImage = "none";
-          spriteEl.style.backgroundColor = box.color;
-          spriteEl.style.borderRadius = "50%";
-        }}
+      // Anything the live state stopped mentioning disappears this frame.
+      for (let i = 0; i < spriteSlots.length; i++) {{
+        if (!spriteSlots[i].touched) spriteReleaseSlot(spriteSlots[i]);
       }}
-      spriteEl.style.transform =
-        "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)";
-      spriteSetVisible(true);
     }}
 
     function startSprite() {{
@@ -2374,9 +2538,13 @@ def render_browser_html(
         window.cancelAnimationFrame(spriteRafHandle);
         spriteRafHandle = null;
       }}
-      spriteLastBoxKey = "";
-      spriteLastPreloadSrc = "";
-      spriteSetVisible(false);
+      for (let i = 0; i < spriteSlots.length; i++) {{
+        const slot = spriteSlots[i];
+        slot.id = null;
+        spriteResetSlot(slot);
+        spriteSetVisible(slot, false);
+      }}
+      for (const src in spritePreloaded) delete spritePreloaded[src];
     }}
 
     window.addEventListener("resize", () => {{

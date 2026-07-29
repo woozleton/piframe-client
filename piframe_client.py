@@ -174,6 +174,17 @@ IMAGE_EXTENSIONS = {
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 
+# Mural sprite overlay (Road B) wire limits. The kiosk keeps one pooled
+# div per entity and one rAF loop, so the cap is really a budget on
+# per-frame DOM work; the renderer enforces the same number.
+SPRITE_MAX_ENTITIES = 8
+# Sprite-sheet animation bounds. `frames` is how many equal-width frames
+# the horizontal strip holds; `fps` is how fast the kiosk walks them.
+SPRITE_ANIM_MIN_FRAMES = 2
+SPRITE_ANIM_MAX_FRAMES = 32
+SPRITE_ANIM_MIN_FPS = 0.5
+SPRITE_ANIM_MAX_FPS = 30.0
+
 
 # ---------------------------------------------------------------------------
 # Helper utilities
@@ -1497,6 +1508,10 @@ class BrowserController:
     def set_sprite(self, value: Optional[Dict[str, Any]]) -> None:
         """Publish (or clear) the mural sprite-overlay descriptor.
 
+        One value carries the whole overlay - the shared envelope (world /
+        window / epoch / latency_ms) plus every entity - so the renderer
+        always sees a consistent set and a re-send is a single atomic swap.
+
         The sprite is an INDEPENDENT layer drawn over whatever is already
         on stage, so this touches exactly one key and nothing else - same
         lock + atomic-write pattern as set_banner / set_visualizer. No
@@ -2644,24 +2659,162 @@ class PiFrameClient:
         BROWSER_EVENT_STATE.wakeup.set()
 
     @staticmethod
-    def _extract_sprite(params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Return a shape-valid sprite-overlay descriptor or None.
+    def _extract_sprite_entity(index: int, raw: Any) -> Optional[Dict[str, Any]]:
+        """Return one normalized sprite entity, or None if it is malformed.
+
+        Entity failures are ISOLATED: the reason is logged as
+        `sprite_entity_invalid` and only this entity is dropped, so one bad
+        creature never takes the whole show down with it. The per-field
+        rules are exactly the single-sprite validator's, plus the optional
+        sprite-sheet `anim` block on the image kind."""
+
+        def _bad(reason: str, **fields: Any) -> None:
+            _log("sprite_entity_invalid", index=index, reason=reason, **fields)
+
+        if not isinstance(raw, dict):
+            _bad("entity_not_object")
+            return None
+
+        entity_id = raw.get("id")
+        if not isinstance(entity_id, str) or not entity_id.strip():
+            _bad("entity_id", id=str(entity_id))
+            return None
+        entity_id = entity_id.strip()
+
+        sprite = raw.get("sprite")
+        motion = raw.get("motion")
+        for name, obj in (("sprite", sprite), ("motion", motion)):
+            if not isinstance(obj, dict):
+                _bad(f"{name}_missing", id=entity_id)
+                return None
+
+        if motion.get("mode") != "sweep":
+            _bad("motion_mode", id=entity_id, mode=str(motion.get("mode")))
+            return None
+        sweep_s = _finite_number(motion.get("sweep_s"))
+        y_period_s = _finite_number(motion.get("y_period_s"))
+        if sweep_s is None or sweep_s <= 0 or y_period_s is None or y_period_s <= 0:
+            _bad("motion_periods", id=entity_id)
+            return None
+        # y_amp_frac and phase_s are soft fields: a missing / malformed
+        # amplitude degrades to a flat sweep and a missing / malformed
+        # phase to 0 (in step with the other entities), rather than
+        # dropping the creature. (_finite_number rejects bool too.)
+        y_amp_frac = _finite_number(motion.get("y_amp_frac"))
+        if y_amp_frac is None:
+            y_amp_frac = 0.0
+        phase_s = _finite_number(motion.get("phase_s"))
+        if phase_s is None:
+            phase_s = 0.0
+
+        # Two sprite kinds. `circle` is the built-in primitive (one size,
+        # one color); `image` paints a media file (transparent PNGs from
+        # <nas>/_mural/sprites/) with independent world w/h. The stored
+        # image payload carries both the normalized NAS path (`url`, for
+        # logging / debugging, mirroring current_video) and the ready-to-use
+        # browser `src`, built the same way playlist items are.
+        kind = sprite.get("kind")
+        if kind == "circle":
+            size = _finite_number(sprite.get("size"))
+            if size is None or size <= 0:
+                _bad("sprite_size", id=entity_id)
+                return None
+            color = sprite.get("color")
+            if not _is_hex_color(color):
+                _bad("sprite_color", id=entity_id, color=str(color))
+                return None
+            sprite_payload: Dict[str, Any] = {
+                "kind": "circle",
+                "size": size,
+                "color": color,
+            }
+        elif kind == "image":
+            raw_url = sprite.get("url")
+            normalized_url = _normalize_media_url(raw_url) if isinstance(raw_url, str) else None
+            normalized_url = normalized_url.strip() if isinstance(normalized_url, str) else ""
+            if not normalized_url:
+                _bad("sprite_url", id=entity_id, url=str(raw_url))
+                return None
+            sprite_w = _finite_number(sprite.get("w"))
+            sprite_h = _finite_number(sprite.get("h"))
+            if sprite_w is None or sprite_w <= 0 or sprite_h is None or sprite_h <= 0:
+                _bad("sprite_dims", id=entity_id)
+                return None
+            try:
+                src = _media_file_src(normalized_url)
+            except Exception:
+                # as_uri() rejects anything non-absolute (and a web URL is
+                # not a local file); better to drop the entity than ship
+                # the kiosk a background-image it can never fetch.
+                _bad("sprite_url_unusable", id=entity_id, url=normalized_url)
+                return None
+            sprite_payload = {
+                "kind": "image",
+                "url": normalized_url,
+                "src": src,
+                "w": sprite_w,
+                "h": sprite_h,
+            }
+            # Optional sprite-sheet animation. The url then points at a
+            # HORIZONTAL strip of `frames` equal-width frames and w/h are
+            # the world dimensions of ONE frame. anim is optional, but a
+            # PRESENT-and-broken anim invalidates the entity: silently
+            # painting the whole strip in a one-frame box would look like
+            # a rendering bug, not a dropped creature.
+            anim = sprite.get("anim")
+            if anim is not None:
+                if not isinstance(anim, dict):
+                    _bad("anim_not_object", id=entity_id)
+                    return None
+                frames = anim.get("frames")
+                if (
+                    isinstance(frames, bool)
+                    or not isinstance(frames, int)
+                    or frames < SPRITE_ANIM_MIN_FRAMES
+                    or frames > SPRITE_ANIM_MAX_FRAMES
+                ):
+                    _bad("anim_frames", id=entity_id, frames=str(frames))
+                    return None
+                fps = _finite_number(anim.get("fps"))
+                if fps is None or fps < SPRITE_ANIM_MIN_FPS or fps > SPRITE_ANIM_MAX_FPS:
+                    _bad("anim_fps", id=entity_id, fps=str(anim.get("fps")))
+                    return None
+                sprite_payload["anim"] = {"frames": int(frames), "fps": fps}
+        else:
+            _bad("sprite_kind", id=entity_id, kind=str(kind))
+            return None
+
+        return {
+            "id": entity_id,
+            "sprite": sprite_payload,
+            "motion": {
+                "mode": "sweep",
+                "sweep_s": sweep_s,
+                "y_period_s": y_period_s,
+                "y_amp_frac": y_amp_frac,
+                "phase_s": phase_s,
+            },
+        }
+
+    @classmethod
+    def _extract_sprite_show(cls, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return a shape-valid multi-entity sprite descriptor or None.
 
         Mirrors _extract_video_sync's defensive style: every field is
         validated and a malformed set logs `sprite_show_invalid` with the
         precise reason, so a half-configured overlay never reaches the
         renderer. All lengths are WORLD units (master-video pixels); the
-        kiosk maps them to screen pixels itself, per frame."""
+        kiosk maps them to screen pixels itself, per frame.
+
+        Envelope (world / window / epoch / latency_ms) is all-or-nothing:
+        it is what makes any entity placeable, so a broken one drops the
+        command. The entity list is per-item tolerant - each entity is
+        validated on its own and a bad one is dropped with a
+        `sprite_entity_invalid` log; only a list with ZERO survivors fails
+        the command."""
         world = params.get("world")
         window = params.get("window")
-        motion = params.get("motion")
-        sprite = params.get("sprite")
-        for name, obj in (
-            ("world", world),
-            ("window", window),
-            ("motion", motion),
-            ("sprite", sprite),
-        ):
+        for name, obj in (("world", world), ("window", window)):
             if not isinstance(obj, dict):
                 _log("sprite_show_invalid", reason=f"{name}_missing")
                 return None
@@ -2683,70 +2836,42 @@ class PiFrameClient:
             _log("sprite_show_invalid", reason="window_dims")
             return None
 
-        if motion.get("mode") != "sweep":
-            _log("sprite_show_invalid", reason="motion_mode", mode=str(motion.get("mode")))
+        raw_entities = params.get("entities")
+        if not isinstance(raw_entities, list) or not raw_entities:
+            _log("sprite_show_invalid", reason="entities_missing")
             return None
-        sweep_s = _finite_number(motion.get("sweep_s"))
-        y_period_s = _finite_number(motion.get("y_period_s"))
-        if sweep_s is None or sweep_s <= 0 or y_period_s is None or y_period_s <= 0:
-            _log("sprite_show_invalid", reason="motion_periods")
+        if len(raw_entities) > SPRITE_MAX_ENTITIES:
+            # Over the frozen wire's cap: a server bug, not a partial show.
+            # Rejecting keeps whatever is already on screen instead of
+            # silently painting an arbitrary subset.
+            _log(
+                "sprite_show_invalid",
+                reason="entities_too_many",
+                count=len(raw_entities),
+                max=SPRITE_MAX_ENTITIES,
+            )
             return None
-        # y_amp_frac is a soft field: a missing / malformed amplitude
-        # degrades to a flat sweep rather than dropping the whole show.
-        y_amp_frac = _finite_number(motion.get("y_amp_frac"))
-        if y_amp_frac is None:
-            y_amp_frac = 0.0
 
-        # Two sprite kinds. `circle` is the built-in primitive (one size,
-        # one color); `image` paints a media file (transparent PNGs from
-        # <nas>/_mural/sprites/) with independent world w/h. The stored
-        # image payload carries both the normalized NAS path (`url`, for
-        # logging / debugging, mirroring current_video) and the ready-to-use
-        # browser `src`, built the same way playlist items are.
-        kind = sprite.get("kind")
-        if kind == "circle":
-            size = _finite_number(sprite.get("size"))
-            if size is None or size <= 0:
-                _log("sprite_show_invalid", reason="sprite_size")
-                return None
-            color = sprite.get("color")
-            if not _is_hex_color(color):
-                _log("sprite_show_invalid", reason="sprite_color", color=str(color))
-                return None
-            sprite_payload: Dict[str, Any] = {
-                "kind": "circle",
-                "size": size,
-                "color": color,
-            }
-        elif kind == "image":
-            raw_url = sprite.get("url")
-            normalized_url = _normalize_media_url(raw_url) if isinstance(raw_url, str) else None
-            normalized_url = normalized_url.strip() if isinstance(normalized_url, str) else ""
-            if not normalized_url:
-                _log("sprite_show_invalid", reason="sprite_url", url=str(raw_url))
-                return None
-            sprite_w = _finite_number(sprite.get("w"))
-            sprite_h = _finite_number(sprite.get("h"))
-            if sprite_w is None or sprite_w <= 0 or sprite_h is None or sprite_h <= 0:
-                _log("sprite_show_invalid", reason="sprite_dims")
-                return None
-            try:
-                src = _media_file_src(normalized_url)
-            except Exception:
-                # as_uri() rejects anything non-absolute (and a web URL is
-                # not a local file); better to drop the command than ship
-                # the kiosk a background-image it can never fetch.
-                _log("sprite_show_invalid", reason="sprite_url_unusable", url=normalized_url)
-                return None
-            sprite_payload = {
-                "kind": "image",
-                "url": normalized_url,
-                "src": src,
-                "w": sprite_w,
-                "h": sprite_h,
-            }
-        else:
-            _log("sprite_show_invalid", reason="sprite_kind", kind=str(kind))
+        entities: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for index, raw_entity in enumerate(raw_entities):
+            entity = cls._extract_sprite_entity(index, raw_entity)
+            if entity is None:
+                continue
+            if entity["id"] in seen_ids:
+                # The kiosk pools its divs BY id, so two entities sharing
+                # one id would fight over a single box. Keep the first.
+                _log(
+                    "sprite_entity_invalid",
+                    index=index,
+                    reason="entity_id_duplicate",
+                    id=entity["id"],
+                )
+                continue
+            seen_ids.add(entity["id"])
+            entities.append(entity)
+        if not entities:
+            _log("sprite_show_invalid", reason="entities_all_invalid")
             return None
 
         # epoch is informational - the motion is pure mod(t) against the
@@ -2756,7 +2881,7 @@ class PiFrameClient:
         # latency_ms is a soft field, exactly like the sync_video path's:
         # a missing / bool / non-finite value degrades to 0 (no
         # compensation) rather than dropping the overlay. A POSITIVE value
-        # makes this screen render the sprite FURTHER ALONG its path,
+        # makes this screen render the sprites FURTHER ALONG their paths,
         # compensating a display that presents late.
         # (_finite_number rejects bool as well as junk, so both land on 0.)
         latency_ms = _finite_number(params.get("latency_ms"))
@@ -2768,52 +2893,48 @@ class PiFrameClient:
             "latency_ms": latency_ms,
             "world": {"w": world_w, "h": world_h},
             "window": {"x": win_x, "y": win_y, "w": win_w, "h": win_h},
-            "motion": {
-                "mode": "sweep",
-                "sweep_s": sweep_s,
-                "y_period_s": y_period_s,
-                "y_amp_frac": y_amp_frac,
-            },
-            "sprite": sprite_payload,
+            "entities": entities,
         }
 
     def _handle_sprite_show(
         self, data: Dict[str, Any], params: Dict[str, Any]
     ) -> None:  # pylint: disable=unused-argument
-        """Mural Road B: a clock-driven sprite painted OVER the current
+        """Mural Road B: clock-driven sprites painted OVER the current
         content instead of replacing it.
 
         This screen knows the shared world size, its own window rect in
-        that world, and a parametric motion; it derives the sprite's world
-        position from the NTP wall clock every animation frame and draws
-        it only where it intersects its own window. Zero runtime
-        coordination between screens - same architecture as the
+        that world, and a parametric motion PER ENTITY; it derives every
+        entity's world position from the NTP wall clock on every animation
+        frame and draws each only where it intersects its own window. Zero
+        runtime coordination between screens - same architecture as the
         clock-synced slideshow.
 
         Pure overlay: playback_state, current_video, current_slideshow,
         current_sync and current_video_sync are all deliberately left
         untouched, so whatever is playing keeps playing and the server's
         schedule / companion guards see no change."""
-        payload = self._extract_sprite(params if isinstance(params, dict) else {})
+        payload = self._extract_sprite_show(params if isinstance(params, dict) else {})
         if payload is None:
-            # _extract_sprite already logged sprite_show_invalid with the
-            # precise reason; leave the screen exactly as it was.
+            # _extract_sprite_show already logged sprite_show_invalid (and
+            # any per-entity sprite_entity_invalid) with the precise
+            # reason; leave the screen exactly as it was.
             return
-        box = payload["sprite"]
-        # Per-kind tail: a circle logs size + color, an image logs its
-        # dimensions + file name (the full file:// src is noise in the log).
-        if box["kind"] == "image":
-            box_fields = {
-                "kind": "image",
-                "size": f"{box['w']:.0f}x{box['h']:.0f}",
-                "image": Path(box["url"]).name,
-            }
-        else:
-            box_fields = {
-                "kind": "circle",
-                "size": box["size"],
-                "color": box["color"],
-            }
+        # One compact per-entity summary rather than a field explosion:
+        # "e0:circle #ffc03c" / "e1:image fish.png 8f@12fps".
+        summary = []
+        for entity in payload["entities"]:
+            box = entity["sprite"]
+            if box["kind"] == "image":
+                anim = box.get("anim")
+                tail = f" {anim['frames']}f@{anim['fps']:g}fps" if anim else ""
+                summary.append(
+                    f"{entity['id']}:image {Path(box['url']).name} "
+                    f"{box['w']:.0f}x{box['h']:.0f}{tail}"
+                )
+            else:
+                summary.append(
+                    f"{entity['id']}:circle {box['color']} {box['size']:.0f}"
+                )
         _log(
             "sprite_show_command",
             world=f"{payload['world']['w']:.0f}x{payload['world']['h']:.0f}",
@@ -2821,11 +2942,9 @@ class PiFrameClient:
                 f"{payload['window']['x']:.0f},{payload['window']['y']:.0f} "
                 f"{payload['window']['w']:.0f}x{payload['window']['h']:.0f}"
             ),
-            sweep_s=payload["motion"]["sweep_s"],
-            y_period_s=payload["motion"]["y_period_s"],
-            y_amp_frac=payload["motion"]["y_amp_frac"],
+            entities=len(payload["entities"]),
+            sprites="; ".join(summary),
             latency_ms=payload["latency_ms"],
-            **box_fields,
         )
         self.renderer.set_sprite(payload)
 
