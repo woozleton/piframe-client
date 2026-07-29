@@ -524,6 +524,7 @@ def render_browser_html(
     // above so the two clock modes never fight over the same element.
     let videoSyncHandle = null;
     let videoSyncLastSeekMs = 0;
+    let videoSyncOutOfBand = 0;
     let activeStageIndex = 0;
     let pendingAdvanceToken = 0;
     let osdTimer = null;
@@ -2051,9 +2052,30 @@ def render_browser_html(
       const err = videoSyncMod(target - video.currentTime + D / 2, D) - D / 2;
       const absErr = Math.abs(err);
       if (absErr <= 0.04) {{
-        video.playbackRate = 1.0;
+        // Locked. Hold exactly 1.0 and only assign it on a real change -
+        // every playbackRate write restarts Chromium's frame pacing, and
+        // smoothly moving content shows each restart as a stutter.
+        videoSyncOutOfBand = 0;
+        if (video.playbackRate !== 1.0) video.playbackRate = 1.0;
       }} else if (absErr <= 0.5) {{
-        video.playbackRate = 1 + videoSyncClamp(0.25 * err, -0.03, 0.03);
+        // Chatter guard: currentTime is frame-quantized (~33ms at 30fps)
+        // and the tick adds its own jitter, so the measured err wobbles
+        // around the deadband edge even when the video is perfectly on
+        // the clock. Never start a correction for that noise - only for
+        // a sustained, clearly-real error (>0.12s on 3 consecutive
+        // ticks). Once nudging, keep correcting until back inside the
+        // deadband, where the branch above re-locks 1.0.
+        const nudging = video.playbackRate !== 1.0;
+        if (nudging) {{
+          video.playbackRate = 1 + videoSyncClamp(0.25 * err, -0.03, 0.03);
+        }} else if (absErr > 0.12) {{
+          videoSyncOutOfBand += 1;
+          if (videoSyncOutOfBand >= 3) {{
+            video.playbackRate = 1 + videoSyncClamp(0.25 * err, -0.03, 0.03);
+          }}
+        }} else {{
+          videoSyncOutOfBand = 0;
+        }}
       }} else {{
         // Hard seek - but gently. The Pi 5 software-decodes H.264, so a
         // currentTime seek takes real time to settle; seeking again every
@@ -2066,6 +2088,7 @@ def render_browser_html(
         const nowMs = Date.now();
         if (video.readyState >= 3 && nowMs - videoSyncLastSeekMs >= 3000) {{
           videoSyncLastSeekMs = nowMs;
+          videoSyncOutOfBand = 0;
           video.currentTime = Math.min(target, D - 0.05);
           video.playbackRate = 1.0;
         }} else {{
@@ -2089,6 +2112,7 @@ def render_browser_html(
         videoSyncHandle = null;
       }}
       videoSyncLastSeekMs = 0;
+      videoSyncOutOfBand = 0;
       // Reset the rate on BOTH stages so a video that left mural mid-nudge
       // (or its cross-fade partner) never keeps a fractional playbackRate.
       for (const stage of stages) {{
