@@ -425,7 +425,10 @@ def render_browser_html(
        those two - .frame itself is z auto, so the sprite always wins
        against everything inside it.
        visibility (not display) is used for the off-window state: it
-       keeps the layer promoted and costs no layout. */
+       keeps the layer promoted and costs no layout.
+       The radius / background here are only the circle-kind defaults -
+       spriteFrame() rewrites border-radius, background-color and
+       background-image per kind whenever the sprite config changes. */
     .sprite {{
       position: fixed;
       left: 0;
@@ -433,7 +436,8 @@ def render_browser_html(
       width: 0;
       height: 0;
       border-radius: 50%;
-      background: transparent;
+      background-color: transparent;
+      background-repeat: no-repeat;
       pointer-events: none;
       visibility: hidden;
       will-change: transform;
@@ -2173,10 +2177,12 @@ def render_browser_html(
 
        Every screen knows the shared world size, its own window rect in
        that world, and a parametric motion, and derives the sprite's
-       world position from the NTP wall clock on every animation frame:
+       world position from the NTP wall clock on every animation frame
+       (spriteW / spriteH are the sprite's world dimensions - w/h for an
+       image sprite, size for both on a circle):
 
-         worldX(t) = mod(t / sweep_s, 1) * (world.w + size) - size
-         worldY(t) = (world.h - size) / 2
+         worldX(t) = mod(t / sweep_s, 1) * (world.w + spriteW) - spriteW
+         worldY(t) = (world.h - spriteH) / 2
                      + world.h * y_amp_frac * sin(2 * PI * t / y_period_s)
 
        (both are the ball path from scripts/mural/make_test_master.py, so
@@ -2193,11 +2199,18 @@ def render_browser_html(
        reintroduced, this mapping needs the same rotate() the media
        elements get.
 
+       Two sprite kinds: `circle` (size + color, drawn with a background
+       color and a 50% radius) and `image` (w/h + a file:// src, painted
+       as a background-image scaled to the box). The element stays a
+       single div either way - background-image keeps the compositor path
+       and needs no load-event plumbing.
+
        Cheapness: the loop writes only `transform` (compositor path) and
        `visibility`, and only when the value actually changed; while the
        sprite is off-window it does no DOM writes at all. Config is read
        from the LIVE polled state every frame, so a re-send with new
-       parameters converges with no re-render and no restart.
+       parameters - including a kind switch or a swapped image url -
+       converges with no re-render and no restart.
        ================================================================ */
     const spriteEl = document.getElementById("sprite");
     let spriteRafHandle = null;
@@ -2205,6 +2218,7 @@ def render_browser_html(
     let spriteViewportH = window.innerHeight;
     let spriteLastVisible = null;
     let spriteLastBoxKey = "";
+    let spriteLastPreloadSrc = "";
 
     function spriteMod(x, m) {{
       return ((x % m) + m) % m;
@@ -2229,10 +2243,32 @@ def render_browser_html(
       if (motion.mode !== "sweep") return false;
       if (!(spriteNum(motion.sweep_s) > 0)) return false;
       if (!(spriteNum(motion.y_period_s) > 0)) return false;
-      if (box.kind !== "circle") return false;
-      if (!(spriteNum(box.size) > 0)) return false;
-      if (typeof box.color !== "string" || !box.color) return false;
-      return true;
+      if (box.kind === "circle") {{
+        if (!(spriteNum(box.size) > 0)) return false;
+        if (typeof box.color !== "string" || !box.color) return false;
+        return true;
+      }}
+      if (box.kind === "image") {{
+        // src is built client-side (file:// URI); w/h are world units.
+        if (typeof box.src !== "string" || !box.src) return false;
+        if (!(spriteNum(box.w) > 0) || !(spriteNum(box.h) > 0)) return false;
+        return true;
+      }}
+      return false;
+    }}
+
+    function spritePreload(box) {{
+      // A brand-new image url takes a moment to fetch and background-image
+      // simply pops in when it lands - no load event, no half-drawn frame.
+      // Warming the cache the moment a new src appears (which is typically
+      // while the sprite is still off this screen's window) makes the pop
+      // invisible in practice. One string compare per frame otherwise.
+      if (!box || box.kind !== "image") return;
+      if (typeof box.src !== "string" || !box.src) return;
+      if (box.src === spriteLastPreloadSrc) return;
+      spriteLastPreloadSrc = box.src;
+      const warm = new Image();
+      warm.src = box.src;
     }}
 
     function spriteSetVisible(visible) {{
@@ -2258,20 +2294,28 @@ def render_browser_html(
       const world = sp.world;
       const win = sp.window;
       const motion = sp.motion;
-      const size = Number(sp.sprite.size);
+      const box = sp.sprite;
+      const isImage = box.kind === "image";
+      spritePreload(box);
+      // World dimensions per kind: a circle is square (size drives both),
+      // an image carries independent w/h. Width feeds the offscreen sweep
+      // bounds, height the vertical centering - identical math after this.
+      const spriteW = isImage ? Number(box.w) : Number(box.size);
+      const spriteH = isImage ? Number(box.h) : Number(box.size);
       const worldW = Number(world.w);
       const worldH = Number(world.h);
       const t = Date.now() / 1000;
-      const worldX = spriteMod(t / Number(motion.sweep_s), 1) * (worldW + size) - size;
+      const worldX =
+        spriteMod(t / Number(motion.sweep_s), 1) * (worldW + spriteW) - spriteW;
       const ampRaw = Number(motion.y_amp_frac);
       const amp = isFinite(ampRaw) ? ampRaw : 0;
       const worldY =
-        (worldH - size) / 2 +
+        (worldH - spriteH) / 2 +
         worldH * amp * Math.sin((2 * Math.PI * t) / Number(motion.y_period_s));
       const scaleX = spriteViewportW / Number(win.w);
       const scaleY = spriteViewportH / Number(win.h);
-      const boxW = size * scaleX;
-      const boxH = size * scaleY;
+      const boxW = spriteW * scaleX;
+      const boxH = spriteH * scaleY;
       const x = (worldX - Number(win.x)) * scaleX;
       const y = (worldY - Number(win.y)) * scaleY;
       const intersects =
@@ -2281,12 +2325,26 @@ def render_browser_html(
         spriteSetVisible(false);
         return;
       }}
-      const boxKey = boxW.toFixed(1) + "x" + boxH.toFixed(1) + "|" + sp.sprite.color;
+      // Change detection covers kind + look as well as the box size, so a
+      // mid-show circle <-> image switch or a swapped url repaints once.
+      const boxKey =
+        boxW.toFixed(1) + "x" + boxH.toFixed(1) + "|" + box.kind + "|" +
+        (isImage ? box.src : box.color);
       if (boxKey !== spriteLastBoxKey) {{
         spriteLastBoxKey = boxKey;
         spriteEl.style.width = boxW.toFixed(1) + "px";
         spriteEl.style.height = boxH.toFixed(1) + "px";
-        spriteEl.style.background = sp.sprite.color;
+        if (isImage) {{
+          // JSON.stringify quotes + escapes the url for the CSS string.
+          spriteEl.style.backgroundImage = "url(" + JSON.stringify(box.src) + ")";
+          spriteEl.style.backgroundSize = "100% 100%";
+          spriteEl.style.backgroundColor = "transparent";
+          spriteEl.style.borderRadius = "0";
+        }} else {{
+          spriteEl.style.backgroundImage = "none";
+          spriteEl.style.backgroundColor = box.color;
+          spriteEl.style.borderRadius = "50%";
+        }}
       }}
       spriteEl.style.transform =
         "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)";
@@ -2307,6 +2365,7 @@ def render_browser_html(
         spriteRafHandle = null;
       }}
       spriteLastBoxKey = "";
+      spriteLastPreloadSrc = "";
       spriteSetVisible(false);
     }}
 

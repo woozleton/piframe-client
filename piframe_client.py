@@ -199,6 +199,18 @@ def _normalize_media_url(url: Optional[str]) -> Optional[str]:
     return value
 
 
+def _media_file_src(path_str: str) -> str:
+    """Return the browser-loadable src for a local media path.
+
+    The kiosk page is itself a local file, so every media element is fed a
+    `file://` URI. This is the single place that mapping lives - playlist
+    items (`_make_item`) and the mural sprite overlay share it, so a sprite
+    image loads exactly like any other library file. Raises ValueError for
+    a non-absolute path (Path.as_uri's contract); callers that take remote
+    input must guard."""
+    return Path(path_str).as_uri()
+
+
 def _finite_number(value: Any) -> Optional[float]:
     """Return `value` as a float when it is a real finite number, else None.
 
@@ -1203,7 +1215,7 @@ class BrowserController:
     def _make_item(self, path_str: str) -> Dict[str, Any]:
         ext = Path(path_str.split("?", 1)[0].split("#", 1)[0]).suffix.lower()
         return {
-            "src": Path(path_str).as_uri(),
+            "src": _media_file_src(path_str),
             "label": Path(path_str).name,
             "kind": self._item_kind(path_str),
             # is_audio is the renderer's hook for the audio visualization
@@ -2685,16 +2697,56 @@ class PiFrameClient:
         if y_amp_frac is None:
             y_amp_frac = 0.0
 
-        if sprite.get("kind") != "circle":
-            _log("sprite_show_invalid", reason="sprite_kind", kind=str(sprite.get("kind")))
-            return None
-        size = _finite_number(sprite.get("size"))
-        if size is None or size <= 0:
-            _log("sprite_show_invalid", reason="sprite_size")
-            return None
-        color = sprite.get("color")
-        if not _is_hex_color(color):
-            _log("sprite_show_invalid", reason="sprite_color", color=str(color))
+        # Two sprite kinds. `circle` is the built-in primitive (one size,
+        # one color); `image` paints a media file (transparent PNGs from
+        # <nas>/_mural/sprites/) with independent world w/h. The stored
+        # image payload carries both the normalized NAS path (`url`, for
+        # logging / debugging, mirroring current_video) and the ready-to-use
+        # browser `src`, built the same way playlist items are.
+        kind = sprite.get("kind")
+        if kind == "circle":
+            size = _finite_number(sprite.get("size"))
+            if size is None or size <= 0:
+                _log("sprite_show_invalid", reason="sprite_size")
+                return None
+            color = sprite.get("color")
+            if not _is_hex_color(color):
+                _log("sprite_show_invalid", reason="sprite_color", color=str(color))
+                return None
+            sprite_payload: Dict[str, Any] = {
+                "kind": "circle",
+                "size": size,
+                "color": color,
+            }
+        elif kind == "image":
+            raw_url = sprite.get("url")
+            normalized_url = _normalize_media_url(raw_url) if isinstance(raw_url, str) else None
+            normalized_url = normalized_url.strip() if isinstance(normalized_url, str) else ""
+            if not normalized_url:
+                _log("sprite_show_invalid", reason="sprite_url", url=str(raw_url))
+                return None
+            sprite_w = _finite_number(sprite.get("w"))
+            sprite_h = _finite_number(sprite.get("h"))
+            if sprite_w is None or sprite_w <= 0 or sprite_h is None or sprite_h <= 0:
+                _log("sprite_show_invalid", reason="sprite_dims")
+                return None
+            try:
+                src = _media_file_src(normalized_url)
+            except Exception:
+                # as_uri() rejects anything non-absolute (and a web URL is
+                # not a local file); better to drop the command than ship
+                # the kiosk a background-image it can never fetch.
+                _log("sprite_show_invalid", reason="sprite_url_unusable", url=normalized_url)
+                return None
+            sprite_payload = {
+                "kind": "image",
+                "url": normalized_url,
+                "src": src,
+                "w": sprite_w,
+                "h": sprite_h,
+            }
+        else:
+            _log("sprite_show_invalid", reason="sprite_kind", kind=str(kind))
             return None
 
         # epoch is informational - the motion is pure mod(t) against the
@@ -2710,7 +2762,7 @@ class PiFrameClient:
                 "y_period_s": y_period_s,
                 "y_amp_frac": y_amp_frac,
             },
-            "sprite": {"kind": "circle", "size": size, "color": color},
+            "sprite": sprite_payload,
         }
 
     def _handle_sprite_show(
@@ -2735,6 +2787,21 @@ class PiFrameClient:
             # _extract_sprite already logged sprite_show_invalid with the
             # precise reason; leave the screen exactly as it was.
             return
+        box = payload["sprite"]
+        # Per-kind tail: a circle logs size + color, an image logs its
+        # dimensions + file name (the full file:// src is noise in the log).
+        if box["kind"] == "image":
+            box_fields = {
+                "kind": "image",
+                "size": f"{box['w']:.0f}x{box['h']:.0f}",
+                "image": Path(box["url"]).name,
+            }
+        else:
+            box_fields = {
+                "kind": "circle",
+                "size": box["size"],
+                "color": box["color"],
+            }
         _log(
             "sprite_show_command",
             world=f"{payload['world']['w']:.0f}x{payload['world']['h']:.0f}",
@@ -2745,8 +2812,7 @@ class PiFrameClient:
             sweep_s=payload["motion"]["sweep_s"],
             y_period_s=payload["motion"]["y_period_s"],
             y_amp_frac=payload["motion"]["y_amp_frac"],
-            size=payload["sprite"]["size"],
-            color=payload["sprite"]["color"],
+            **box_fields,
         )
         self.renderer.set_sprite(payload)
 

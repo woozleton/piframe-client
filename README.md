@@ -204,11 +204,39 @@ already on screen:
 - `epoch` is informational - the motion is pure `mod(t)` against the wall
   clock, so a screen that joins late is instantly in phase
 
-Every animation frame the kiosk computes
+**Sprite kinds.** `circle` is the built-in primitive above. `image`
+paints a media file instead, with independent world width / height:
+
+```json
+"sprite": { "kind": "image",
+            "url": "/mnt/nas/_mural/sprites/fish.png",
+            "w": 240, "h": 140 }
+```
+
+- `url` is an ordinary NAS media path (UNC / IP-style paths are mapped to
+  the local mount by the same normalizer the playback commands use); the
+  client turns it into the `file://` src the kiosk loads, exactly like a
+  playlist item
+- convention: sprite art lives in `<nas>/_mural/sprites/*.png` as
+  **transparent PNGs** - the sprite box has no background of its own, so
+  the alpha channel is what makes the creature read as a creature
+- `w` / `h` are WORLD units, so the artwork is stretched to that box
+  (`background-size: 100% 100%`) - author the PNG at the intended aspect
+  ratio
+- kinds can be swapped mid-show: a re-sent `sprite_show` with a different
+  kind or url repaints in place, with no re-render and no restart of the
+  animation loop
+- a new image url pops in as soon as Chromium has fetched it; the kiosk
+  pre-warms the cache the moment a new src appears, normally while the
+  sprite is still off-window
+
+Every animation frame the kiosk computes (`spriteW` / `spriteH` are the
+sprite's world dimensions - `w` / `h` for an image, `size` for both on a
+circle)
 
 ```
-worldX = mod(t / sweep_s, 1) * (world.w + size) - size
-worldY = (world.h - size) / 2 + world.h * y_amp_frac * sin(2*PI*t / y_period_s)
+worldX = mod(t / sweep_s, 1) * (world.w + spriteW) - spriteW
+worldY = (world.h - spriteH) / 2 + world.h * y_amp_frac * sin(2*PI*t / y_period_s)
 ```
 
 maps it with `scaleX = viewportWidth / window.w`,
