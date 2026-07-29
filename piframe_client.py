@@ -190,6 +190,28 @@ def _normalize_media_url(url: Optional[str]) -> Optional[str]:
     return value
 
 
+def _finite_number(value: Any) -> Optional[float]:
+    """Return `value` as a float when it is a real finite number, else None.
+
+    bool is rejected on purpose: it is an int subclass, so a bare
+    isinstance((int, float)) guard would let True/False through as 1/0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _is_hex_color(value: Any) -> bool:
+    """True for a '#rrggbb' string - the sprite overlay's only color form."""
+    return (
+        isinstance(value, str)
+        and len(value) == 7
+        and value[0] == "#"
+        and all(ch in "0123456789abcdefABCDEF" for ch in value[1:])
+    )
+
+
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
     """Best-effort bool coercion for JSON-ish inputs (bool/int/str)."""
     if value is None:
@@ -1445,6 +1467,29 @@ class BrowserController:
             self._state["visualizer"] = normalized
             self._write_state()
 
+    def set_sprite(self, value: Optional[Dict[str, Any]]) -> None:
+        """Publish (or clear) the mural sprite-overlay descriptor.
+
+        The sprite is an INDEPENDENT layer drawn over whatever is already
+        on stage, so this touches exactly one key and nothing else - same
+        lock + atomic-write pattern as set_banner / set_visualizer. No
+        _ensure_running() call: an overlay must never be the thing that
+        spawns the browser (the renderer is already up whenever there is
+        anything to overlay, and the key is picked up on the next poll).
+
+        Survival across content changes is by construction:
+        _set_items_state does `self._state.update({...})` with an explicit
+        key list that does NOT include "sprite", so a slideshow / video /
+        idle transition leaves the sprite descriptor in place - which is
+        exactly what Road B wants (the creature crosses screens OVER a
+        running slideshow). Only sprite_stop clears it."""
+        with self._state_lock:
+            if value is None:
+                self._state.pop("sprite", None)
+            else:
+                self._state["sprite"] = value
+            self._write_state()
+
 
 class MpvCompanion:
     """Sidecar mpv process for companion audio playback.
@@ -1969,6 +2014,8 @@ class PiFrameClient:
             "restart_service": self._handle_restart_service,
             "webview_open": self._handle_webview_open,
             "webview_close": self._handle_webview_close,
+            "sprite_show": self._handle_sprite_show,
+            "sprite_stop": self._handle_sprite_stop,
         }.get(cmd)
         if handler:
             handler(data, params)
@@ -2568,6 +2615,132 @@ class PiFrameClient:
         # has something to display rather than a blank page.
         self.renderer.ensure_idle(self._get_idle_media())
         BROWSER_EVENT_STATE.wakeup.set()
+
+    @staticmethod
+    def _extract_sprite(params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Return a shape-valid sprite-overlay descriptor or None.
+
+        Mirrors _extract_video_sync's defensive style: every field is
+        validated and a malformed set logs `sprite_show_invalid` with the
+        precise reason, so a half-configured overlay never reaches the
+        renderer. All lengths are WORLD units (master-video pixels); the
+        kiosk maps them to screen pixels itself, per frame."""
+        world = params.get("world")
+        window = params.get("window")
+        motion = params.get("motion")
+        sprite = params.get("sprite")
+        for name, obj in (
+            ("world", world),
+            ("window", window),
+            ("motion", motion),
+            ("sprite", sprite),
+        ):
+            if not isinstance(obj, dict):
+                _log("sprite_show_invalid", reason=f"{name}_missing")
+                return None
+
+        world_w = _finite_number(world.get("w"))
+        world_h = _finite_number(world.get("h"))
+        if world_w is None or world_w <= 0 or world_h is None or world_h <= 0:
+            _log("sprite_show_invalid", reason="world_dims")
+            return None
+
+        win_x = _finite_number(window.get("x"))
+        win_y = _finite_number(window.get("y"))
+        win_w = _finite_number(window.get("w"))
+        win_h = _finite_number(window.get("h"))
+        if win_x is None or win_y is None:
+            _log("sprite_show_invalid", reason="window_origin")
+            return None
+        if win_w is None or win_w <= 0 or win_h is None or win_h <= 0:
+            _log("sprite_show_invalid", reason="window_dims")
+            return None
+
+        if motion.get("mode") != "sweep":
+            _log("sprite_show_invalid", reason="motion_mode", mode=str(motion.get("mode")))
+            return None
+        sweep_s = _finite_number(motion.get("sweep_s"))
+        y_period_s = _finite_number(motion.get("y_period_s"))
+        if sweep_s is None or sweep_s <= 0 or y_period_s is None or y_period_s <= 0:
+            _log("sprite_show_invalid", reason="motion_periods")
+            return None
+        # y_amp_frac is a soft field: a missing / malformed amplitude
+        # degrades to a flat sweep rather than dropping the whole show.
+        y_amp_frac = _finite_number(motion.get("y_amp_frac"))
+        if y_amp_frac is None:
+            y_amp_frac = 0.0
+
+        if sprite.get("kind") != "circle":
+            _log("sprite_show_invalid", reason="sprite_kind", kind=str(sprite.get("kind")))
+            return None
+        size = _finite_number(sprite.get("size"))
+        if size is None or size <= 0:
+            _log("sprite_show_invalid", reason="sprite_size")
+            return None
+        color = sprite.get("color")
+        if not _is_hex_color(color):
+            _log("sprite_show_invalid", reason="sprite_color", color=str(color))
+            return None
+
+        # epoch is informational - the motion is pure mod(t) against the
+        # wall clock - so a missing/odd value defaults instead of failing.
+        epoch = _finite_number(params.get("epoch"))
+        return {
+            "epoch": epoch if epoch is not None else 0.0,
+            "world": {"w": world_w, "h": world_h},
+            "window": {"x": win_x, "y": win_y, "w": win_w, "h": win_h},
+            "motion": {
+                "mode": "sweep",
+                "sweep_s": sweep_s,
+                "y_period_s": y_period_s,
+                "y_amp_frac": y_amp_frac,
+            },
+            "sprite": {"kind": "circle", "size": size, "color": color},
+        }
+
+    def _handle_sprite_show(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:  # pylint: disable=unused-argument
+        """Mural Road B: a clock-driven sprite painted OVER the current
+        content instead of replacing it.
+
+        This screen knows the shared world size, its own window rect in
+        that world, and a parametric motion; it derives the sprite's world
+        position from the NTP wall clock every animation frame and draws
+        it only where it intersects its own window. Zero runtime
+        coordination between screens - same architecture as the
+        clock-synced slideshow.
+
+        Pure overlay: playback_state, current_video, current_slideshow,
+        current_sync and current_video_sync are all deliberately left
+        untouched, so whatever is playing keeps playing and the server's
+        schedule / companion guards see no change."""
+        payload = self._extract_sprite(params if isinstance(params, dict) else {})
+        if payload is None:
+            # _extract_sprite already logged sprite_show_invalid with the
+            # precise reason; leave the screen exactly as it was.
+            return
+        _log(
+            "sprite_show_command",
+            world=f"{payload['world']['w']:.0f}x{payload['world']['h']:.0f}",
+            window=(
+                f"{payload['window']['x']:.0f},{payload['window']['y']:.0f} "
+                f"{payload['window']['w']:.0f}x{payload['window']['h']:.0f}"
+            ),
+            sweep_s=payload["motion"]["sweep_s"],
+            y_period_s=payload["motion"]["y_period_s"],
+            y_amp_frac=payload["motion"]["y_amp_frac"],
+            size=payload["sprite"]["size"],
+            color=payload["sprite"]["color"],
+        )
+        self.renderer.set_sprite(payload)
+
+    def _handle_sprite_stop(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:  # pylint: disable=unused-argument
+        """Clear the sprite overlay. Content underneath is untouched."""
+        _log("sprite_stop_command")
+        self.renderer.set_sprite(None)
 
     def on_close(self, ws, close_status_code, close_msg) -> None:  # pylint: disable=unused-argument
         _log("websocket_closed", code=close_status_code, message=close_msg)

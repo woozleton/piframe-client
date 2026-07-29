@@ -69,6 +69,7 @@ The client currently handles these server-side commands:
 - `update_self` (see Self-update below)
 - `webview_open` (optional `url` field; see [Remote Control](#remote-control-vnc))
 - `webview_close`
+- `sprite_show` / `sprite_stop` (mural sprite overlay; see [below](#sprite-overlay-mural-road-b))
 
 Single-video note:
 
@@ -170,6 +171,63 @@ heartbeat (the manager's schedule / companion guards key on it). Requires
 NTP-synced clocks, exactly like the clock-synced slideshow above. The
 server-side model is documented in the manager repo at
 `docs/plans/mural.md`.
+
+### Sprite overlay (mural Road B)
+
+Chromium's `<video>` path on these Pis presents at ~3fps regardless of
+codec, resolution or frame rate, while the same kiosk composites
+canvas/rAF content at ~40fps. So the mural creature can also cross the
+frames as a **sprite drawn inside the kiosk page**, over whatever is
+already on screen:
+
+```json
+{ "cmd": "sprite_show",
+  "params": { "epoch": 1785300000.0,
+              "world":  { "w": 3904, "h": 1080 },
+              "window": { "x": 0, "y": 0, "w": 608, "h": 1080 },
+              "motion": { "mode": "sweep", "sweep_s": 20,
+                          "y_period_s": 15, "y_amp_frac": 0.3 },
+              "sprite": { "kind": "circle", "size": 120,
+                          "color": "#ffc03c" } } }
+
+{ "cmd": "sprite_stop", "params": {} }
+```
+
+- `world` - the shared world (master-video pixel space) every screen
+  shares; `window` - this screen's rectangle inside it. Both come from
+  the manager's `data/mural/layout.json`
+- `motion` - `sweep` is the only mode: a full horizontal crossing every
+  `sweep_s` seconds plus a vertical sine of period `y_period_s` and
+  amplitude `y_amp_frac * world.h`
+- `sprite.size` is in WORLD units and is scaled like any other world
+  length; `color` must be `#rrggbb`
+- `epoch` is informational - the motion is pure `mod(t)` against the wall
+  clock, so a screen that joins late is instantly in phase
+
+Every animation frame the kiosk computes
+
+```
+worldX = mod(t / sweep_s, 1) * (world.w + size) - size
+worldY = (world.h - size) / 2 + world.h * y_amp_frac * sin(2*PI*t / y_period_s)
+```
+
+maps it with `scaleX = viewportWidth / window.w`,
+`scaleY = viewportHeight / window.h`, moves the element with
+`translate3d` (compositor path, no layout), and hides it while it does
+not intersect this screen's window.
+
+**Overlay semantics:** `sprite_show` does NOT interrupt playback. It
+touches no playback state at all - `playback_state`, the current video /
+slideshow and both clock-sync descriptors are left alone, so a slideshow
+keeps flipping underneath and the manager's schedule / companion guards
+see no change. The overlay also survives content changes and re-renders:
+it lives on its own `sprite` key in the browser state file, outside the
+renderer's re-render signature. Only `sprite_stop` clears it. A
+malformed command is dropped (logged as `sprite_show_invalid` with a
+reason) and nothing on screen changes.
+
+Requires NTP-synced clocks, like every other clock-driven mode here. The
+server-side model lives in the manager repo at `docs/plans/mural.md`.
 
 ## Display Features
 

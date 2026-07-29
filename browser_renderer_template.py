@@ -414,6 +414,32 @@ def render_browser_html(
       opacity: 1;
       transform: translate(-50%, 0);
     }}
+    /* Mural sprite overlay (Road B). One compositor-friendly box moved
+       by translate3d from a rAF loop; nothing else about the page
+       changes while it runs.
+       Stacking: z-index 30 puts it ABOVE the media stages (z auto,
+       inside .frame) and above the audio-visualizer layer (z 4), but
+       BELOW the banner (40) and the OSD (45) so an error banner or a
+       volume pop is never hidden by a passing creature. It sits outside
+       .frame so its z-index competes in the root stacking context with
+       those two - .frame itself is z auto, so the sprite always wins
+       against everything inside it.
+       visibility (not display) is used for the off-window state: it
+       keeps the layer promoted and costs no layout. */
+    .sprite {{
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 0;
+      height: 0;
+      border-radius: 50%;
+      background: transparent;
+      pointer-events: none;
+      visibility: hidden;
+      will-change: transform;
+      transform: translate3d(0, 0, 0);
+      z-index: 30;
+    }}
   </style>
 </head>
 <body>
@@ -449,6 +475,10 @@ def render_browser_html(
       <div id="audioVisTrackName" class="audio-vis__track-name" aria-hidden="true"></div>
     </div>
   </div>
+  <!-- Mural sprite overlay (Road B): a single box driven by the shared
+       wall clock, drawn over whatever the stages are showing. Outside
+       .frame so it stacks against the banner / OSD directly. -->
+  <div id="sprite" class="sprite" aria-hidden="true"></div>
   <div id="banner" class="banner"></div>
   <div id="osd" class="osd">
     <div class="osd-head">
@@ -2133,6 +2163,158 @@ def render_browser_html(
       startVideoSync();
     }}
 
+    /* ================================================================
+       Mural sprite overlay (Road B) - state.sprite.
+       ----------------------------------------------------------------
+       An INDEPENDENT layer over whatever the stages are showing: it
+       never touches items / mode / either clock-sync path, and it is not
+       part of the render signature in pollState, so slideshow flips and
+       content changes leave it running untouched.
+
+       Every screen knows the shared world size, its own window rect in
+       that world, and a parametric motion, and derives the sprite's
+       world position from the NTP wall clock on every animation frame:
+
+         worldX(t) = mod(t / sweep_s, 1) * (world.w + size) - size
+         worldY(t) = (world.h - size) / 2
+                     + world.h * y_amp_frac * sin(2 * PI * t / y_period_s)
+
+       (both are the ball path from scripts/mural/make_test_master.py, so
+       sprite runs and pre-rendered masters describe the same motion.)
+       World lengths map to screen pixels with scaleX = vw / window.w,
+       scaleY = vh / window.h, and the box is hidden whenever it does not
+       intersect this screen's window. No screen ever talks to another -
+       the wall clock is the only shared state, exactly like the
+       clock-synced slideshow.
+
+       Coordinates are plain viewport pixels: rotation is applied at the
+       compositor (BROWSER_ROTATION_DEGREES = 0), so the viewport already
+       is the physical, upright screen. If CSS rotation is ever
+       reintroduced, this mapping needs the same rotate() the media
+       elements get.
+
+       Cheapness: the loop writes only `transform` (compositor path) and
+       `visibility`, and only when the value actually changed; while the
+       sprite is off-window it does no DOM writes at all. Config is read
+       from the LIVE polled state every frame, so a re-send with new
+       parameters converges with no re-render and no restart.
+       ================================================================ */
+    const spriteEl = document.getElementById("sprite");
+    let spriteRafHandle = null;
+    let spriteViewportW = window.innerWidth;
+    let spriteViewportH = window.innerHeight;
+    let spriteLastVisible = null;
+    let spriteLastBoxKey = "";
+
+    function spriteMod(x, m) {{
+      return ((x % m) + m) % m;
+    }}
+
+    function spriteNum(value) {{
+      const n = Number(value);
+      return isFinite(n) ? n : NaN;
+    }}
+
+    function spriteConfigValid(sp) {{
+      if (!sp || typeof sp !== "object") return false;
+      const world = sp.world;
+      const win = sp.window;
+      const motion = sp.motion;
+      const box = sp.sprite;
+      if (!world || !win || !motion || !box) return false;
+      // NaN fails every comparison, so these cover missing / junk values.
+      if (!(spriteNum(world.w) > 0) || !(spriteNum(world.h) > 0)) return false;
+      if (!isFinite(spriteNum(win.x)) || !isFinite(spriteNum(win.y))) return false;
+      if (!(spriteNum(win.w) > 0) || !(spriteNum(win.h) > 0)) return false;
+      if (motion.mode !== "sweep") return false;
+      if (!(spriteNum(motion.sweep_s) > 0)) return false;
+      if (!(spriteNum(motion.y_period_s) > 0)) return false;
+      if (box.kind !== "circle") return false;
+      if (!(spriteNum(box.size) > 0)) return false;
+      if (typeof box.color !== "string" || !box.color) return false;
+      return true;
+    }}
+
+    function spriteSetVisible(visible) {{
+      const flag = !!visible;
+      if (flag === spriteLastVisible) return;
+      spriteLastVisible = flag;
+      spriteEl.style.visibility = flag ? "visible" : "hidden";
+    }}
+
+    function spriteRunning() {{
+      return spriteRafHandle !== null;
+    }}
+
+    function spriteFrame() {{
+      // Re-arm first so every early return keeps the loop alive; only
+      // stopSprite() ever cancels it.
+      spriteRafHandle = window.requestAnimationFrame(spriteFrame);
+      const sp = activeState && activeState.sprite;
+      if (!spriteConfigValid(sp)) {{
+        spriteSetVisible(false);
+        return;
+      }}
+      const world = sp.world;
+      const win = sp.window;
+      const motion = sp.motion;
+      const size = Number(sp.sprite.size);
+      const worldW = Number(world.w);
+      const worldH = Number(world.h);
+      const t = Date.now() / 1000;
+      const worldX = spriteMod(t / Number(motion.sweep_s), 1) * (worldW + size) - size;
+      const ampRaw = Number(motion.y_amp_frac);
+      const amp = isFinite(ampRaw) ? ampRaw : 0;
+      const worldY =
+        (worldH - size) / 2 +
+        worldH * amp * Math.sin((2 * Math.PI * t) / Number(motion.y_period_s));
+      const scaleX = spriteViewportW / Number(win.w);
+      const scaleY = spriteViewportH / Number(win.h);
+      const boxW = size * scaleX;
+      const boxH = size * scaleY;
+      const x = (worldX - Number(win.x)) * scaleX;
+      const y = (worldY - Number(win.y)) * scaleY;
+      const intersects =
+        x + boxW > 0 && x < spriteViewportW && y + boxH > 0 && y < spriteViewportH;
+      if (!intersects) {{
+        // Off this screen's window: hide once, write nothing else.
+        spriteSetVisible(false);
+        return;
+      }}
+      const boxKey = boxW.toFixed(1) + "x" + boxH.toFixed(1) + "|" + sp.sprite.color;
+      if (boxKey !== spriteLastBoxKey) {{
+        spriteLastBoxKey = boxKey;
+        spriteEl.style.width = boxW.toFixed(1) + "px";
+        spriteEl.style.height = boxH.toFixed(1) + "px";
+        spriteEl.style.background = sp.sprite.color;
+      }}
+      spriteEl.style.transform =
+        "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)";
+      spriteSetVisible(true);
+    }}
+
+    function startSprite() {{
+      // Idempotent: a re-send must never stack a second rAF loop.
+      if (spriteRafHandle !== null) return;
+      spriteViewportW = window.innerWidth;
+      spriteViewportH = window.innerHeight;
+      spriteRafHandle = window.requestAnimationFrame(spriteFrame);
+    }}
+
+    function stopSprite() {{
+      if (spriteRafHandle !== null) {{
+        window.cancelAnimationFrame(spriteRafHandle);
+        spriteRafHandle = null;
+      }}
+      spriteLastBoxKey = "";
+      spriteSetVisible(false);
+    }}
+
+    window.addEventListener("resize", () => {{
+      spriteViewportW = window.innerWidth;
+      spriteViewportH = window.innerHeight;
+    }}, {{ passive: true }});
+
     function applyControl(control) {{
       if (!control) {{
         return;
@@ -2244,6 +2426,17 @@ def render_browser_html(
           applyControl(state.control);
         }}
         activeState = state;
+        // Sprite overlay: deliberately NOT part of the signature above,
+        // so it never triggers a re-render and a re-render never
+        // disturbs it. Only the appeared / disappeared edges need
+        // handling here - a changed config is picked up by the rAF loop
+        // itself, which reads activeState.sprite every frame.
+        const spriteWanted = spriteConfigValid(state.sprite);
+        if (spriteWanted && !spriteRunning()) {{
+          startSprite();
+        }} else if (!spriteWanted && spriteRunning()) {{
+          stopSprite();
+        }}
         applyLiveAudioState(state);
         applyCompanionState(state);
         // Per-playlist visualizer pick lives on the state file. Apply
