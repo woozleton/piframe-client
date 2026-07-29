@@ -668,6 +668,12 @@ What it does:
 - enables user lingering via `loginctl enable-linger` so
   `/run/user/<uid>` exists at boot for cage / Chromium's Wayland
   socket
+- points `systemd-timesyncd` at the manager's LAN NTP server
+  (default `192.168.100.100`; override with `PIFRAME_NTP_SERVER=<ip>`,
+  or set it empty to skip). The mural's cross-screen sync needs every
+  frame to agree with the MANAGER's clock - it is the show's clock
+  authority - and LAN sync holds offsets near 1ms vs internet NTP's
+  5-50ms
 - enables and restarts both services
 
 Audio mixer (one-time, recommended):
