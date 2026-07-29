@@ -523,6 +523,7 @@ def render_browser_html(
     // wall-clock playhead. Distinct from the slideshow syncTimeoutHandle
     // above so the two clock modes never fight over the same element.
     let videoSyncHandle = null;
+    let videoSyncLastSeekMs = 0;
     let activeStageIndex = 0;
     let pendingAdvanceToken = 0;
     let osdTimer = null;
@@ -1764,6 +1765,14 @@ def render_browser_html(
       // Preserve a sticky error across benign re-renders (banner change,
       // volume change, etc.) — it'll only clear via user action or
       // genuinely new content above.
+      // A mural start is an explicit operator action - always retry the
+      // src even if an earlier attempt got it stall-flagged (e.g. the
+      // discipline loop destabilized a cold decoder before the seek
+      // cooldown existed).
+      if (videoSyncConfigValid(state) && state.items && state.items[0]) {{
+        failedSrcs.delete(state.items[0].src);
+        failedSrcReasons.delete(state.items[0].src);
+      }}
       const startingOnFailedVideo =
         state.items && state.items.length === 1 &&
         state.items[0].kind === "video" &&
@@ -2046,8 +2055,22 @@ def render_browser_html(
       }} else if (absErr <= 0.5) {{
         video.playbackRate = 1 + videoSyncClamp(0.25 * err, -0.03, 0.03);
       }} else {{
-        video.currentTime = Math.min(target, D - 0.05);
-        video.playbackRate = 1.0;
+        // Hard seek - but gently. The Pi 5 software-decodes H.264, so a
+        // currentTime seek takes real time to settle; seeking again every
+        // 500ms tick while it settles starves playback entirely (seek
+        // storm), which trips the kiosk stall watchdog and gets the src
+        // flagged as failed. Seek only once the decoder is warm
+        // (readyState >= 3) and at most once per 3s; between allowed
+        // seeks hold the max nudge so the playhead still creeps the
+        // right way and the watchdog sees progress.
+        const nowMs = Date.now();
+        if (video.readyState >= 3 && nowMs - videoSyncLastSeekMs >= 3000) {{
+          videoSyncLastSeekMs = nowMs;
+          video.currentTime = Math.min(target, D - 0.05);
+          video.playbackRate = 1.0;
+        }} else {{
+          video.playbackRate = 1 + videoSyncClamp(err, -0.03, 0.03);
+        }}
       }}
     }}
 
@@ -2065,6 +2088,7 @@ def render_browser_html(
         window.clearInterval(videoSyncHandle);
         videoSyncHandle = null;
       }}
+      videoSyncLastSeekMs = 0;
       // Reset the rate on BOTH stages so a video that left mural mid-nudge
       // (or its cross-fade partner) never keeps a fractional playbackRate.
       for (const stage of stages) {{
