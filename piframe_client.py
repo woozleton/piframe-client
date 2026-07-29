@@ -63,6 +63,15 @@ OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "
 # distances.
 OUTPUT_MODE = os.environ.get("PIFRAME_OUTPUT_MODE", "").strip()
 BROWSER_ROTATION_DEGREES = 0
+# Kiosk vsync policy. Default (unset/0): vsync ON so rAF locks to the
+# panel's refresh - the mural sprite overlay and any UI motion get even
+# 60Hz frame pacing. Set to 1 to restore the historical unbounded-fps
+# behavior (--disable-frame-rate-limit + --disable-gpu-vsync), which
+# lets Butterchurn render past its ~40fps-under-vsync budget at the
+# cost of irregular presentation pacing for everything else.
+UNBOUNDED_FPS = os.environ.get("PIFRAME_UNBOUNDED_FPS", "").strip().lower() in (
+    "1", "true", "yes"
+)
 # Bundled Chromium extension that forces video sites off AV1.
 # Loaded only in webview mode (kiosk renderer's content is from
 # the NAS and never AV1, so kiosk mode runs without it). The Pi 5
@@ -939,12 +948,18 @@ class BrowserController:
                 chromium_args.append(f"--load-extension={H264IFY_EXTENSION_DIR}")
             chromium_args.append(self._webview_url or "about:blank")
         else:
-            # Kiosk mode: drop frame-rate ceiling and vsync so the
-            # Butterchurn audio visualizer can render at unbounded
-            # fps. cage+wayland's vsync caps the visualizer at ~40fps
-            # otherwise, masking the actual GPU budget.
-            chromium_args.append("--disable-frame-rate-limit")
-            chromium_args.append("--disable-gpu-vsync")
+            # Kiosk mode. Vsync stays ON by default so rAF is locked to
+            # the panel's 60Hz - the mural sprite overlay needs even
+            # frame pacing, and with vsync disabled rAF free-runs and
+            # presents unevenly. The historical unbounded-fps flags
+            # (kept behind PIFRAME_UNBOUNDED_FPS=1) let Butterchurn
+            # render past the ~40fps it manages under vsync, but that
+            # cap is Butterchurn's own frame cost missing vsync
+            # deadlines - cheap content like the sprite hits a clean 60
+            # with vsync on.
+            if UNBOUNDED_FPS:
+                chromium_args.append("--disable-frame-rate-limit")
+                chromium_args.append("--disable-gpu-vsync")
             chromium_args.append("--kiosk")
             chromium_args.append(BROWSER_HTML_FILE.as_uri())
         wlrctl_path = shutil.which(WLRCTL_BIN)
