@@ -454,6 +454,29 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
+# ----------------------------------------------------------------
+# Point systemd-timesyncd at the woozlescape server's LAN NTP.
+# The mural's cross-screen sync needs the fleet to agree with the
+# SERVER's clock (the show's clock master), not with true UTC -
+# LAN sync gets offsets into the ~1ms range vs internet NTP's
+# 5-50ms. Idempotent: rewrites any existing NTP= line (commented
+# or not); override the server with PIFRAME_NTP_SERVER, or set it
+# empty to skip.
+# ----------------------------------------------------------------
+NTP_SERVER="${PIFRAME_NTP_SERVER-192.168.100.100}"
+if [[ -n "${NTP_SERVER}" && -f /etc/systemd/timesyncd.conf ]]; then
+  if ! grep -qE '^\[Time\]' /etc/systemd/timesyncd.conf; then
+    printf '\n[Time]\n' >> /etc/systemd/timesyncd.conf
+  fi
+  if grep -qE '^#?NTP=' /etc/systemd/timesyncd.conf; then
+    sed -i "s|^#\?NTP=.*|NTP=${NTP_SERVER}|" /etc/systemd/timesyncd.conf
+  else
+    sed -i "s|^\[Time\]|[Time]\nNTP=${NTP_SERVER}|" /etc/systemd/timesyncd.conf
+  fi
+  systemctl restart systemd-timesyncd 2>/dev/null || true
+  echo "NTP: systemd-timesyncd -> ${NTP_SERVER}"
+fi
+
 systemctl daemon-reload
 systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"

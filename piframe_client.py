@@ -2752,8 +2752,20 @@ class PiFrameClient:
         # epoch is informational - the motion is pure mod(t) against the
         # wall clock - so a missing/odd value defaults instead of failing.
         epoch = _finite_number(params.get("epoch"))
+
+        # latency_ms is a soft field, exactly like the sync_video path's:
+        # a missing / bool / non-finite value degrades to 0 (no
+        # compensation) rather than dropping the overlay. A POSITIVE value
+        # makes this screen render the sprite FURTHER ALONG its path,
+        # compensating a display that presents late.
+        # (_finite_number rejects bool as well as junk, so both land on 0.)
+        latency_ms = _finite_number(params.get("latency_ms"))
+        if latency_ms is None:
+            latency_ms = 0.0
+
         return {
             "epoch": epoch if epoch is not None else 0.0,
+            "latency_ms": latency_ms,
             "world": {"w": world_w, "h": world_h},
             "window": {"x": win_x, "y": win_y, "w": win_w, "h": win_h},
             "motion": {
@@ -2812,6 +2824,7 @@ class PiFrameClient:
             sweep_s=payload["motion"]["sweep_s"],
             y_period_s=payload["motion"]["y_period_s"],
             y_amp_frac=payload["motion"]["y_amp_frac"],
+            latency_ms=payload["latency_ms"],
             **box_fields,
         )
         self.renderer.set_sprite(payload)

@@ -2187,6 +2187,9 @@ def render_browser_html(
 
        (both are the ball path from scripts/mural/make_test_master.py, so
        sprite runs and pre-rendered masters describe the same motion.)
+       t is the wall clock plus this surface's optional latency_ms/1000,
+       so a POSITIVE latency renders the sprite FURTHER ALONG its path -
+       the compensation for a display that presents late.
        World lengths map to screen pixels with scaleX = vw / window.w,
        scaleY = vh / window.h, and the box is hidden whenever it does not
        intersect this screen's window. No screen ever talks to another -
@@ -2304,7 +2307,14 @@ def render_browser_html(
       const spriteH = isImage ? Number(box.h) : Number(box.size);
       const worldW = Number(world.w);
       const worldH = Number(world.h);
-      const t = Date.now() / 1000;
+      // Per-surface display-lag compensation, read LIVE every frame like
+      // every other sprite parameter: a POSITIVE latency_ms renders the
+      // sprite FURTHER ALONG its path, compensating a display that
+      // presents late. Missing / junk (an older manager, which never sends
+      // it) degrades to 0 - uncompensated, never broken.
+      const spriteLatencyRaw = Number(sp.latency_ms);
+      const spriteLatency = isFinite(spriteLatencyRaw) ? spriteLatencyRaw : 0;
+      const t = Date.now() / 1000 + spriteLatency / 1000;
       const worldX =
         spriteMod(t / Number(motion.sweep_s), 1) * (worldW + spriteW) - spriteW;
       const ampRaw = Number(motion.y_amp_frac);

@@ -188,7 +188,8 @@ already on screen:
               "motion": { "mode": "sweep", "sweep_s": 20,
                           "y_period_s": 15, "y_amp_frac": 0.3 },
               "sprite": { "kind": "circle", "size": 120,
-                          "color": "#ffc03c" } } }
+                          "color": "#ffc03c" },
+              "latency_ms": 0 } }
 
 { "cmd": "sprite_stop", "params": {} }
 ```
@@ -203,6 +204,14 @@ already on screen:
   length; `color` must be `#rrggbb`
 - `epoch` is informational - the motion is pure `mod(t)` against the wall
   clock, so a screen that joins late is instantly in phase
+- `latency_ms` - per-screen display-lag compensation (either sign,
+  optional, default `0`), the same knob the `sync_video` path takes. The
+  sprite position is evaluated at `Date.now()/1000 + latency_ms/1000`, so
+  a POSITIVE value renders the sprite FURTHER ALONG its path -
+  compensating a display that presents late. It is read live every frame,
+  so a re-sent `sprite_show` retimes the screen with no restart; a
+  missing or malformed value degrades to `0` (uncompensated) rather than
+  dropping the command
 
 **Sprite kinds.** `circle` is the built-in primitive above. `image`
 paints a media file instead, with independent world width / height:
@@ -235,6 +244,7 @@ sprite's world dimensions - `w` / `h` for an image, `size` for both on a
 circle)
 
 ```
+t      = Date.now()/1000 + latency_ms/1000
 worldX = mod(t / sweep_s, 1) * (world.w + spriteW) - spriteW
 worldY = (world.h - spriteH) / 2 + world.h * y_amp_frac * sin(2*PI*t / y_period_s)
 ```
