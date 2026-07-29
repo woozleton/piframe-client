@@ -517,6 +517,12 @@ def render_browser_html(
     // different image (a lap row-swap or a manual next/prev "peek" can
     // otherwise leave the wrong one showing).
     let lastPaintedSrc = null;
+    // Mural (clock-slaved single video, sync.mode === "clock_video").
+    // Owns a 500ms discipline interval that nudges the active <video>'s
+    // playbackRate (or hard-seeks on gross drift) toward the shared
+    // wall-clock playhead. Distinct from the slideshow syncTimeoutHandle
+    // above so the two clock modes never fight over the same element.
+    let videoSyncHandle = null;
     let activeStageIndex = 0;
     let pendingAdvanceToken = 0;
     let osdTimer = null;
@@ -1766,6 +1772,9 @@ def render_browser_html(
         hideOsd();
       }}
       stopTimers();
+      // Any hard state application drops a prior mural discipline; the
+      // mural branch below re-arms it when the new state is clock_video.
+      stopVideoSync();
       if (!state.items || !state.items.length) {{
         showIdle(state.idle_item);
         notifyPauseState(false);
@@ -1794,9 +1803,19 @@ def render_browser_html(
           notifyPauseState(false);
           return;
         }}
-        logSyncFallback(state);
+        // A clock_video (mural) sync is disciplined below after the single
+        // video renders - it isn't a slideshow fallback, so don't log one.
+        // Anything else that failed slideshow validation still falls
+        // through to the free-running path and is logged once.
+        if (!videoSyncConfigValid(state)) {{
+          logSyncFallback(state);
+        }}
       }}
       renderItem(state.items[activeIndex], state, perItemSeconds);
+      // Mural: arm the clock discipline once the <video> element exists.
+      if (videoSyncConfigValid(state)) {{
+        startVideoSync();
+      }}
       notifySlideChange(activeIndex);
       notifyPauseState(false);
     }}
@@ -1944,6 +1963,128 @@ def render_browser_html(
       }} catch (_) {{ /* ignore */ }}
     }}
 
+    /* ================================================================
+       Mural: clock-slaved single video (state.sync.mode === "clock_video").
+       ----------------------------------------------------------------
+       Separate from the slideshow clock-sync above (own timer, own
+       guards - the two never share state). One looping video per screen;
+       every screen disciplines its own <video> playhead toward the
+       shared NTP wall clock so pre-cropped views of one master play in
+       lockstep. No start coordination and no waiting for epoch: a late
+       or stalled start converges within ~1-2s.
+
+         target = ((now - epoch + latency) mod duration)
+         err    = ((target - playhead + D/2) mod D) - D/2   // loop-seam safe
+         |err| <= 0.04s : rate 1.0             (deadband)
+         |err| <= 0.5s  : rate 1 +/- <=3%      (invisible nudge)
+         |err|  > 0.5s  : hard seek to target  (rare - join / gross stall)
+
+       The tick reads epoch/duration/latency from the LIVE activeState on
+       every pass, so a re-dispatch with a new epoch converges without a
+       re-render (pollState soft-swaps the state in place; .src is never
+       touched). Muted like every other kiosk video; the loop wrap is
+       seam-free because the modular math spans the boundary.
+       ================================================================ */
+    function videoSyncMod(x, m) {{
+      return ((x % m) + m) % m;
+    }}
+
+    function videoSyncClamp(v, lo, hi) {{
+      return Math.max(lo, Math.min(hi, v));
+    }}
+
+    function videoSyncConfigValid(state) {{
+      const s = state && state.sync;
+      if (!s || s.mode !== "clock_video") return false;
+      if (state.mode !== "single") return false;
+      const items = state.items;
+      if (!Array.isArray(items) || items.length !== 1) return false;
+      const item = items[0];
+      if (!item || item.kind !== "video") return false;
+      const duration = Number(s.duration);
+      if (!isFinite(duration) || duration <= 0) return false;
+      const epoch = Number(s.epoch);
+      if (!isFinite(epoch) || epoch <= 0) return false;
+      return true;
+    }}
+
+    function videoSyncActive() {{
+      return videoSyncConfigValid(activeState);
+    }}
+
+    function sameSingleVideoSrc(a, b) {{
+      const as = a && a.items && a.items[0] && a.items[0].src;
+      const bs = b && b.items && b.items[0] && b.items[0].src;
+      return !!as && as === bs;
+    }}
+
+    function videoSyncTick() {{
+      // Discipline only a valid, on-screen, playing, metadata-loaded
+      // video; any failed guard no-ops this pass (the interval keeps
+      // running and converges once the condition clears). An operator
+      // pause leaves video.paused true -> no-op -> resume converges for
+      // free. Numbers are read from the LIVE activeState every tick.
+      if (!videoSyncActive()) return;
+      const stage = getActiveStage();
+      const video = stage && stage.video;
+      if (!video) return;
+      if (video.style.display !== "block") return;
+      if (video.paused) return;
+      if (video.readyState < 1) return;
+      const s = activeState.sync;
+      const D = Number(s.duration);
+      if (!isFinite(D) || D <= 0) return;
+      const epoch = Number(s.epoch);
+      const latencyRaw = Number(s.latency_ms);
+      const latency = isFinite(latencyRaw) ? latencyRaw : 0;
+      const nowS = Date.now() / 1000;
+      const target = videoSyncMod(nowS - epoch + latency / 1000, D);
+      const err = videoSyncMod(target - video.currentTime + D / 2, D) - D / 2;
+      const absErr = Math.abs(err);
+      if (absErr <= 0.04) {{
+        video.playbackRate = 1.0;
+      }} else if (absErr <= 0.5) {{
+        video.playbackRate = 1 + videoSyncClamp(0.25 * err, -0.03, 0.03);
+      }} else {{
+        video.currentTime = Math.min(target, D - 0.05);
+        video.playbackRate = 1.0;
+      }}
+    }}
+
+    function startVideoSync() {{
+      // Idempotent: a re-dispatch (new epoch, same video) must not stack
+      // intervals. One immediate pass starts convergence without waiting
+      // the first 500ms (no-ops if the video isn't ready yet).
+      if (videoSyncHandle !== null) return;
+      videoSyncHandle = window.setInterval(videoSyncTick, 500);
+      videoSyncTick();
+    }}
+
+    function stopVideoSync() {{
+      if (videoSyncHandle !== null) {{
+        window.clearInterval(videoSyncHandle);
+        videoSyncHandle = null;
+      }}
+      // Reset the rate on BOTH stages so a video that left mural mid-nudge
+      // (or its cross-fade partner) never keeps a fractional playbackRate.
+      for (const stage of stages) {{
+        try {{ if (stage.video) stage.video.playbackRate = 1.0; }} catch (_) {{}}
+      }}
+    }}
+
+    function softSwapVideoSync(state) {{
+      // Mural re-dispatch: same video src, new epoch/duration/latency.
+      // Swap the live state so videoSyncTick reads the new numbers next
+      // pass; never touch <video>.src - a reload would reset the playhead
+      // and defeat the clock-slave. Discipline stays armed (idempotent).
+      activeState = state;
+      showBanner(
+        state.banner ? state.banner.message : "",
+        state.banner ? state.banner.level : "warning"
+      );
+      startVideoSync();
+    }}
+
     function applyControl(control) {{
       if (!control) {{
         return;
@@ -2036,6 +2177,17 @@ def render_browser_html(
             prevState.sync.length === state.sync.length
           ) {{
             softSwapSyncRow(state);
+          }} else if (
+            videoSyncConfigValid(state) &&
+            videoSyncConfigValid(prevState) &&
+            sameSingleVideoSrc(prevState, state)
+          ) {{
+            // Mural re-dispatch (new epoch, same video): update the live
+            // numbers in place so the playhead never resets - the
+            // discipline tick reads the new epoch/duration/latency on its
+            // next pass. Re-rendering would reload the <video> and defeat
+            // the clock-slave.
+            softSwapVideoSync(state);
           }} else {{
             startFromState(state);
           }}

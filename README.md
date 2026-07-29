@@ -57,6 +57,7 @@ round-trip instead of the periodic 2-second backstop.
 The client currently handles these server-side commands:
 
 - `play`
+- `sync_video` (mural / clock-synced video; see [below](#mural--clock-synced-video))
 - `video_playlist`
 - `audio_playlist` (direct audio + companion mode via `is_companion: true`)
 - `slideshow`
@@ -120,6 +121,55 @@ Requires NTP-synced clocks (standard Raspberry Pi OS setup). The
 server-side model (timetable generation, dedup registry, degradation
 ladder) is documented in the manager repo at
 `docs/subsystems/display-sync.md`.
+
+## Mural / Clock-Synced Video
+
+The `sync_video` command plays one looping video slaved to the same NTP
+wall clock the slideshow timetable uses, so several screens can each show
+a pre-cropped view of a single master video in lockstep (a creature
+crosses seamlessly from one screen to the next). It is a sibling of
+`play`, not a slideshow mode - the two clock paths are deliberately kept
+separate (`sync.mode == "clock_video"` here vs `"clock"` for slideshows).
+
+```json
+{ "cmd": "sync_video",
+  "params": { "url": "/mnt/nas/_mural/test/frame-livingroom-left.mp4",
+              "duration": 60.0, "epoch": 1785300000.0,
+              "latency_ms": 0, "show": "test" } }
+```
+
+- `url` - the per-surface video (normalized like `play`); always looped
+- `duration` - master video length in seconds (must equal the file's)
+- `epoch` - wall-clock UNIX epoch (float) the show "started"; may be in
+  the past and is never waited on
+- `latency_ms` - per-screen display-lag compensation (either sign,
+  default `0`)
+- `show` - display name; labels the surface as `Mural: <show>`
+
+Every 500ms the kiosk disciplines the active `<video>` toward
+`target = ((now - epoch + latency_ms / 1000) mod duration)`:
+
+- `|err| <= 0.04s`: playback rate `1.0` (deadband)
+- `0.04 < |err| <= 0.5s`: rate nudged within +-3% (invisible)
+- `|err| > 0.5s`: hard seek to `target` (rare - only at join or after a
+  gross stall)
+
+`err` is measured loop-seam-safe, so the wrap at the loop point never
+triggers a spurious seek. There is no start coordination: a screen that
+joins late or stalls converges onto the shared clock within ~1-2s, and a
+dropped frame never accumulates error. A re-dispatch with a new `epoch`
+converges without re-loading the video. An operator `pause` freezes the
+video and the discipline no-ops; resume converges for free. A malformed
+command (bad `duration`/`epoch`/`url`) is dropped (logged as
+`sync_video_invalid`) and playback is left untouched. Any other playback
+command (`play`, `slideshow`, `stop`, `webview_open`, ...) exits mural
+mode.
+
+While mural is active the client reports `playback_state: "mural"` in its
+heartbeat (the manager's schedule / companion guards key on it). Requires
+NTP-synced clocks, exactly like the clock-synced slideshow above. The
+server-side model is documented in the manager repo at
+`docs/plans/mural.md`.
 
 ## Display Features
 

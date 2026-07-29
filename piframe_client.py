@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import shlex
@@ -1292,7 +1293,18 @@ class BrowserController:
         self.last_command = f"browser idle {resolved or '(blank)'}"
         return True
 
-    def play_single_video(self, url: str, *, loop: bool = True) -> bool:
+    def play_single_video(
+        self,
+        url: str,
+        *,
+        loop: bool = True,
+        sync: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        # sync is the additive clock descriptor. None for an ordinary
+        # single video; a {"mode": "clock_video", ...} dict for a mural
+        # (clock-slaved) video, threaded through to the browser state the
+        # same way play_slideshow threads its slideshow sync. mode stays
+        # "single" either way.
         if not self._set_items_state(
             mode="single",
             playlist_name="Single Video",
@@ -1302,6 +1314,7 @@ class BrowserController:
             loop=loop,
             shuffle=False,
             idle_media=self._pick_existing_idle_media(_default_idle_media()),
+            sync=sync,
         ):
             return False
         self.slideshow_active = False
@@ -1833,6 +1846,13 @@ class PiFrameClient:
         # playlist, freshly shuffled row) is recognized and treated as
         # continuous instead of an ad-hoc restart.
         self.current_sync: Optional[Dict[str, Any]] = None
+        # Mural (clock-slaved single video) descriptor
+        # ({"mode": "clock_video", "epoch": s, "duration": s,
+        # "latency_ms": n}) or None. Set by _handle_sync_video, cleared
+        # everywhere current_sync is cleared so any other content command
+        # exits mural mode. Distinct from current_sync (the slideshow
+        # clock descriptor) so the two routers never collide.
+        self.current_video_sync: Optional[Dict[str, Any]] = None
         # Wall-clock timestamp (epoch seconds, float) when the current
         # slideshow started rotating. Manager UI uses this + current_interval
         # to project which slide is on screen right now without needing the
@@ -1936,6 +1956,7 @@ class PiFrameClient:
         cmd = (data.get("cmd") or data.get("type") or "").strip()
         handler = {
             "play": self._handle_play,
+            "sync_video": self._handle_sync_video,
             "video_playlist": self._handle_video_playlist,
             "audio_playlist": self._handle_audio_playlist,
             "pause": self._handle_pause,
@@ -1985,8 +2006,116 @@ class PiFrameClient:
         )
         self.current_video = url
         self.current_slideshow = []
+        # A plain single video replaces any mural in progress. current_sync
+        # (slideshow) is left as the slideshow paths manage it; current_video_sync
+        # is cleared so the mural mirror never latches past this content command.
+        self.current_video_sync = None
         self.playback_state = "playing"
         if self.renderer.play_single_video(url, loop=loop_flag):
+            self._send_render_command()
+
+    @staticmethod
+    def _extract_video_sync(
+        url: Optional[str],
+        duration: Any,
+        epoch: Any,
+        latency_ms: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Return a shape-valid clock_video (mural) sync descriptor or None.
+
+        Mirrors _extract_sync's defensive style for the `sync_video`
+        command. The browser discipline loop needs a positive-finite
+        duration + epoch; latency_ms is optional and defaults to 0. bool
+        is rejected wherever a number is required (bool is an int
+        subclass, so a bare guard would let True/False through). A
+        malformed set logs `sync_video_invalid` with the precise reason
+        and returns None so the caller leaves playback untouched - the
+        kiosk never enters a half-configured mural state."""
+        if not url:
+            _log("sync_video_invalid", reason="url")
+            return None
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not math.isfinite(duration)
+            or duration <= 0
+        ):
+            _log("sync_video_invalid", reason="duration", duration=str(duration))
+            return None
+        if (
+            isinstance(epoch, bool)
+            or not isinstance(epoch, (int, float))
+            or not math.isfinite(epoch)
+            or epoch <= 0
+        ):
+            _log("sync_video_invalid", reason="epoch", epoch=str(epoch))
+            return None
+        # latency_ms is a soft field: a missing / bool / non-finite value
+        # is treated as the documented default (0), never a hard reject -
+        # a latency typo must not stop the whole show.
+        if (
+            isinstance(latency_ms, bool)
+            or not isinstance(latency_ms, (int, float))
+            or not math.isfinite(latency_ms)
+        ):
+            latency = 0.0
+        else:
+            latency = float(latency_ms)
+        return {
+            "mode": "clock_video",
+            "epoch": float(epoch),
+            "duration": float(duration),
+            "latency_ms": latency,
+        }
+
+    def _handle_sync_video(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:
+        """Mural: one looping video slaved to the shared NTP wall clock.
+
+        Sibling of _handle_play. The server pushes a per-surface
+        pre-cropped video plus the shared show clock; every screen
+        disciplines its own playhead toward
+        ``target = (now - epoch + latency) mod duration`` so the views
+        play in lockstep (browser-side discipline lives in
+        browser_renderer_template.py, sync.mode == "clock_video"). The
+        video always loops; the modular math handles the seam. Distinct
+        playback_state "mural" (frozen) the server's schedule/companion
+        guards key on - the heartbeat keeps reporting it while active."""
+        url = _normalize_media_url(data.get("url") or params.get("url"))
+        duration = params.get("duration", data.get("duration"))
+        epoch = params.get("epoch", data.get("epoch"))
+        latency_ms = params.get("latency_ms", data.get("latency_ms", 0))
+        show = params.get("show", data.get("show"))
+        if not isinstance(show, str) or not show.strip():
+            show = "mural"
+        sync = self._extract_video_sync(url, duration, epoch, latency_ms)
+        if sync is None:
+            # _extract_video_sync already logged sync_video_invalid with the
+            # precise reason; leave playback exactly as it was.
+            return
+        _log(
+            "sync_video_command",
+            item=Path(url).name,
+            duration=f"{sync['duration']:.3f}",
+            epoch=f"{sync['epoch']:.3f}",
+            latency_ms=sync["latency_ms"],
+            show=show,
+        )
+        self.current_playlist_name = f"Mural: {show}"
+        self.current_playlist_id = None
+        self.current_video = url
+        self.current_slideshow = []
+        # Slideshow clock descriptor off; mural descriptor on.
+        self.current_sync = None
+        self.current_video_sync = sync
+        self.playback_state = "mural"
+        self.slideshow_started_at = None
+        BROWSER_EVENT_STATE.clear_slideshow_index()
+        BROWSER_EVENT_STATE.set_paused(False)
+        # Mural video always loops; thread the sync object into the browser
+        # state so the discipline loop can read epoch/duration/latency.
+        if self.renderer.play_single_video(url, loop=True, sync=sync):
             self._send_render_command()
 
     def _handle_video_playlist(
@@ -2023,6 +2152,7 @@ class PiFrameClient:
             # slideshow timer null for video playback.
             self.slideshow_started_at = None
             self.current_sync = None
+            self.current_video_sync = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
             BROWSER_EVENT_STATE.set_paused(False)
             self._send_render_command()
@@ -2116,6 +2246,7 @@ class PiFrameClient:
             self.playback_state = "audio_playing"
             self.slideshow_started_at = None
             self.current_sync = None
+            self.current_video_sync = None
             BROWSER_EVENT_STATE.clear_slideshow_index()
             BROWSER_EVENT_STATE.set_paused(False)
             # Starting direct audio playback supersedes any companion
@@ -2197,6 +2328,7 @@ class PiFrameClient:
         self.current_video = ""
         self.current_slideshow = []
         self.current_sync = None
+        self.current_video_sync = None
         self.current_playlist_name = ""
         self.current_playlist_id = ""
         self.playback_state = "stopped"
@@ -2285,6 +2417,10 @@ class PiFrameClient:
             self.current_interval = float(interval)
             self.current_shuffle = shuffle_flag
             self.current_sync = sync
+            # Starting a slideshow leaves mural mode; drop the mural mirror
+            # (the renderer state now carries the slideshow clock sync, not
+            # the clock_video one).
+            self.current_video_sync = None
             # A clock-sync lap re-send is the SAME synced playlist with a
             # freshly shuffled row - the slideshow is continuous, not
             # restarted. Preserve the start time, the reported index, and
@@ -2405,6 +2541,7 @@ class PiFrameClient:
         self.current_video = ""
         self.current_slideshow = []
         self.current_sync = None
+        self.current_video_sync = None
         self.current_playlist_name = ""
         self.current_playlist_id = ""
         self.slideshow_started_at = None
@@ -2425,6 +2562,7 @@ class PiFrameClient:
         self.current_video = ""
         self.current_slideshow = []
         self.current_sync = None
+        self.current_video_sync = None
         self.renderer.set_browser_mode("kiosk", None)
         # Once the kiosk renderer is back up, show idle so the screen
         # has something to display rather than a blank page.
@@ -2446,6 +2584,7 @@ class PiFrameClient:
         self.current_video = ""
         self.current_slideshow = []
         self.current_sync = None
+        self.current_video_sync = None
         self.current_playlist_name = ""
         self.current_playlist_id = ""
         self.playback_state = "stopped"
