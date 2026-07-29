@@ -2433,10 +2433,18 @@ def render_browser_html(
       const boxH = spriteH * scaleY;
       const x = (worldX - Number(sp.window.x)) * scaleX;
       const y = (worldY - Number(sp.window.y)) * scaleY;
-      const intersects =
-        x + boxW > 0 && x < spriteViewportW && y + boxH > 0 && y < spriteViewportH;
-      if (!intersects) {{
-        // Off this screen's window: hide once, write nothing else.
+      // Edge-churn guard: track and show the sprite from ONE SPRITE-WIDTH
+      // outside the window, not from first pixel contact. All the state
+      // flips (visibility, compositor layer promotion / re-clipping, the
+      // first transform write after an approach) then happen fully
+      // offscreen, so crossing the visible edge is a plain smooth slide -
+      // no entry hitch, no repaint churn while straddling the boundary
+      // (the field-observed edge stutter). Beyond the margin the slot
+      // hides and writes nothing, so rooms-away entities still cost zero.
+      const near =
+        x + boxW > -boxW && x < spriteViewportW + boxW &&
+        y + boxH > -boxH && y < spriteViewportH + boxH;
+      if (!near) {{
         spriteSetVisible(slot, false);
         return;
       }}
