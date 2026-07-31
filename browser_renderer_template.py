@@ -415,7 +415,7 @@ def render_browser_html(
       transform: translate(-50%, 0);
     }}
     /* Mural sprite overlay (Road B). A POOL of compositor-friendly boxes
-       (one per entity, created lazily, max 8) moved by translate3d from a
+       (one per entity, created lazily, max 16) moved by translate3d from a
        single rAF loop; nothing else about the page changes while it runs.
        Stacking: the pool's container carries z-index 30, which puts every
        box ABOVE the media stages (z auto, inside .frame) and above the
@@ -2246,7 +2246,7 @@ def render_browser_html(
        swapped image url - converges with no re-render and no restart.
        ================================================================ */
     const spriteLayer = document.getElementById("spriteLayer");
-    const SPRITE_MAX_ENTITIES = 8;
+    const SPRITE_MAX_ENTITIES = 16;
     // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched }}.
     // id === null means the slot is free for the next new entity.
     const spriteSlots = [];

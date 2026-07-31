@@ -177,7 +177,9 @@ AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 # Mural sprite overlay (Road B) wire limits. The kiosk keeps one pooled
 # div per entity and one rAF loop, so the cap is really a budget on
 # per-frame DOM work; the renderer enforces the same number.
-SPRITE_MAX_ENTITIES = 8
+# Matches the server cap (woozlescape core.mural.MURAL_ENTITY_MAX): the
+# wall's mpv overlay-id budget pins the fleet-wide ceiling at 16.
+SPRITE_MAX_ENTITIES = 16
 # Sprite-sheet animation bounds. `frames` is how many equal-width frames
 # the horizontal strip holds; `fps` is how fast the kiosk walks them.
 SPRITE_ANIM_MIN_FRAMES = 2
