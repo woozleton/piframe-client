@@ -2198,7 +2198,9 @@ def render_browser_html(
        animated image they are the dimensions of ONE frame):
 
          t_e(t)    = t + phase_s
-         worldX(t) = mod(t_e / sweep_s, 1) * (world.w + spriteW) - spriteW
+         frac      = mod(t_e / sweep_s, 1); reverse flips it to 1 - frac
+                     (and mirrors the art with scaleX(-1))
+         worldX(t) = frac * (world.w + spriteW) - spriteW
          worldY(t) = (world.h - spriteH) / 2
                      + world.h * y_amp_frac * sin(2 * PI * t_e / y_period_s)
 
@@ -2420,8 +2422,11 @@ def render_browser_html(
       const spriteH = isImage ? Number(box.h) : Number(box.size);
       const worldW = Number(sp.world.w);
       const worldH = Number(sp.world.h);
-      const worldX =
-        spriteMod(t / Number(motion.sweep_s), 1) * (worldW + spriteW) - spriteW;
+      // reverse === true sweeps right-to-left (frac mirrored) and flips
+      // the art below, so the creature faces where it is going.
+      let spriteFrac = spriteMod(t / Number(motion.sweep_s), 1);
+      if (motion.reverse === true) spriteFrac = 1 - spriteFrac;
+      const worldX = spriteFrac * (worldW + spriteW) - spriteW;
       const ampRaw = Number(motion.y_amp_frac);
       const amp = isFinite(ampRaw) ? ampRaw : 0;
       const worldY =
@@ -2494,7 +2499,8 @@ def render_browser_html(
         }}
       }}
       slot.el.style.transform =
-        "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)";
+        "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)" +
+        (motion.reverse === true ? " scaleX(-1)" : "");
       spriteSetVisible(slot, true);
     }}
 

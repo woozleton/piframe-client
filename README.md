@@ -245,7 +245,9 @@ circle)
 
 ```
 t      = Date.now()/1000 + latency_ms/1000
-worldX = mod(t / sweep_s, 1) * (world.w + spriteW) - spriteW
+frac   = mod(t / sweep_s, 1)            (motion.reverse flips it to 1 - frac
+                                         and mirrors the art with scaleX(-1))
+worldX = frac * (world.w + spriteW) - spriteW
 worldY = (world.h - spriteH) / 2 + world.h * y_amp_frac * sin(2*PI*t / y_period_s)
 ```
 

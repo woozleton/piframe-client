@@ -2708,6 +2708,9 @@ class PiFrameClient:
         phase_s = _finite_number(motion.get("phase_s"))
         if phase_s is None:
             phase_s = 0.0
+        # reverse is soft too: strict True flips the sweep right-to-left
+        # (and mirrors the art); anything else swims forward.
+        reverse = motion.get("reverse") is True
 
         # Two sprite kinds. `circle` is the built-in primitive (one size,
         # one color); `image` paints a media file (transparent PNGs from
@@ -2795,6 +2798,7 @@ class PiFrameClient:
                 "y_period_s": y_period_s,
                 "y_amp_frac": y_amp_frac,
                 "phase_s": phase_s,
+                "reverse": reverse,
             },
         }
 
