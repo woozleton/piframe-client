@@ -251,6 +251,13 @@ worldX = frac * (world.w + spriteW) - spriteW
 worldY = (world.h - spriteH) / 2 + world.h * y_amp_frac * sin(2*PI*t / y_period_s)
 ```
 
+A pinned entity (`motion.mode == "pinned"`) skips the sweep and bob -
+`x_frac`/`y_frac` locate its center (`worldX = x_frac * world.w -
+spriteW/2`, same for Y) and only its strip keeps stepping.
+`motion.flip` mirrors the art independently of travel (net mirror =
+reverse XOR flip; a pinned sprite has no travel, so flip alone decides
+its facing).
+
 maps it with `scaleX = viewportWidth / window.w`,
 `scaleY = viewportHeight / window.h`, moves the element with
 `translate3d` (compositor path, no layout), and hides it while it does

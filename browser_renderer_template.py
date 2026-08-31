@@ -2204,6 +2204,13 @@ def render_browser_html(
          worldY(t) = (world.h - spriteH) / 2
                      + world.h * y_amp_frac * sin(2 * PI * t_e / y_period_s)
 
+       A PINNED entity (motion.mode == "pinned") skips the sweep and bob:
+       x_frac/y_frac locate its CENTER in the world
+       (worldX = x_frac * world.w - spriteW/2, same for Y) and only the
+       strip keeps stepping. `flip` mirrors the art independently of
+       travel (net mirror = reverse XOR flip; a pinned sprite has no
+       travel, so flip alone decides which way it faces).
+
        (both are the ball path from scripts/mural/make_test_master.py, so
        sprite runs and pre-rendered masters describe the same motion.)
        t is the wall clock plus this surface's optional latency_ms/1000,
@@ -2422,16 +2429,24 @@ def render_browser_html(
       const spriteH = isImage ? Number(box.h) : Number(box.size);
       const worldW = Number(sp.world.w);
       const worldH = Number(sp.world.h);
-      // reverse === true sweeps right-to-left (frac mirrored) and flips
-      // the art below, so the creature faces where it is going.
-      let spriteFrac = spriteMod(t / Number(motion.sweep_s), 1);
-      if (motion.reverse === true) spriteFrac = 1 - spriteFrac;
-      const worldX = spriteFrac * (worldW + spriteW) - spriteW;
-      const ampRaw = Number(motion.y_amp_frac);
-      const amp = isFinite(ampRaw) ? ampRaw : 0;
-      const worldY =
-        (worldH - spriteH) / 2 +
-        worldH * amp * Math.sin((2 * Math.PI * t) / Number(motion.y_period_s));
+      let worldX, worldY;
+      if (motion.mode === "pinned") {{
+        // Anchored: x/y_frac locate the sprite's CENTER in the world.
+        // No sweep, no bob - only the strip keeps stepping below.
+        worldX = Number(motion.x_frac) * worldW - spriteW / 2;
+        worldY = Number(motion.y_frac) * worldH - spriteH / 2;
+      }} else {{
+        // reverse === true sweeps right-to-left (frac mirrored) and flips
+        // the art below, so the creature faces where it is going.
+        let spriteFrac = spriteMod(t / Number(motion.sweep_s), 1);
+        if (motion.reverse === true) spriteFrac = 1 - spriteFrac;
+        worldX = spriteFrac * (worldW + spriteW) - spriteW;
+        const ampRaw = Number(motion.y_amp_frac);
+        const amp = isFinite(ampRaw) ? ampRaw : 0;
+        worldY =
+          (worldH - spriteH) / 2 +
+          worldH * amp * Math.sin((2 * Math.PI * t) / Number(motion.y_period_s));
+      }}
       const scaleX = spriteViewportW / Number(sp.window.w);
       const scaleY = spriteViewportH / Number(sp.window.h);
       const boxW = spriteW * scaleX;
@@ -2498,9 +2513,14 @@ def render_browser_html(
           slot.el.style.backgroundPositionX = (-(index * boxW)).toFixed(1) + "px";
         }}
       }}
+      // Facing: travel mirrors the art (reverse), flip mirrors it again
+      // independently - a pinned sprite has no travel, so flip alone rules.
+      const mirrored = motion.mode === "pinned"
+        ? motion.flip === true
+        : (motion.reverse === true) !== (motion.flip === true);
       slot.el.style.transform =
         "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)" +
-        (motion.reverse === true ? " scaleX(-1)" : "");
+        (mirrored ? " scaleX(-1)" : "");
       spriteSetVisible(slot, true);
     }}
 

@@ -2690,27 +2690,57 @@ class PiFrameClient:
                 _bad(f"{name}_missing", id=entity_id)
                 return None
 
-        if motion.get("mode") != "sweep":
-            _bad("motion_mode", id=entity_id, mode=str(motion.get("mode")))
+        mode = motion.get("mode")
+        if mode not in ("sweep", "pinned"):
+            _bad("motion_mode", id=entity_id, mode=str(mode))
             return None
-        sweep_s = _finite_number(motion.get("sweep_s"))
-        y_period_s = _finite_number(motion.get("y_period_s"))
-        if sweep_s is None or sweep_s <= 0 or y_period_s is None or y_period_s <= 0:
-            _bad("motion_periods", id=entity_id)
-            return None
-        # y_amp_frac and phase_s are soft fields: a missing / malformed
-        # amplitude degrades to a flat sweep and a missing / malformed
-        # phase to 0 (in step with the other entities), rather than
+        # phase_s is soft in both modes: a missing / malformed phase
+        # degrades to 0 (in step with the other entities) rather than
         # dropping the creature. (_finite_number rejects bool too.)
-        y_amp_frac = _finite_number(motion.get("y_amp_frac"))
-        if y_amp_frac is None:
-            y_amp_frac = 0.0
         phase_s = _finite_number(motion.get("phase_s"))
         if phase_s is None:
             phase_s = 0.0
-        # reverse is soft too: strict True flips the sweep right-to-left
-        # (and mirrors the art); anything else swims forward.
-        reverse = motion.get("reverse") is True
+        # flip is soft too: strict True mirrors the art independently of
+        # travel (the renderer nets it against reverse); anything else
+        # leaves the art as drawn.
+        flip = motion.get("flip") is True
+        if mode == "pinned":
+            # Anchored at a fixed world point - no sweep, no bob, frames
+            # still stepping on the shared clock. The x/y anchors locate
+            # the sprite's CENTER as world fractions; soft fields, mid-world
+            # when missing, clamped so junk can't fling it into the void.
+            x_frac = _finite_number(motion.get("x_frac"))
+            y_frac = _finite_number(motion.get("y_frac"))
+            motion_payload: Dict[str, Any] = {
+                "mode": "pinned",
+                "x_frac": min(1.0, max(0.0, 0.5 if x_frac is None else x_frac)),
+                "y_frac": min(1.0, max(0.0, 0.5 if y_frac is None else y_frac)),
+                "phase_s": phase_s,
+                "flip": flip,
+            }
+        else:
+            sweep_s = _finite_number(motion.get("sweep_s"))
+            y_period_s = _finite_number(motion.get("y_period_s"))
+            if sweep_s is None or sweep_s <= 0 or y_period_s is None or y_period_s <= 0:
+                _bad("motion_periods", id=entity_id)
+                return None
+            # y_amp_frac is soft: a missing / malformed amplitude degrades
+            # to a flat sweep.
+            y_amp_frac = _finite_number(motion.get("y_amp_frac"))
+            if y_amp_frac is None:
+                y_amp_frac = 0.0
+            # reverse is soft too: strict True flips the sweep right-to-left
+            # (and mirrors the art); anything else swims forward.
+            reverse = motion.get("reverse") is True
+            motion_payload = {
+                "mode": "sweep",
+                "sweep_s": sweep_s,
+                "y_period_s": y_period_s,
+                "y_amp_frac": y_amp_frac,
+                "phase_s": phase_s,
+                "reverse": reverse,
+                "flip": flip,
+            }
 
         # Two sprite kinds. `circle` is the built-in primitive (one size,
         # one color); `image` paints a media file (transparent PNGs from
@@ -2792,14 +2822,7 @@ class PiFrameClient:
         return {
             "id": entity_id,
             "sprite": sprite_payload,
-            "motion": {
-                "mode": "sweep",
-                "sweep_s": sweep_s,
-                "y_period_s": y_period_s,
-                "y_amp_frac": y_amp_frac,
-                "phase_s": phase_s,
-                "reverse": reverse,
-            },
+            "motion": motion_payload,
         }
 
     @classmethod
