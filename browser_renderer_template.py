@@ -2296,9 +2296,20 @@ def render_browser_html(
       const box = ent.sprite;
       if (!motion || !box) return false;
       // NaN fails every comparison, so these cover missing / junk values.
-      if (motion.mode !== "sweep") return false;
-      if (!(spriteNum(motion.sweep_s) > 0)) return false;
-      if (!(spriteNum(motion.y_period_s) > 0)) return false;
+      // TWO motion modes, each with its own required fields: a sweeping
+      // entity needs positive periods, a PINNED one carries x/y anchors
+      // and deliberately no periods at all. Gating both on "sweep" would
+      // drop every pinned creature here - and blank the whole overlay via
+      // spriteConfigValid when a cast is entirely pinned.
+      if (motion.mode === "pinned") {{
+        if (!isFinite(spriteNum(motion.x_frac))) return false;
+        if (!isFinite(spriteNum(motion.y_frac))) return false;
+      }} else if (motion.mode === "sweep") {{
+        if (!(spriteNum(motion.sweep_s) > 0)) return false;
+        if (!(spriteNum(motion.y_period_s) > 0)) return false;
+      }} else {{
+        return false;
+      }}
       if (box.kind === "circle") {{
         if (!(spriteNum(box.size) > 0)) return false;
         if (typeof box.color !== "string" || !box.color) return false;
