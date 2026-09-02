@@ -2211,6 +2211,24 @@ def render_browser_html(
        travel (net mirror = reverse XOR flip; a pinned sprite has no
        travel, so flip alone decides which way it faces).
 
+       A PATH entity (motion.mode == "path") walks a polyline of 2..64
+       world-fraction points instead, at constant speed, one lap every
+       sweep_s, wrapping from the last point back to the first:
+
+         frac      = mod(t_e / sweep_s, 1); reverse flips it to 1 - frac
+         P[i]      = (points[i][0] * world.w, points[i][1] * world.h)
+         cum[0]    = 0; cum[i+1] = cum[i] + |P[i+1] - P[i]|; L = cum[n-1]
+         d         = frac * L
+         k         = first i with cum[i+1] > d, else n-2  (last eats d == L)
+         u         = seg[k] > 0 ? clamp((d - cum[k]) / seg[k], 0, 1) : 0
+         worldX(t) = P[k].x + (P[k+1].x - P[k].x) * u - spriteW/2  (same Y)
+         dirX      = (P[k+1].x - P[k].x) * (reverse ? -1 : 1)
+
+       Segment lengths are re-measured every frame - stateless like the
+       other two modes, and 64 points is nothing. A route's facing follows
+       the segment it is walking: net mirror = (dirX < 0) XOR flip, so a
+       vertical segment (dirX == 0) faces forward.
+
        (both are the ball path from scripts/mural/make_test_master.py, so
        sprite runs and pre-rendered masters describe the same motion.)
        t is the wall clock plus this surface's optional latency_ms/1000,
@@ -2296,14 +2314,18 @@ def render_browser_html(
       const box = ent.sprite;
       if (!motion || !box) return false;
       // NaN fails every comparison, so these cover missing / junk values.
-      // TWO motion modes, each with its own required fields: a sweeping
+      // THREE motion modes, each with its own required fields: a sweeping
       // entity needs positive periods, a PINNED one carries x/y anchors
-      // and deliberately no periods at all. Gating both on "sweep" would
-      // drop every pinned creature here - and blank the whole overlay via
-      // spriteConfigValid when a cast is entirely pinned.
+      // and deliberately no periods at all, a PATH one a polyline and a
+      // lap time. Gating them all on "sweep" would drop every pinned or
+      // routed creature here - and blank the whole overlay via
+      // spriteConfigValid when a cast holds nothing else.
       if (motion.mode === "pinned") {{
         if (!isFinite(spriteNum(motion.x_frac))) return false;
         if (!isFinite(spriteNum(motion.y_frac))) return false;
+      }} else if (motion.mode === "path") {{
+        if (!Array.isArray(motion.points) || motion.points.length < 2) return false;
+        if (!(spriteNum(motion.sweep_s) > 0)) return false;
       }} else if (motion.mode === "sweep") {{
         if (!(spriteNum(motion.sweep_s) > 0)) return false;
         if (!(spriteNum(motion.y_period_s) > 0)) return false;
@@ -2441,11 +2463,45 @@ def render_browser_html(
       const worldW = Number(sp.world.w);
       const worldH = Number(sp.world.h);
       let worldX, worldY;
+      // Only a routed entity has a travel direction of its own; the other
+      // two modes leave this at 0 and never read it.
+      let dirX = 0;
       if (motion.mode === "pinned") {{
         // Anchored: x/y_frac locate the sprite's CENTER in the world.
         // No sweep, no bob - only the strip keeps stepping below.
         worldX = Number(motion.x_frac) * worldW - spriteW / 2;
         worldY = Number(motion.y_frac) * worldH - spriteH / 2;
+      }} else if (motion.mode === "path") {{
+        // A freehand ROUTE: the CENTER walks the polyline at constant
+        // speed, one lap every sweep_s, wrapping last point -> first.
+        // Re-measured every frame, so the loop stays stateless.
+        const pts = motion.points;
+        let spriteFrac = spriteMod(t / Number(motion.sweep_s), 1);
+        if (motion.reverse === true) spriteFrac = 1 - spriteFrac;
+        const n = pts.length;
+        const cum = [0];
+        for (let j = 1; j < n; j++) {{
+          cum[j] = cum[j - 1] + Math.hypot(
+            (Number(pts[j][0]) - Number(pts[j - 1][0])) * worldW,
+            (Number(pts[j][1]) - Number(pts[j - 1][1])) * worldH);
+        }}
+        const d = spriteFrac * cum[n - 1];
+        // The FIRST segment whose far end is past d owns the sprite; the
+        // last one absorbs d === L (and a zero-length route, which the
+        // manager rejects but which must never divide here).
+        let k = n - 2;
+        for (let j = 0; j < n - 1; j++) {{
+          if (cum[j + 1] > d) {{ k = j; break; }}
+        }}
+        const seg = cum[k + 1] - cum[k];
+        const u = seg > 0 ? Math.min(1, Math.max(0, (d - cum[k]) / seg)) : 0;
+        const ax = Number(pts[k][0]) * worldW;
+        const ay = Number(pts[k][1]) * worldH;
+        const bx = Number(pts[k + 1][0]) * worldW;
+        const by = Number(pts[k + 1][1]) * worldH;
+        worldX = ax + (bx - ax) * u - spriteW / 2;
+        worldY = ay + (by - ay) * u - spriteH / 2;
+        dirX = (bx - ax) * (motion.reverse === true ? -1 : 1);
       }} else {{
         // reverse === true sweeps right-to-left (frac mirrored) and flips
         // the art below, so the creature faces where it is going.
@@ -2525,10 +2581,13 @@ def render_browser_html(
         }}
       }}
       // Facing: travel mirrors the art (reverse), flip mirrors it again
-      // independently - a pinned sprite has no travel, so flip alone rules.
+      // independently - a pinned sprite has no travel, so flip alone rules,
+      // and a route's travel is whichever segment it is walking.
       const mirrored = motion.mode === "pinned"
         ? motion.flip === true
-        : (motion.reverse === true) !== (motion.flip === true);
+        : (motion.mode === "path"
+          ? (dirX < 0) !== (motion.flip === true)
+          : (motion.reverse === true) !== (motion.flip === true));
       slot.el.style.transform =
         "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)" +
         (mirrored ? " scaleX(-1)" : "");

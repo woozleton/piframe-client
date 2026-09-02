@@ -258,6 +258,20 @@ spriteW/2`, same for Y) and only its strip keeps stepping.
 reverse XOR flip; a pinned sprite has no travel, so flip alone decides
 its facing).
 
+A path entity (`motion.mode == "path"`) follows a drawn ROUTE:
+`motion.points` is 2 to 64 `[x, y]` pairs, each a fraction of the shared
+world (the same space as `x_frac`/`y_frac`), locating the sprite's
+center. The center walks that polyline at CONSTANT SPEED, covering the
+whole line once every `sweep_s` seconds, and the lap WRAPS - the last
+point joins back to the first, so a route drawn back to its own start is
+a seamless cycle. `motion.reverse` walks it backwards. Facing follows
+travel: the art is mirrored when the segment being walked runs right to
+left, netted against `flip` (a vertical segment faces forward). There is
+no bob and there are no anchors in this mode. A pre-OTA kiosk does not
+know the mode and drops such an entity IN ISOLATION
+(`sprite_entity_invalid` / `motion_mode`), so the rest of the show plays
+on unchanged.
+
 maps it with `scaleX = viewportWidth / window.w`,
 `scaleY = viewportHeight / window.h`, moves the element with
 `translate3d` (compositor path, no layout), and hides it while it does

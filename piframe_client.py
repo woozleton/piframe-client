@@ -2691,7 +2691,7 @@ class PiFrameClient:
                 return None
 
         mode = motion.get("mode")
-        if mode not in ("sweep", "pinned"):
+        if mode not in ("sweep", "pinned", "path"):
             _bad("motion_mode", id=entity_id, mode=str(mode))
             return None
         # phase_s is soft in both modes: a missing / malformed phase
@@ -2716,6 +2716,42 @@ class PiFrameClient:
                 "x_frac": min(1.0, max(0.0, 0.5 if x_frac is None else x_frac)),
                 "y_frac": min(1.0, max(0.0, 0.5 if y_frac is None else y_frac)),
                 "phase_s": phase_s,
+                "flip": flip,
+            }
+        elif mode == "path":
+            # A freehand ROUTE: the sprite's CENTER walks a polyline of
+            # world fractions, one lap every sweep_s, wrapping from the
+            # last point back to the first. Individual points are soft
+            # (an unusable pair drops, a wild one clamps into the world),
+            # but a route left with fewer than two points has no line to
+            # walk at all - that drops the entity, in isolation like every
+            # other per-entity failure.
+            raw_points = motion.get("points")
+            raw_points = raw_points if isinstance(raw_points, (list, tuple)) else ()
+            points: List[List[float]] = []
+            for point in raw_points:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    continue
+                px = _finite_number(point[0])
+                py = _finite_number(point[1])
+                if px is None or py is None:
+                    continue
+                points.append([min(1.0, max(0.0, px)), min(1.0, max(0.0, py))])
+            if len(points) < 2:
+                _bad("motion_path", id=entity_id)
+                return None
+            sweep_s = _finite_number(motion.get("sweep_s"))
+            if sweep_s is None or sweep_s <= 0:
+                _bad("motion_periods", id=entity_id)
+                return None
+            motion_payload = {
+                "mode": "path",
+                "points": points,
+                "sweep_s": sweep_s,
+                "phase_s": phase_s,
+                # Soft like the sweep branch: anything but strict True
+                # walks the route forwards.
+                "reverse": motion.get("reverse") is True,
                 "flip": flip,
             }
         else:
