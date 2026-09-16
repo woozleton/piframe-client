@@ -574,6 +574,12 @@ def render_browser_html(
     let videoSyncOutOfBand = 0;
     let activeStageIndex = 0;
     let pendingAdvanceToken = 0;
+    // Bumped at the top of every renderItem() call. An image render
+    // waits on a decode promise before activating its stage; if a newer
+    // renderItem() runs first (a fast advance, a peek, a lap swap) this
+    // token no longer matches when the older decode settles, so the
+    // stale activation is dropped instead of clobbering the new one.
+    let renderToken = 0;
     let osdTimer = null;
     let lastVolume = null;
     let lastMuted = null;
@@ -584,6 +590,16 @@ def render_browser_html(
     // legitimate retry (new content) gets a fresh attempt.
     const failedSrcs = new Set();
     const failedSrcReasons = new Map();
+    // How many image slots ahead of the current index preloadAhead()
+    // warms. Keyed-by-src so re-visiting a slot (repeat / clock-sync
+    // wrap) reuses the already-decoding Image instead of restarting it.
+    const PRELOAD_AHEAD = 3;
+    const preloadedImages = new Map();
+    // Cap on how long renderItem() waits for a fresh image to decode
+    // before activating its stage anyway. A cold image can still land
+    // after this on a clock-sync flip - late but on the correct slot,
+    // and self-healing at the next boundary.
+    const DECODE_WAIT_MS = 1500;
     function notifySlideChange(idx) {{
       if (!eventEndpoint || idx === lastReportedSlideIndex) return;
       lastReportedSlideIndex = idx;
@@ -757,23 +773,39 @@ def render_browser_html(
       timingEl.textContent = `mode ${{state.mode}} | per-item ${{perItemSeconds.toFixed(3)}}s | rotate {rotation_degrees}deg`;
     }}
 
-    function preloadNextImage() {{
+    function preloadAhead() {{
       if (!activeState || !activeState.items || activeState.items.length < 2) {{
         return;
       }}
       const itemCount = activeState.items.length;
-      let nextIndex = activeIndex + 1;
-      if (activeState.repeat) {{
-        nextIndex = (nextIndex + itemCount) % itemCount;
-      }} else if (nextIndex >= itemCount) {{
-        return;
+      const wrap = !!activeState.repeat || syncActive();
+      const wantedSrcs = new Set();
+      for (let offset = 1; offset <= PRELOAD_AHEAD; offset++) {{
+        let idx = activeIndex + offset;
+        if (wrap) {{
+          idx = ((idx % itemCount) + itemCount) % itemCount;
+        }} else if (idx >= itemCount) {{
+          break;
+        }}
+        const candidate = activeState.items[idx];
+        if (!candidate || candidate.kind !== "image") {{
+          continue;
+        }}
+        wantedSrcs.add(candidate.src);
+        if (!preloadedImages.has(candidate.src)) {{
+          const preload = new Image();
+          preload.src = candidate.src;
+          preloadedImages.set(candidate.src, preload);
+        }}
       }}
-      const nextItem = activeState.items[nextIndex];
-      if (!nextItem || nextItem.kind !== "image") {{
-        return;
+      // Drop entries that have fallen behind the current index (or off
+      // the end of a non-wrapping playlist) so the map doesn't grow
+      // unbounded over a long-running slideshow.
+      for (const src of preloadedImages.keys()) {{
+        if (!wantedSrcs.has(src)) {{
+          preloadedImages.delete(src);
+        }}
       }}
-      const preload = new Image();
-      preload.src = nextItem.src;
     }}
 
     function stopTimers() {{
@@ -896,6 +928,10 @@ def render_browser_html(
         stage.resetHandle = null;
       }}
       resetStage(stage);
+      // Set only in the image branch below - the promise renderItem()
+      // waits on before activating this stage. undefined for
+      // video/html, which keep activating synchronously.
+      let readyPromise;
       if (item.kind === "html") {{
         stage.html.style.display = "block";
         stage.html.onload = () => {{
@@ -1041,8 +1077,31 @@ def render_browser_html(
           showBanner(itemErrorMessage(item), "error");
         }};
         stage.image.src = item.src;
+        // Wait for the image to actually decode before renderItem()
+        // activates the stage, so the cross-fade never reveals a blank
+        // frame while a multi-MB image is still arriving. Settles on
+        // decode() (falling back to the load/error events above on
+        // browsers without it), on error, or after DECODE_WAIT_MS -
+        // whichever comes first. A preloaded image (see preloadAhead())
+        // typically resolves immediately.
+        readyPromise = new Promise((resolve) => {{
+          let settled = false;
+          const finish = () => {{
+            if (settled) return;
+            settled = true;
+            resolve();
+          }};
+          window.setTimeout(finish, DECODE_WAIT_MS);
+          if (typeof stage.image.decode === "function") {{
+            stage.image.decode().then(finish).catch(finish);
+          }} else {{
+            stage.image.addEventListener("load", finish, {{ once: true }});
+            stage.image.addEventListener("error", finish, {{ once: true }});
+          }}
+        }});
       }}
       setHud(item, state, perItemSeconds);
+      return readyPromise;
     }}
 
     /* =================================================================
@@ -1635,42 +1694,62 @@ def render_browser_html(
       if (!item) {{
         return;
       }}
+      // Claim this render before any async wait below so a superseding
+      // renderItem() call (fast advance, peek, lap swap) can tell a
+      // stale pending activation apart from the current one.
+      const token = ++renderToken;
       lastPaintedSrc = item.src || null;
       const targetStage = getInactiveStage();
-      prepareStage(targetStage, item, state, perItemSeconds);
-      activateStage(targetStage);
-      // Audio items: paint the visualizer over the (otherwise blank)
-      // <video>. Video / image items: kill the visualizer.
-      if (item && item.is_audio) {{
-        audioVis.start(item, targetStage.video);
-      }} else {{
-        audioVis.stop();
-      }}
-      const previousStage = getInactiveStage();
-      if (previousStage.resetHandle) {{
-        window.clearTimeout(previousStage.resetHandle);
-      }}
-      previousStage.resetHandle = window.setTimeout(() => {{
-        previousStage.resetHandle = null;
-        resetStage(previousStage);
-      }}, {reset_delay_ms});
-      if (item.kind === "video") {{
-        stagePlay(targetStage.video);
-      }} else if (item.kind === "html") {{
-        // HTML idles are static iframes - no interval, no preload.
-        stopTimers();
-      }} else {{
-        // Clock-synced mode arms its own wall-clock boundary timer
-        // (scheduleSyncFlip, driven from the sync entry / soft-swap /
-        // boundary paths), so don't start the free-running interval
-        // here. A manual next/prev "peek" repaints through renderItem
-        // but must leave that boundary timer untouched.
-        if (!syncActive()) {{
-          scheduleImageAdvance(perItemSeconds);
+      // prepareStage() activates video/html synchronously (it returns
+      // undefined for those kinds); for an image it returns a promise
+      // that settles once the image has decoded (or timed out), so the
+      // activation below runs asynchronously in that case only.
+      const readyPromise = prepareStage(targetStage, item, state, perItemSeconds);
+      const activate = () => {{
+        if (token !== renderToken) {{
+          // A newer render superseded this one before the image
+          // finished decoding - drop it, the newer call owns the stage.
+          return;
         }}
-        preloadNextImage();
+        activateStage(targetStage);
+        // Audio items: paint the visualizer over the (otherwise blank)
+        // <video>. Video / image items: kill the visualizer.
+        if (item && item.is_audio) {{
+          audioVis.start(item, targetStage.video);
+        }} else {{
+          audioVis.stop();
+        }}
+        const previousStage = getInactiveStage();
+        if (previousStage.resetHandle) {{
+          window.clearTimeout(previousStage.resetHandle);
+        }}
+        previousStage.resetHandle = window.setTimeout(() => {{
+          previousStage.resetHandle = null;
+          resetStage(previousStage);
+        }}, {reset_delay_ms});
+        if (item.kind === "video") {{
+          stagePlay(targetStage.video);
+        }} else if (item.kind === "html") {{
+          // HTML idles are static iframes - no interval, no preload.
+          stopTimers();
+        }} else {{
+          // Clock-synced mode arms its own wall-clock boundary timer
+          // (scheduleSyncFlip, driven from the sync entry / soft-swap /
+          // boundary paths), so don't start the free-running interval
+          // here. A manual next/prev "peek" repaints through renderItem
+          // but must leave that boundary timer untouched.
+          if (!syncActive()) {{
+            scheduleImageAdvance(perItemSeconds);
+          }}
+          preloadAhead();
+        }}
+        hideCursor();
+      }};
+      if (readyPromise && typeof readyPromise.then === "function") {{
+        readyPromise.then(activate);
+      }} else {{
+        activate();
       }}
-      hideCursor();
     }}
 
     function stagePlay(video) {{

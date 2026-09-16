@@ -306,6 +306,14 @@ Current browser renderer features include:
   playback, with per-playlist preset selection and a track-name
   OSD pulse on each new song
 
+Playlist items are not stat'ed individually any more when a new
+slideshow dispatches - the client checks the NAS mount once and
+classifies only the first item, and the renderer's per-slot `onerror`
+path covers every other item's missing-file case. The renderer also
+preloads three slots ahead and waits for each image to decode (capped
+at 1.5s) before the cross-fade activates it, so a slide's first frame
+is never blank while a multi-MB image is still arriving.
+
 ## Remote Control (VNC)
 
 Each Pi runs a `wayvnc` instance attached to the cage Wayland session

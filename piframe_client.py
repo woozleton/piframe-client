@@ -1276,11 +1276,26 @@ class BrowserController:
             )
             return False
         idle_item = self._make_item(idle_media) if idle_media else None
+        # Classifying every item here would run Path.exists() per item -
+        # each a network round trip against the NAS mount, done serially,
+        # so N stats scale with playlist length (a 343-image dispatch
+        # spent seconds here before anything changed on screen). Instead:
+        # check the mount ONCE if any item resolves under NAS_ROOT, and
+        # classify only the FIRST item (one stat) so the existing "Media
+        # file missing" banner still fires for the common single-item /
+        # first-item case. Every other item is left to the renderer's
+        # per-slot onerror path, which already raises that banner when
+        # that slot comes up.
         banner = None
-        for item in items:
-            banner = self._classify_item_issue(item)
-            if banner:
-                break
+        try:
+            normalized_items = [_normalize_media_url(item) or item for item in items]
+            if any(n.startswith(f"{NAS_ROOT}/") or n == NAS_ROOT for n in normalized_items):
+                if not os.path.ismount(NAS_ROOT):
+                    banner = self._make_banner("NAS unavailable")
+        except Exception:
+            pass
+        if banner is None and items:
+            banner = self._classify_item_issue(items[0])
         with self._state_lock:
             self._state.update(
                 {
