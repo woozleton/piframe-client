@@ -562,10 +562,15 @@ journalctl -u piframe-client -f
 
 ### Getting a console on the frame (maintenance chord)
 
-cage owns the seat and swallows the VT-switch keys, so Ctrl+Alt+F2
-does nothing while the kiosk is up (Ctrl+Alt+Esc powers the Pi off
-via logind - not a console). With a keyboard plugged into the frame,
-press **Ctrl+Alt+Backspace twice within 3 seconds**. The kiosk page
+cage is launched with `-s` (allow VT switching), so with a keyboard
+plugged into the frame **Ctrl+Alt+F2** switches to a getty console
+while the kiosk keeps running on tty1; Ctrl+Alt+F1 returns to it.
+This works in webview mode too. Set `PIFRAME_CAGE_VT_SWITCH=0` in the
+unit environment to lock it back down. (Ctrl+Alt+Esc powers the Pi
+off via logind - not a console.)
+
+To stop the kiosk outright instead, press **Ctrl+Alt+Backspace twice
+within 3 seconds**. The kiosk page
 shows a hint on the first press, and on the second it POSTs
 `{"type": "maintenance_console"}` to the loopback event endpoint; the
 client runs `sudo systemctl stop piframe-vnc piframe-client`, cage
@@ -578,8 +583,9 @@ sudo systemctl start piframe-client piframe-vnc
 ```
 
 The chord only works while the kiosk page is rendering (not in
-webview mode, not while the client is crash-looping). For those cases
-use Ethernet + SSH, or append
+webview mode, not while the client is crash-looping); Ctrl+Alt+F2
+works whenever cage is up. If neither gets you in, use Ethernet + SSH,
+or append
 `systemd.mask=piframe-client.service systemd.mask=piframe-vnc.service`
 to `cmdline.txt` on the boot partition.
 
@@ -1138,6 +1144,8 @@ These can be set in the service file or shell environment.
 - `PIFRAME_IDLE_MEDIA`
 - `PIFRAME_CHROMIUM_BIN`
 - `PIFRAME_CAGE_BIN`
+- `PIFRAME_CAGE_VT_SWITCH` (default `1`) - launch cage with `-s` so
+  Ctrl+Alt+F2 reaches a console on the frame; `0` locks it down.
 - `PIFRAME_WLR_RANDR_BIN` (default `wlr-randr`) - used to apply
   `PIFRAME_OUTPUT_TRANSFORM` to the cage output at startup
 - `PIFRAME_OUTPUT_TRANSFORM` (default `90`) - cage output rotation,

@@ -44,6 +44,13 @@ SERVER_DEFAULT = os.environ.get("PIFRAME_SERVER", "ws://192.168.100.100:8080/ws"
 NAS_ROOT = os.environ.get("PIFRAME_NAS_ROOT", "/mnt/nas").rstrip("/") or "/mnt/nas"
 CHROMIUM_BIN = os.environ.get("PIFRAME_CHROMIUM_BIN", "chromium").strip() or "chromium"
 CAGE_BIN = os.environ.get("PIFRAME_CAGE_BIN", "cage").strip() or "cage"
+# -d: no client-side decorations. -s: allow VT switching, so
+# Ctrl+Alt+F2..F6 on a plugged-in keyboard reaches a getty console
+# while the kiosk (or a webview) is on screen - cage swallows the chord
+# otherwise. Set PIFRAME_CAGE_VT_SWITCH=0 to lock it back down.
+CAGE_ARGS = ["-d"] + (
+    ["-s"] if os.environ.get("PIFRAME_CAGE_VT_SWITCH", "1").strip() != "0" else []
+)
 WLRCTL_BIN = os.environ.get("PIFRAME_WLRCTL_BIN", "wlrctl").strip() or "wlrctl"
 WLR_RANDR_BIN = os.environ.get("PIFRAME_WLR_RANDR_BIN", "wlr-randr").strip() or "wlr-randr"
 # Output rotation is applied at the compositor (cage) via wlr-randr so the
@@ -1056,16 +1063,16 @@ class BrowserController:
                 ]
             )
             launcher_script = "\n".join(launcher_lines)
-            args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
+            args = [CAGE_BIN, *CAGE_ARGS, "--", "/bin/bash", "-lc", launcher_script]
         elif rotate_cmd:
             lines = ["set -eu", rotate_cmd]
             if rotate_watch_cmd:
                 lines.append(f"({rotate_watch_cmd}) &")
             lines.append(f"exec {shlex.join(chromium_args)}")
             launcher_script = "\n".join(lines)
-            args = [CAGE_BIN, "-d", "--", "/bin/bash", "-lc", launcher_script]
+            args = [CAGE_BIN, *CAGE_ARGS, "--", "/bin/bash", "-lc", launcher_script]
         else:
-            args = [CAGE_BIN, "-d", "--", *chromium_args]
+            args = [CAGE_BIN, *CAGE_ARGS, "--", *chromium_args]
         try:
             child_env = os.environ.copy()
             child_env["XDG_RUNTIME_DIR"] = runtime_dir
