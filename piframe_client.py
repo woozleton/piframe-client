@@ -1913,6 +1913,23 @@ class _BrowserEventHandler(BaseHTTPRequestHandler):
                 has_butterchurn=bool(payload.get("has_butterchurn")),
                 has_presets=bool(payload.get("has_presets")),
             )
+        elif kind == "maintenance_console":
+            # Kiosk page saw the Ctrl+Alt+Backspace double-press. Stop
+            # both units (VNC first - systemctl reverses the After=
+            # order) so cage releases the seat and tty1's getty gets the
+            # screen. A plain stop, not disable: the next reboot brings
+            # the kiosk back on its own. Passwordless sudo for systemctl
+            # is already required by update.sh (README "Sudoers").
+            _log("maintenance_console_requested")
+            try:
+                subprocess.Popen(
+                    ["sudo", "systemctl", "stop", "piframe-vnc", "piframe-client"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                _log("maintenance_console_spawn_failed", error=str(exc))
         elif kind == "slideshow_sync":
             # Browser dropped a malformed clock-sync object and fell back
             # to the free-running slideshow; surface why in journalctl

@@ -560,6 +560,39 @@ sudo systemctl status piframe-client --no-pager
 journalctl -u piframe-client -f
 ```
 
+### Getting a console on the frame (maintenance chord)
+
+cage owns the seat and swallows the VT-switch keys, so Ctrl+Alt+F2
+does nothing while the kiosk is up (Ctrl+Alt+Esc powers the Pi off
+via logind - not a console). With a keyboard plugged into the frame,
+press **Ctrl+Alt+Backspace twice within 3 seconds**. The kiosk page
+shows a hint on the first press, and on the second it POSTs
+`{"type": "maintenance_console"}` to the loopback event endpoint; the
+client runs `sudo systemctl stop piframe-vnc piframe-client`, cage
+releases the screen, and tty1's login prompt appears (sideways on
+portrait frames - it still works). It is a plain `stop`, so the next
+reboot brings the kiosk back; to return without rebooting:
+
+```bash
+sudo systemctl start piframe-client piframe-vnc
+```
+
+The chord only works while the kiosk page is rendering (not in
+webview mode, not while the client is crash-looping). For those cases
+use Ethernet + SSH, or append
+`systemd.mask=piframe-client.service systemd.mask=piframe-vnc.service`
+to `cmdline.txt` on the boot partition.
+
+`piframe-vnc.service` deliberately has only `After=piframe-client`
+(no `Wants=`): wayvnc restarts every 2s with no start-limit cap, and
+a `Wants=` there re-pulled a stopped kiosk unit on every restart.
+Frames bootstrapped before that fix carry the old line; drop it with:
+
+```bash
+sudo sed -i '/^Wants=piframe-client.service/d' /etc/systemd/system/piframe-vnc.service
+sudo systemctl daemon-reload
+```
+
 ## Self-update
 
 The server's System tab has a "Client updates" card that pushes

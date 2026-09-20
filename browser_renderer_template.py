@@ -1237,6 +1237,52 @@ def render_browser_html(
       }}
 
 
+      // Maintenance chord: Ctrl+Alt+Backspace twice within 3s asks the
+      // client to stop the kiosk units (piframe-vnc + piframe-client)
+      // so the frame drops to the tty1 login prompt for a plugged-in
+      // keyboard. cage swallows the VT-switch keys, so this is the
+      // only way to reach a console on-device while the kiosk is up.
+      // Double-press guards against a stray keypress; the first press
+      // shows a short on-screen hint. Handled in piframe_client.py's
+      // _BrowserEventHandler ("maintenance_console").
+      let maintenanceArmedAt = 0;
+      function showMaintenanceHint(text) {{
+        let el = document.getElementById("maintenanceHint");
+        if (!el) {{
+          el = document.createElement("div");
+          el.id = "maintenanceHint";
+          el.style.cssText = "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);"
+            + "padding:16px 24px;background:rgba(0,0,0,0.8);color:#fff;font:600 28px/1.3 sans-serif;"
+            + "border-radius:12px;z-index:99999;text-align:center;pointer-events:none;";
+          document.body.appendChild(el);
+        }}
+        el.textContent = text;
+        el.style.display = "block";
+        clearTimeout(showMaintenanceHint._t);
+        showMaintenanceHint._t = setTimeout(() => {{ el.style.display = "none"; }}, 3000);
+      }}
+      window.addEventListener("keydown", (ev) => {{
+        if (!(ev.ctrlKey && ev.altKey && ev.key === "Backspace")) return;
+        ev.preventDefault();
+        const now = Date.now();
+        if (now - maintenanceArmedAt > 3000) {{
+          maintenanceArmedAt = now;
+          showMaintenanceHint("Press Ctrl+Alt+Backspace again to stop the kiosk");
+          return;
+        }}
+        maintenanceArmedAt = 0;
+        showMaintenanceHint("Stopping kiosk - console on tty1");
+        if (!eventEndpoint) return;
+        try {{
+          fetch(eventEndpoint, {{
+            method: "POST",
+            headers: {{"Content-Type": "application/json"}},
+            body: JSON.stringify({{ type: "maintenance_console" }}),
+            keepalive: true,
+          }}).catch(() => {{}});
+        }} catch (_) {{}}
+      }}, true);
+
       function vizDiag(stage, detail) {{
         // Surface visualizer init / runtime status to the parent
         // process so we can diagnose blue-screen failures over the
