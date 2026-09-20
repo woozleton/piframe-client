@@ -432,8 +432,12 @@ fi
 cat > "${VNC_SERVICE_FILE}" <<EOF
 [Unit]
 Description=PiFrame VNC (wayvnc attached to the cage kiosk)
+# Ordering only (After=, no Wants=). wayvnc restarts every 2s with no
+# start-limit cap, and a Wants= here re-pulled the kiosk unit into
+# every one of those restarts - so a deliberately stopped/disabled
+# piframe-client came straight back. The kiosk unit is enabled on its
+# own; this unit just attaches to whatever cage session exists.
 After=${SERVICE_NAME}.service
-Wants=${SERVICE_NAME}.service
 # Cage gets torn down whenever the client switches between kiosk and
 # webview modes, which makes wayvnc lose its Wayland socket. Disable
 # systemd's start-limit rate cap so wayvnc keeps retrying after the
