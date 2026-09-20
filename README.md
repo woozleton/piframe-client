@@ -25,6 +25,8 @@ This client now uses one browser-based renderer for:
 - `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
 - `/etc/systemd/system/piframe-client.service` (installed by bootstrap)
 - `/etc/systemd/system/piframe-vnc.service` (installed by bootstrap; runs `wayvnc` against the cage Wayland session)
+- `/etc/sudoers.d/020_piframe` (installed by bootstrap; passwordless `systemctl` for the two units only)
+- `/usr/local/sbin/piframe-wifi-migrate` + `/var/log/piframe-wifi-migrate.log` (written by bootstrap only when an imager netplan Wi-Fi profile is found; see [OS packages](#os-packages-dont-apt-upgrade-the-frames))
 
 ## How It Works
 
@@ -745,8 +747,19 @@ cd /home/<user>/piframe_client
 sudo ./scripts/bootstrap_pi.sh --user <user> --server ws://<manager-ip>:8080/ws
 ```
 
+Re-running bootstrap on a configured frame is safe and is the
+supported way to apply bootstrap changes: orientation and output mode
+are inherited from the existing unit, apt runs with `--no-upgrade`
+(missing packages only), the sudoers file and units are rewritten
+idempotently, the Wi-Fi migration is a no-op without a netplan
+profile, and the dpkg preflight only acts on an interrupted install.
+Side effects: both units restart (screen blanks for a few seconds)
+and the HDMI sink volume is pinned back to 50%.
+
 What it does:
 
+- finishes any interrupted apt/dpkg transaction (`dpkg --audit` ->
+  `dpkg --configure -a`) before touching anything else
 - installs `gh` and `git`
 - installs required apt packages (chromium, cage, seatd, wlrctl,
   wlr-randr, wayvnc, alsa-utils, mpv for the audio companion)
@@ -763,6 +776,9 @@ What it does:
 - installs Python requirements from `requirements.txt`
 - writes `/etc/systemd/system/piframe-client.service`
 - writes `/etc/systemd/system/piframe-vnc.service`
+- writes `/etc/sudoers.d/020_piframe` (see [Sudoers prerequisite](#sudoers-prerequisite))
+- migrates an imager-written netplan Wi-Fi profile to a native
+  NetworkManager keyfile, detached, when one exists
 - writes `/home/<user>/.config/wayvnc/config` (only if absent, so
   later edits survive re-runs)
 - enables user lingering via `loginctl enable-linger` so
