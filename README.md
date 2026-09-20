@@ -674,19 +674,49 @@ blank screen.
 ### Sudoers prerequisite
 
 `update.sh` ends with `exec sudo /bin/systemctl restart
-piframe-client`, so the service user needs passwordless sudo for that
-command. The simplest setup (already in place on existing devices)
-is `/etc/sudoers.d/010_pi-nopasswd`:
+piframe-client`, the Restart action runs `sudo systemctl restart
+piframe-client`, and the maintenance chord runs `sudo systemctl stop
+piframe-vnc piframe-client` - all need passwordless sudo.
+`bootstrap_pi.sh` writes `/etc/sudoers.d/020_piframe` (validated with
+`visudo -c`) granting exactly those `systemctl restart|stop|start`
+forms for the two units, under both `/bin` and `/usr/bin` spellings.
 
-```
-woozleton ALL=(ALL) NOPASSWD: ALL
-```
+Don't rely on Raspberry Pi OS's `010_pi-nopasswd` (`NOPASSWD: ALL`)
+for this: it belongs to `raspberrypi-sys-mods`, and on 2026-09-20 an
+interrupted upgrade of that package removed it on three frames. OTA
+then "succeeded" (git pull fine) but the restart failed with `sudo: a
+password is required`, so the old process kept running and kept
+reporting the old SHA. Symptom to recognize: `/tmp/piframe_update.log`
+ends in that sudo error. Fix: `sudo dpkg --configure -a`, then re-run
+bootstrap (or restore the file) and `sudo systemctl restart
+piframe-client`.
 
-A tighter alternative scoped just to the restart:
+### OS packages: don't apt upgrade the frames
 
-```
-woozleton ALL=NOPASSWD: /bin/systemctl restart piframe-client
-```
+Policy: the frames are not `apt-get upgrade`d as routine hygiene. They
+are single-purpose kiosks on a trusted LAN, and the client code ships
+through self-update without apt. Only upgrade for a concrete reason
+(a Chromium playback bug, a fix you actually need).
+
+Why: the 2026-09-20 Trixie upgrade (`network-manager 1.52.1-1+rpt4`
+netplan sync + `netplan.io 1.1.2-7+rpt1`) regenerated the imager-
+written netplan Wi-Fi profile (`/etc/netplan/90-NM-<uuid>.yaml`,
+"preconfigured") without its key - every frame failed with
+`no-secrets` after reboot - and because Wi-Fi dropped mid-run, three
+frames were left with 150+ packages unpacked-but-unconfigured.
+
+Bootstrap now hardens both: a package-state preflight (`dpkg --audit`
+-> `dpkg --configure -a`, completing an interrupted transaction, not
+upgrading) and a Wi-Fi migration that copies the live netplan-derived
+profile to a native keyfile in `/etc/NetworkManager/system-connections`
+(PSK stored, autoconnect on), activates it, and deletes the netplan
+one, with originals under `/root/wifi-backup`. The migration runs as a
+detached unit (`piframe-wifi-migrate`, log
+`/var/log/piframe-wifi-migrate.log`) because switching connections
+drops an SSH-over-Wi-Fi session for a few seconds. If you ever do
+upgrade: run bootstrap first so the profile is already native, upgrade
+ONE frame, reboot it, check `dpkg --audit` is empty and
+`/etc/sudoers.d/020_piframe` still exists, then do the rest.
 
 ### Line-ending guard
 

@@ -261,9 +261,31 @@ VNC_CONFIG_DIR="${USER_HOME}/.config/wayvnc"
 VNC_CONFIG_FILE="${VNC_CONFIG_DIR}/config"
 ORIGIN_URL="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
 
+# ----------------------------------------------------------------
+# Package-state preflight. An apt upgrade interrupted mid-run (on
+# 2026-09-20 the Trixie upgrade took Wi-Fi down halfway through and
+# the reboot killed dpkg) leaves packages unpacked-but-unconfigured.
+# Two things then break silently: a kernel is half-installed, and the
+# Raspberry Pi OS sudoers rule vanishes (raspberrypi-sys-mods owns
+# /etc/sudoers.d/010_pi-nopasswd), so update.sh's `sudo systemctl
+# restart` starts asking for a password and OTA looks like it worked
+# while the old process keeps running. Finish that transaction before
+# touching anything else. This is NOT an upgrade - it only completes
+# what dpkg already started. Policy: the frames are not apt-upgraded
+# as routine hygiene (see README "OS packages").
+# ----------------------------------------------------------------
+if [[ -n "$(dpkg --audit 2>/dev/null)" ]]; then
+  echo "dpkg reports unconfigured packages - finishing the interrupted install first."
+  DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+  DEBIAN_FRONTEND=noninteractive apt-get -y -f install
+fi
+
 if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then
   apt-get update
-  apt-get install -y \
+  # --no-upgrade: a re-run on a configured frame must only fill in
+  # missing packages, never bump ones already installed (see the
+  # no-apt-upgrade policy in README "OS packages").
+  apt-get install -y --no-upgrade \
     chromium \
     cage \
     seatd \
@@ -481,6 +503,111 @@ if [[ -n "${NTP_SERVER}" && -f /etc/systemd/timesyncd.conf ]]; then
   echo "NTP: systemd-timesyncd -> ${NTP_SERVER}"
 fi
 
+# ----------------------------------------------------------------
+# Passwordless sudo for exactly what the client needs. update.sh and
+# the Restart action run `sudo systemctl restart piframe-client`; the
+# on-device maintenance chord runs `sudo systemctl stop piframe-vnc
+# piframe-client`. Raspberry Pi OS's own 010_pi-nopasswd (NOPASSWD:
+# ALL) used to cover this by accident, but that file belongs to
+# raspberrypi-sys-mods and disappeared on three frames when its
+# upgrade was interrupted. A file we own, scoped to the two units,
+# survives whatever the OS packages do. Both /bin and /usr/bin
+# spellings are listed: sudo matches the path as invoked, and
+# update.sh calls /bin/systemctl while the client calls bare
+# systemctl (resolved via PATH to /usr/bin).
+# ----------------------------------------------------------------
+SUDOERS_FILE="/etc/sudoers.d/020_piframe"
+sudoers_cmds=""
+for bin in /usr/bin/systemctl /bin/systemctl; do
+  for spec in \
+    "restart ${SERVICE_NAME}" \
+    "restart ${VNC_SERVICE_NAME}" \
+    "stop ${VNC_SERVICE_NAME} ${SERVICE_NAME}" \
+    "start ${SERVICE_NAME} ${VNC_SERVICE_NAME}" \
+    "stop ${SERVICE_NAME}" \
+    "start ${SERVICE_NAME}" \
+    "stop ${VNC_SERVICE_NAME}" \
+    "start ${VNC_SERVICE_NAME}"; do
+    sudoers_cmds="${sudoers_cmds:+${sudoers_cmds}, }${bin} ${spec}"
+  done
+done
+cat > "${SUDOERS_FILE}.tmp" <<EOF
+# piframe kiosk - written by bootstrap_pi.sh; re-run bootstrap to change.
+${SERVICE_USER} ALL=(root) NOPASSWD: ${sudoers_cmds}
+EOF
+chmod 0440 "${SUDOERS_FILE}.tmp"
+if visudo -c -q -f "${SUDOERS_FILE}.tmp"; then
+  mv "${SUDOERS_FILE}.tmp" "${SUDOERS_FILE}"
+  echo "sudoers: ${SUDOERS_FILE} (systemctl restart/stop/start for the kiosk units)"
+else
+  rm -f "${SUDOERS_FILE}.tmp"
+  echo "WARNING: generated sudoers file failed visudo validation; sudo left unchanged" >&2
+fi
+
+# ----------------------------------------------------------------
+# Wi-Fi: move an imager-written netplan profile to a native
+# NetworkManager keyfile. Raspberry Pi Imager stores Wi-Fi as
+# /etc/netplan/90-NM-<uuid>.yaml and NetworkManager regenerates its
+# real profile from it on every boot. The 2026-09-20 Trixie upgrade
+# (network-manager +rpt4 netplan sync, netplan.io +rpt1) regenerated
+# that profile WITHOUT its key - every frame then failed with
+# "no-secrets". A keyfile under /etc/NetworkManager/system-connections
+# with the PSK stored is what `nmcli device wifi connect` writes and
+# is not touched by netplan. The migration copies the live runtime
+# profile (settings + psk), activates it, then deletes the netplan
+# one; originals are backed up to /root/wifi-backup. It runs DETACHED
+# (systemd-run) because switching connections briefly drops the link
+# and would kill this script when bootstrap is run over Wi-Fi SSH.
+# Idempotent: nothing to do when /etc/netplan has no wifi profile.
+# ----------------------------------------------------------------
+WIFI_MIGRATE_LOG="/var/log/piframe-wifi-migrate.log"
+if ls /etc/netplan/90-NM-*.yaml >/dev/null 2>&1 && grep -lq "^  wifis:" /etc/netplan/90-NM-*.yaml 2>/dev/null; then
+  cat > /usr/local/sbin/piframe-wifi-migrate <<'MIGRATE'
+#!/usr/bin/env bash
+# Written by bootstrap_pi.sh. Never prints the PSK.
+set -euo pipefail
+BACKUP=/root/wifi-backup
+CONN_DIR=/etc/NetworkManager/system-connections
+mkdir -p "$BACKUP"
+for yaml in /etc/netplan/90-NM-*.yaml; do
+  grep -q "^  wifis:" "$yaml" || continue
+  uuid="$(sed -nE 's/^[[:space:]]*uuid: "?([0-9a-f-]{36})"?.*/\1/p' "$yaml" | head -1)"
+  [[ -n "$uuid" ]] || { echo "skip $yaml: no uuid"; continue; }
+  runtime="$(ls /run/NetworkManager/system-connections/netplan-NM-${uuid}-*.nmconnection 2>/dev/null | head -1 || true)"
+  [[ -n "$runtime" ]] || { echo "skip $yaml: no runtime profile for $uuid (not loaded?)"; continue; }
+  grep -q '^psk=' "$runtime" || { echo "skip $yaml: runtime profile carries no psk"; continue; }
+  ssid="$(sed -nE 's/^ssid=(.*)$/\1/p' "$runtime" | head -1)"
+  [[ -n "$ssid" ]] || { echo "skip $yaml: no ssid"; continue; }
+  newid="$ssid"
+  newfile="$CONN_DIR/${newid}.nmconnection"
+  if [[ -e "$newfile" ]]; then
+    echo "skip $yaml: $newfile already exists"; continue
+  fi
+  cp -a "$yaml" "$runtime" "$BACKUP/"
+  newuuid="$(cat /proc/sys/kernel/random/uuid)"
+  umask 077
+  sed -E -e '/^#Netplan/d' -e "s/^uuid=.*/uuid=${newuuid}/" -e "s/^id=.*/id=${newid}/" "$runtime" > "$newfile"
+  chown root:root "$newfile"; chmod 600 "$newfile"
+  nmcli connection load "$newfile"
+  echo "activating '$newid' (from netplan profile $uuid)"
+  nmcli connection up "$newid"
+  sleep 6
+  nmcli connection delete uuid "$uuid" || rm -f "$yaml"
+  echo "migrated $yaml -> $newfile"
+done
+echo "netplan dir now:"; ls -la /etc/netplan/
+echo "active:"; nmcli -t -f NAME,DEVICE,STATE connection show --active
+echo WIFI_MIGRATE_DONE
+MIGRATE
+  chmod 0755 /usr/local/sbin/piframe-wifi-migrate
+  echo "Wi-Fi: netplan profile found - migrating to a NetworkManager keyfile in the background (log: ${WIFI_MIGRATE_LOG})"
+  systemctl reset-failed piframe-wifi-migrate.service 2>/dev/null || true
+  systemd-run --unit=piframe-wifi-migrate --collect \
+    -p StandardOutput=file:"${WIFI_MIGRATE_LOG}" -p StandardError=file:"${WIFI_MIGRATE_LOG}" \
+    /usr/local/sbin/piframe-wifi-migrate >/dev/null 2>&1 || \
+    echo "WARNING: could not launch the Wi-Fi migration unit; run /usr/local/sbin/piframe-wifi-migrate as root by hand" >&2
+fi
+
 systemctl daemon-reload
 systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"
@@ -501,6 +628,8 @@ Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
 Audio device:    ${ALSA_DEVICE}
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}
+Sudoers:         ${SUDOERS_FILE}
+Wi-Fi migration: ${WIFI_MIGRATE_LOG} (only written when a netplan Wi-Fi profile was found)
 
 Useful checks:
   systemctl status ${SERVICE_NAME} --no-pager
