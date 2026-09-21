@@ -274,10 +274,21 @@ ORIGIN_URL="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
 # what dpkg already started. Policy: the frames are not apt-upgraded
 # as routine hygiene (see README "OS packages").
 # ----------------------------------------------------------------
+# The configure step runs as a transient systemd unit, not in this
+# shell: configuring network-manager restarts NetworkManager, which
+# drops Wi-Fi and kills an SSH session (and with it a script running
+# inside it) right in the middle of dpkg - which is exactly how the
+# frames got half-configured in the first place. As a unit, dpkg
+# finishes even if this session dies; re-run bootstrap afterwards.
+# Do NOT power-cycle the frame while the log is still growing.
+DPKG_PREFLIGHT_LOG="/var/log/piframe-dpkg-preflight.log"
 if [[ -n "$(dpkg --audit 2>/dev/null)" ]]; then
   echo "dpkg reports unconfigured packages - finishing the interrupted install first."
-  DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-  DEBIAN_FRONTEND=noninteractive apt-get -y -f install
+  echo "  (runs as unit piframe-dpkg-preflight; log: ${DPKG_PREFLIGHT_LOG})"
+  echo "  If this SSH session drops, WAIT - do not reboot - then reconnect and re-run bootstrap."
+  systemctl reset-failed piframe-dpkg-preflight.service 2>/dev/null || true
+  systemd-run --unit=piframe-dpkg-preflight --wait --collect --quiet     -p StandardOutput=file:"${DPKG_PREFLIGHT_LOG}" -p StandardError=file:"${DPKG_PREFLIGHT_LOG}"     -E DEBIAN_FRONTEND=noninteractive     /bin/bash -c 'dpkg --configure -a && apt-get -y -f install'     || { echo "dpkg preflight failed - see ${DPKG_PREFLIGHT_LOG}" >&2; exit 1; }
+  echo "dpkg preflight complete."
 fi
 
 if [[ ${INSTALL_SYSTEM_PACKAGES} -eq 1 ]]; then

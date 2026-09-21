@@ -709,7 +709,12 @@ frames were left with 150+ packages unpacked-but-unconfigured.
 
 Bootstrap now hardens both: a package-state preflight (`dpkg --audit`
 -> `dpkg --configure -a`, completing an interrupted transaction, not
-upgrading) and a Wi-Fi migration that copies the live netplan-derived
+upgrading; it runs as the transient unit `piframe-dpkg-preflight`, log
+`/var/log/piframe-dpkg-preflight.log`, because configuring
+`network-manager` restarts NetworkManager and drops an SSH-over-Wi-Fi
+session mid-dpkg - if that happens, wait for the log to stop growing,
+reconnect, and re-run bootstrap; never power-cycle a frame while dpkg
+is configuring) and a Wi-Fi migration that copies the live netplan-derived
 profile to a native keyfile in `/etc/NetworkManager/system-connections`
 (PSK stored, autoconnect on), activates it, and deletes the netplan
 one, with originals under `/root/wifi-backup`. The migration runs as a
