@@ -28,6 +28,7 @@ This client now uses one browser-based renderer for:
 - `/etc/systemd/system/piframe-vnc.service` (installed by bootstrap; runs `wayvnc` against the cage Wayland session)
 - `/etc/systemd/system/piframe-cec.service` + `/etc/piframe/cec.env` (installed by bootstrap; the env file is root-only and holds the MQTT login)
 - `/etc/sudoers.d/020_piframe` (installed by bootstrap; passwordless `systemctl` for the three piframe units only)
+- `/etc/systemd/system.conf.d/50-piframe-watchdog.conf` (installed by bootstrap; 3-minute hardware watchdog, see [OS packages](#os-packages-dont-apt-upgrade-the-frames))
 - `/usr/local/sbin/piframe-wifi-migrate` + `/var/log/piframe-wifi-migrate.log` (written by bootstrap only when an imager netplan Wi-Fi profile is found; see [OS packages](#os-packages-dont-apt-upgrade-the-frames))
 
 ## How It Works
@@ -816,6 +817,22 @@ drops an SSH-over-Wi-Fi session for a few seconds. If you ever do
 upgrade: run bootstrap first so the profile is already native, upgrade
 ONE frame, reboot it, check `dpkg --audit` is empty and
 `/etc/sudoers.d/020_piframe` still exists, then do the rest.
+
+**Watchdog: 3 minutes, set by bootstrap** (`/etc/systemd/system.conf.d/50-piframe-watchdog.conf`,
+overriding Raspberry Pi OS's 1-minute default). On `network-manager
+1.52.1-1+rpt4` every NetworkManager *restart* makes NM request a
+systemd reload that deadlocks for exactly 90s in the generator sandbox
+(journal: `Failed to fork off sandboxing environment for executing
+generators` / `Reloading finished in 90192 ms`); with a 60s watchdog
+the board hard-resets first. That was the real reason stairs and both
+living-room frames stayed half-configured from 2026-09-20 to 09-22 -
+the dpkg preflight configured network-manager, the frame reset a
+minute later, every time. A boot-time NetworkManager start doesn't
+trigger it, and a frame without the watchdog override is fine until
+something restarts NetworkManager. Bootstrap writes the override
+before the preflight and applies it to the running system, so the
+preflight is safe on the first run. Expect Wi-Fi to be gone for ~90s
+whenever NetworkManager restarts on these packages.
 
 ### Line-ending guard
 

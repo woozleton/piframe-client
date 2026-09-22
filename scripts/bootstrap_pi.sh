@@ -344,6 +344,36 @@ ORIGIN_URL="$(git -C "${REPO_DIR}" remote get-url origin 2>/dev/null || true)"
 # frames got half-configured in the first place. As a unit, dpkg
 # finishes even if this session dies; re-run bootstrap afterwards.
 # Do NOT power-cycle the frame while the log is still growing.
+# ----------------------------------------------------------------
+# Hardware watchdog: 3 minutes, not Raspberry Pi OS's 1 minute
+# (/usr/lib/systemd/system.conf.d/40-rpi-enable-watchdog.conf). On
+# network-manager 1.52.1-1+rpt4 every NetworkManager restart makes NM
+# ask systemd for a daemon-reload that deadlocks in the generator
+# sandbox for exactly 90s ("Failed to fork off sandboxing environment
+# for executing generators: Protocol error", "Reloading finished in
+# 90192 ms"). PID1 can't pet the watchdog meanwhile, so at 60s the
+# board hard-resets - that is what kept stairs + both living-room
+# frames half-configured from 2026-09-20 to 09-22: configuring
+# network-manager restarts NM, the frame reset ~60s later, dpkg never
+# finished, and the next attempt did the same. A boot-time NM start
+# does not trigger it. 3 minutes clears the 90s stall and still
+# catches a genuinely hung system. Written before the dpkg preflight
+# and applied to the running manager too (no reboot needed), so the
+# preflight below is protected on its first run.
+# ----------------------------------------------------------------
+WATCHDOG_CONF="/etc/systemd/system.conf.d/50-piframe-watchdog.conf"
+install -d -m 0755 "$(dirname "${WATCHDOG_CONF}")"
+cat > "${WATCHDOG_CONF}" <<'EOF'
+# piframe - written by bootstrap_pi.sh; see the watchdog note there.
+# Overrides 40-rpi-enable-watchdog.conf (later name wins).
+[Manager]
+RuntimeWatchdogSec=3min
+EOF
+busctl set-property org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+  org.freedesktop.systemd1.Manager RuntimeWatchdogUSec t 180000000 2>/dev/null \
+  || echo "WARNING: could not apply the 3-minute watchdog to the running system; it takes effect at next boot" >&2
+WATCHDOG_STATE="$(systemctl show -p RuntimeWatchdogUSec --value 2>/dev/null || echo unknown)"
+
 DPKG_PREFLIGHT_LOG="/var/log/piframe-dpkg-preflight.log"
 if [[ -n "$(dpkg --audit 2>/dev/null)" ]]; then
   echo "dpkg reports unconfigured packages - finishing the interrupted install first."
@@ -820,6 +850,7 @@ VNC config:      ${VNC_CONFIG_FILE}
 CEC service:     ${CEC_SERVICE_FILE} (MQTT ${MQTT_USER}@${MQTT_HOST}$([[ -n "${MQTT_PASSWORD}" ]] || echo ', NO PASSWORD - CEC-only'))
 CEC check:       ${CEC_STATE}
 Sudoers:         ${SUDOERS_FILE}
+Watchdog:        ${WATCHDOG_STATE} (${WATCHDOG_CONF})
 Wi-Fi migration: ${WIFI_MIGRATE_LOG} (only written when a netplan Wi-Fi profile was found)
 
 Useful checks:
