@@ -94,6 +94,15 @@ after_short="$(git rev-parse --short HEAD)"
 echo "[update] after:  $after_short"
 
 restart_service() {
+  # piframe-cec (TV power over CEC) runs from this same checkout. Restart
+  # it FIRST: restarting the client below kills this script along with
+  # the client's cgroup. Skipped on frames bootstrapped before the unit
+  # existed; a sudo failure here only means it keeps its old code until
+  # the next bootstrap re-run, so it never blocks the client restart.
+  if [ -f /etc/systemd/system/piframe-cec.service ]; then
+    sudo -n /bin/systemctl restart piframe-cec \
+      || echo "[update] could not restart piframe-cec (sudoers predates it? re-run bootstrap)"
+  fi
   # Preferred: systemd restarts the whole unit (kills cage/chromium/mpv
   # with the cgroup, respawns us on the new code). sudo -n so a missing
   # passwordless rule fails fast instead of hanging on a password prompt

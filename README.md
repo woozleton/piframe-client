@@ -14,6 +14,7 @@ This client now uses one browser-based renderer for:
 
 - `piframe_client.py` - WebSocket client + browser orchestrator + audio companion sidecar
 - `browser_renderer_template.py` - Chromium kiosk HTML/JS template
+- `piframe_cec.py` - TV power over HDMI-CEC for Home Assistant (own unit; see [TV Power (HDMI-CEC)](#tv-power-hdmi-cec))
 - `vendor/butterchurn/` - Butterchurn (MilkDrop port) + preset bundle for the audio visualizer overlay
 - `vendor/h264ify/` - bundled Chromium extension that forces video sites
   off AV1 in webview mode (see [Remote Control](#remote-control-vnc))
@@ -25,7 +26,8 @@ This client now uses one browser-based renderer for:
 - `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
 - `/etc/systemd/system/piframe-client.service` (installed by bootstrap)
 - `/etc/systemd/system/piframe-vnc.service` (installed by bootstrap; runs `wayvnc` against the cage Wayland session)
-- `/etc/sudoers.d/020_piframe` (installed by bootstrap; passwordless `systemctl` for the two units only)
+- `/etc/systemd/system/piframe-cec.service` + `/etc/piframe/cec.env` (installed by bootstrap; the env file is root-only and holds the MQTT login)
+- `/etc/sudoers.d/020_piframe` (installed by bootstrap; passwordless `systemctl` for the three piframe units only)
 - `/usr/local/sbin/piframe-wifi-migrate` + `/var/log/piframe-wifi-migrate.log` (written by bootstrap only when an imager netplan Wi-Fi profile is found; see [OS packages](#os-packages-dont-apt-upgrade-the-frames))
 
 ## How It Works
@@ -315,6 +317,55 @@ path covers every other item's missing-file case. The renderer also
 preloads three slots ahead and waits for each image to decode (capped
 at 1.5s) before the cross-fade activates it, so a slide's first frame
 is never blank while a multi-MB image is still arriving.
+
+## TV Power (HDMI-CEC)
+
+Home Assistant switches each frame's TV on and off over HDMI-CEC, sent
+by `piframe_cec.py` running as `piframe-cec.service`. It is a separate
+unit from the kiosk on purpose: a kiosk restart never touches the TV,
+and screen control keeps working when the kiosk is broken. Nothing is
+per-frame - it opens every `/dev/cec*`, uses whichever HDMI port has a
+TV, and learns the TV input from the TV, so any Pi port and any TV
+input work.
+
+In Home Assistant each frame appears via MQTT discovery (broker: the
+Mosquitto add-on, login from `/etc/piframe/cec.env`) as a device named
+after the hostname, with `switch.<host>_screen` and a diagnostic
+`sensor.<host>_tv_power` (the raw CEC report). Topics:
+`piframe/<host>/screen/set` (ON/OFF, retained - the broker holds the
+desired state), `.../screen/state`, `.../tv_power`, `.../availability`.
+
+What it sends (field-tested 2026-09-22):
+
+- **on**: `<Image View On>` then broadcast `<Active Source>`.
+- **off**: broadcast `<Active Source>`, then `<Standby>`. A Samsung
+  ignored a bare standby; announcing the source first fixed it.
+- **status**: only a report of `on` means on. TVs report off as
+  `standby`, `to-on` or `to-standby` depending on the model.
+- **Power returns** (the TV's physical address comes back after 5s+
+  gone) or **the Pi just booted**, and the screen is meant to be on:
+  wake it. A plain service restart (OTA) never changes the TV. The
+  desired state is also cached in `/var/lib/piframe-cec` so a power cut
+  recovers before Home Assistant is back.
+- Answers the TV's `<Request Active Source>` so a TV woken by its own
+  remote lands on the kiosk. TV-remote key passthrough is deliberately
+  off (keys must not reach the kiosk browser).
+
+Per TV, once: enable HDMI-CEC (Samsung: **Anynet+**) and, on Samsung
+Frames, set **Power Button Option = On/Off** so standby turns the TV
+off instead of into Art Mode. Bootstrap ends with a read-only CEC check
+that warns when the TV doesn't answer. Exceptions are handled in Home
+Assistant, not here: the 3fl-mirror's rebuilt Vizio ignores standby and
+always reports `on`, so its off is a smart plug and this service only
+wakes it when mains power returns.
+
+Hand checks (safe alongside the running service):
+
+```bash
+~/piframe_client/api-env/bin/python ~/piframe_client/piframe_cec.py --probe   # read-only
+~/piframe_client/api-env/bin/python ~/piframe_client/piframe_cec.py --on      # or --off
+journalctl -u piframe-cec -f
+```
 
 ## Remote Control (VNC)
 
@@ -704,9 +755,11 @@ The bootstrap is idempotent: re-running on a configured Pi
 overwrites the unit files in place, preserves
 `PIFRAME_OUTPUT_TRANSFORM` from the existing service file (so the
 operator's orientation choice survives), and skips the wayvnc
-config write if one already exists. It does restart both
-`piframe-client` and `piframe-vnc` at the end so there's a brief
-blank screen.
+config write if one already exists. It does restart
+`piframe-client`, `piframe-vnc` and `piframe-cec` at the end so
+there's a brief blank screen. The MQTT login in
+`/etc/piframe/cec.env` is reused on re-runs; a first install takes it
+from `PIFRAME_MQTT_PASSWORD` or a prompt.
 
 ### Sudoers prerequisite
 
@@ -718,7 +771,9 @@ piframe-vnc piframe-client` and has no fallback - stopping a unit
 needs root.
 `bootstrap_pi.sh` writes `/etc/sudoers.d/020_piframe` (validated with
 `visudo -c`) granting exactly those `systemctl restart|stop|start`
-forms for the two units, under both `/bin` and `/usr/bin` spellings.
+forms for the kiosk units and `piframe-cec`, under both `/bin` and
+`/usr/bin` spellings. `update.sh` restarts `piframe-cec` before the
+client (the client restart kills the updater with its cgroup).
 
 Don't rely on Raspberry Pi OS's `010_pi-nopasswd` (`NOPASSWD: ALL`)
 for this: it belongs to `raspberrypi-sys-mods`, and on 2026-09-20 an

@@ -31,6 +31,18 @@ OUTPUT_MODE=""
 # different audio characteristics. Auto-detected from connected display.
 # Format: plughw:X,Y where X is card number, Y is device number.
 ALSA_DEVICE=""
+# TV power over HDMI-CEC (piframe_cec.py): its own unit, talking MQTT to
+# Home Assistant's Mosquitto broker. Settings live in a root-only env file
+# so the password never lands in a world-readable unit file. Empty values
+# here mean "inherit from the existing env file, else default" (password:
+# else PIFRAME_MQTT_PASSWORD, else prompt on a terminal, else CEC-only).
+CEC_SERVICE_NAME="piframe-cec"
+CEC_ENV_FILE="/etc/piframe/cec.env"
+MQTT_HOST=""
+MQTT_USER=""
+MQTT_PASSWORD="${PIFRAME_MQTT_PASSWORD:-}"
+MQTT_HOST_DEFAULT="192.168.130.11"
+MQTT_USER_DEFAULT="piframe"
 
 detect_alsa_device() {
   # Auto-detect which HDMI port has a display connected.
@@ -92,6 +104,12 @@ Options:
   --alsa-device <dev>    ALSA device for audio (plughw:card,device).
                          Auto-detected from connected display if omitted.
                          The Pi 5 has two HDMI ports: 0 and 1.
+  --mqtt-host <host>     MQTT broker for TV power control (piframe-cec).
+                         Default: existing ${CEC_ENV_FILE}, else ${MQTT_HOST_DEFAULT}
+  --mqtt-user <name>     MQTT login. Default: existing env file, else ${MQTT_USER_DEFAULT}
+  --mqtt-password <pw>   MQTT password. Prefer PIFRAME_MQTT_PASSWORD or the
+                         interactive prompt (flags show up in ps). Re-runs
+                         reuse the one already in ${CEC_ENV_FILE}.
   --skip-apt             Skip apt package installation.
   -h, --help             Show this help.
 EOF
@@ -125,6 +143,18 @@ while [[ $# -gt 0 ]]; do
       ;;
     --alsa-device)
       ALSA_DEVICE="$2"
+      shift 2
+      ;;
+    --mqtt-host)
+      MQTT_HOST="$2"
+      shift 2
+      ;;
+    --mqtt-user)
+      MQTT_USER="$2"
+      shift 2
+      ;;
+    --mqtt-password)
+      MQTT_PASSWORD="$2"
       shift 2
       ;;
     --skip-apt)
@@ -259,6 +289,34 @@ EOF
     OUTPUT_TRANSFORM_VALUE="90"
     echo "No --orientation flag and no terminal; defaulting to portrait (transform=90)."
   fi
+fi
+
+# ----------------------------------------------------------------
+# Resolve the MQTT settings for piframe-cec. Same inheritance idea as
+# orientation: an explicit flag wins, else the value already in the
+# env file (a routine re-run must not need the password again), else
+# the default. A missing password prompts on a terminal; with no
+# terminal the service still installs and runs CEC-only (it wakes the
+# TV after power returns but Home Assistant can't reach it) until a
+# re-run supplies one.
+# ----------------------------------------------------------------
+env_file_value() {
+  [[ -f "${CEC_ENV_FILE}" ]] || return 0
+  sed -n "s/^$1=//p" "${CEC_ENV_FILE}" | head -1
+}
+[[ -n "${MQTT_HOST}" ]] || MQTT_HOST="$(env_file_value PIFRAME_MQTT_HOST)"
+[[ -n "${MQTT_USER}" ]] || MQTT_USER="$(env_file_value PIFRAME_MQTT_USER)"
+[[ -n "${MQTT_PASSWORD}" ]] || MQTT_PASSWORD="$(env_file_value PIFRAME_MQTT_PASSWORD)"
+MQTT_HOST="${MQTT_HOST:-${MQTT_HOST_DEFAULT}}"
+MQTT_USER="${MQTT_USER:-${MQTT_USER_DEFAULT}}"
+if [[ -z "${MQTT_PASSWORD}" && -t 0 ]]; then
+  echo
+  echo "TV power control logs in to the MQTT broker at ${MQTT_HOST} as '${MQTT_USER}'."
+  read -r -s -p "MQTT password (Enter to skip; TV control then stays local-only): " MQTT_PASSWORD || MQTT_PASSWORD=""
+  echo
+fi
+if [[ -z "${MQTT_PASSWORD}" ]]; then
+  echo "WARNING: no MQTT password - ${CEC_SERVICE_NAME} will run CEC-only (no Home Assistant). Re-run with PIFRAME_MQTT_PASSWORD=... to connect it." >&2
 fi
 
 VNC_SERVICE_FILE="/etc/systemd/system/${VNC_SERVICE_NAME}.service"
@@ -497,6 +555,52 @@ WantedBy=multi-user.target
 EOF
 
 # ----------------------------------------------------------------
+# piframe-cec: TV power over HDMI-CEC for Home Assistant. Its own unit
+# on purpose - a kiosk restart (OTA, crash, mode swap) never blips the
+# TV, and screen control keeps working when the kiosk is broken. Same
+# checkout + venv as the client, so self-update ships it too (update.sh
+# restarts it). No per-frame settings: it finds whichever HDMI port has
+# the TV and learns its input from the TV. StateDirectory holds the
+# last desired on/off so a power cut recovers before HA is back up.
+# ----------------------------------------------------------------
+CEC_SERVICE_FILE="/etc/systemd/system/${CEC_SERVICE_NAME}.service"
+install -d -m 0755 "$(dirname "${CEC_ENV_FILE}")"
+(
+  umask 077
+  cat > "${CEC_ENV_FILE}" <<EOF
+# piframe-cec - written by bootstrap_pi.sh; re-run bootstrap to change.
+PIFRAME_MQTT_HOST=${MQTT_HOST}
+PIFRAME_MQTT_PORT=1883
+PIFRAME_MQTT_USER=${MQTT_USER}
+PIFRAME_MQTT_PASSWORD=${MQTT_PASSWORD}
+EOF
+)
+chown root:root "${CEC_ENV_FILE}"
+chmod 0600 "${CEC_ENV_FILE}"
+
+cat > "${CEC_SERVICE_FILE}" <<EOF
+[Unit]
+Description=PiFrame CEC (TV power over HDMI-CEC for Home Assistant)
+# Soft network dependency: CEC works without the broker, and paho
+# reconnects on its own once the network is up.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=${SERVICE_USER}
+WorkingDirectory=${REPO_DIR}
+ExecStart=${VENV_DIR}/bin/python ${REPO_DIR}/piframe_cec.py
+EnvironmentFile=-${CEC_ENV_FILE}
+Environment=PYTHONUNBUFFERED=1
+StateDirectory=${CEC_SERVICE_NAME}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# ----------------------------------------------------------------
 # Point systemd-timesyncd at the woozlescape server's LAN NTP.
 # The mural's cross-screen sync needs the fleet to agree with the
 # SERVER's clock (the show's clock master), not with true UTC -
@@ -543,7 +647,10 @@ for bin in /usr/bin/systemctl /bin/systemctl; do
     "stop ${SERVICE_NAME}" \
     "start ${SERVICE_NAME}" \
     "stop ${VNC_SERVICE_NAME}" \
-    "start ${VNC_SERVICE_NAME}"; do
+    "start ${VNC_SERVICE_NAME}" \
+    "restart ${CEC_SERVICE_NAME}" \
+    "stop ${CEC_SERVICE_NAME}" \
+    "start ${CEC_SERVICE_NAME}"; do
     sudoers_cmds="${sudoers_cmds:+${sudoers_cmds}, }${bin} ${spec}"
   done
 done
@@ -554,7 +661,7 @@ EOF
 chmod 0440 "${SUDOERS_FILE}.tmp"
 if visudo -c -q -f "${SUDOERS_FILE}.tmp"; then
   mv "${SUDOERS_FILE}.tmp" "${SUDOERS_FILE}"
-  echo "sudoers: ${SUDOERS_FILE} (systemctl restart/stop/start for the kiosk units)"
+  echo "sudoers: ${SUDOERS_FILE} (systemctl restart/stop/start for the kiosk + CEC units)"
 else
   rm -f "${SUDOERS_FILE}.tmp"
   echo "WARNING: generated sudoers file failed visudo validation; sudo left unchanged" >&2
@@ -671,6 +778,30 @@ systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
 systemctl enable "${VNC_SERVICE_NAME}"
 systemctl restart "${VNC_SERVICE_NAME}"
+systemctl enable "${CEC_SERVICE_NAME}"
+systemctl restart "${CEC_SERVICE_NAME}"
+
+# ----------------------------------------------------------------
+# CEC check, next to the NAS one: catch a TV with HDMI-CEC switched off
+# at setup rather than the first time Home Assistant can't turn it off.
+# Read-only (vendor + power queries); the screen doesn't change. Waits
+# for the service to claim its CEC address first. Never fatal.
+# ----------------------------------------------------------------
+sleep 4
+CEC_STATE="$(sudo -u "${SERVICE_USER}" "${VENV_DIR}/bin/python" "${REPO_DIR}/piframe_cec.py" --probe 2>&1 | tail -1 || true)"
+case "${CEC_STATE}" in
+  *"TV answering"*) ;;
+  *)
+    echo "" >&2
+    echo "WARNING: ${CEC_STATE:-CEC probe produced no output}" >&2
+    echo "  Home Assistant won't be able to switch this TV until the TV answers CEC." >&2
+    echo "  Samsung: Settings > General > External Device Manager > Anynet+ (HDMI-CEC) = On," >&2
+    echo "  and Settings > General > Power and Energy Saving > Power Button Option = On/Off" >&2
+    echo "  (so standby turns it off instead of into Art Mode). Menu names vary by model year." >&2
+    echo "  Then re-check: ${VENV_DIR}/bin/python ${REPO_DIR}/piframe_cec.py --probe" >&2
+    echo "" >&2
+    ;;
+esac
 
 cat <<EOF
 
@@ -686,6 +817,8 @@ Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
 Audio device:    ${ALSA_DEVICE}
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}
+CEC service:     ${CEC_SERVICE_FILE} (MQTT ${MQTT_USER}@${MQTT_HOST}$([[ -n "${MQTT_PASSWORD}" ]] || echo ', NO PASSWORD - CEC-only'))
+CEC check:       ${CEC_STATE}
 Sudoers:         ${SUDOERS_FILE}
 Wi-Fi migration: ${WIFI_MIGRATE_LOG} (only written when a netplan Wi-Fi profile was found)
 
@@ -693,6 +826,7 @@ Useful checks:
   systemctl status ${SERVICE_NAME} --no-pager
   journalctl -u ${SERVICE_NAME} -f
   systemctl status ${VNC_SERVICE_NAME} --no-pager
+  journalctl -u ${CEC_SERVICE_NAME} -f
   pactl get-sink-volume @DEFAULT_SINK@
 
 If audio does not work on the target Pi, verify the ALSA device with: aplay -l
