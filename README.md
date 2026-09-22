@@ -562,6 +562,29 @@ sudo systemctl status piframe-client --no-pager
 journalctl -u piframe-client -f
 ```
 
+### Black screen while the manager says "slideshow"
+
+Check the NAS mount first. Every slide is loaded over `file://` from
+`/mnt/nas`, so an unmounted share means a black page while the client
+still reports the playlist as playing. The mount unit is `nofail` by
+design, so the failure is silent at boot.
+
+```bash
+mountpoint /mnt/nas
+systemctl status mnt-nas.mount --no-pager
+grep /mnt/nas /etc/fstab
+```
+
+`mount error(2): No such file or directory` with a reachable NAS means
+the share path in fstab no longer exists on the NAS (the media folder
+was renamed once; a frame that was offline at the time kept the old
+name). Compare against a working frame's fstab line, fix, then
+`sudo systemctl daemon-reload && sudo systemctl start mnt-nas.mount`.
+Re-running bootstrap performs this check and prints the fix.
+
+Also remember the idle page is black on black: through mirror glass a
+frame on the idle page looks switched off. Play something to it first.
+
 ### Getting a console on the frame (maintenance chord)
 
 cage is launched with `-s` (allow VT switching), so with a keyboard
@@ -782,6 +805,10 @@ What it does:
 - writes `/etc/systemd/system/piframe-client.service`
 - writes `/etc/systemd/system/piframe-vnc.service`
 - writes `/etc/sudoers.d/020_piframe` (see [Sudoers prerequisite](#sudoers-prerequisite))
+- checks the NAS mount: retries `mnt-nas.mount` once and, if the share
+  is still not mounted, warns with the fstab line, the unit's last log
+  lines and a fix hint when the path drifted from the fleet's
+  (`NAS_SHARE_EXPECTED` at the top of the script). Never fatal.
 - migrates an imager-written netplan Wi-Fi profile to a native
   NetworkManager keyfile, detached, when one exists
 - writes `/home/<user>/.config/wayvnc/config` (only if absent, so

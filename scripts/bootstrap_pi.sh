@@ -8,6 +8,11 @@ SERVICE_USER="${SUDO_USER:-${USER}}"
 SERVER_URL="ws://192.168.100.100:8080/ws"
 NAS_ROOT="/mnt/nas"
 MOUNT_UNIT="mnt-nas.mount"
+# What the fleet's fstab points at. Only used by the NAS mount check
+# below to flag a frame whose fstab drifted (the share folder was
+# renamed once and one frame kept the old name -> mount failed ->
+# black screen while the client still reported "slideshow").
+NAS_SHARE_EXPECTED="//192.168.100.15/Media/Displays"
 SERVICE_NAME="piframe-client"
 VNC_SERVICE_NAME="piframe-vnc"
 VNC_LISTEN_ADDRESS="0.0.0.0"
@@ -619,6 +624,47 @@ MIGRATE
     echo "WARNING: could not launch the Wi-Fi migration unit; run /usr/local/sbin/piframe-wifi-migrate as root by hand" >&2
 fi
 
+# ----------------------------------------------------------------
+# NAS mount check. The kiosk loads every slide over file:// from
+# ${NAS_ROOT}; if the share isn't mounted the page paints black while
+# the client happily reports "slideshow" to the manager. The mount
+# unit is nofail on purpose (a slow NAS must not block boot), so a
+# failure is silent unless someone looks. Try once more now that the
+# network is up, then WARN loudly with the fstab line, the unit's
+# last words and a fix hint when the fstab path drifted from the fleet.
+# Never fatal: the frame still boots to the idle page without it.
+# ----------------------------------------------------------------
+NAS_MOUNT_STATE="not configured"
+if [[ -n "${MOUNT_UNIT}" ]]; then
+  if ! systemctl is-active --quiet "${MOUNT_UNIT}"; then
+    systemctl reset-failed "${MOUNT_UNIT}" 2>/dev/null || true
+    systemctl start "${MOUNT_UNIT}" 2>/dev/null || true
+  fi
+  if mountpoint -q "${NAS_ROOT}"; then
+    NAS_MOUNT_STATE="active (${NAS_ROOT})"
+  else
+    NAS_MOUNT_STATE="FAILED - see warning above"
+    fstab_line="$(grep -E "[[:space:]]${NAS_ROOT}[[:space:]]" /etc/fstab 2>/dev/null || true)"
+    echo "" >&2
+    echo "WARNING: ${NAS_ROOT} is not mounted (${MOUNT_UNIT} failed)." >&2
+    echo "  The kiosk will show a black screen for every playlist until this is fixed." >&2
+    if [[ -n "${fstab_line}" ]]; then
+      echo "  fstab: ${fstab_line}" >&2
+      fstab_share="$(printf '%s' "${fstab_line}" | awk '{print $1}')"
+      if [[ -n "${NAS_SHARE_EXPECTED}" && "${fstab_share}" != "${NAS_SHARE_EXPECTED}" ]]; then
+        echo "  The fleet mounts ${NAS_SHARE_EXPECTED} - this frame's fstab points elsewhere." >&2
+        echo "  Fix: sudo sed -i 's#${fstab_share}#${NAS_SHARE_EXPECTED}#' /etc/fstab && sudo systemctl daemon-reload && sudo systemctl start ${MOUNT_UNIT}" >&2
+      fi
+    else
+      echo "  No fstab entry for ${NAS_ROOT}. Expected something like:" >&2
+      echo "  ${NAS_SHARE_EXPECTED}  ${NAS_ROOT}  cifs  credentials=/root/.nascred,vers=3.0,iocharset=utf8,_netdev,nofail  0  0" >&2
+    fi
+    echo "  Unit log:" >&2
+    journalctl -u "${MOUNT_UNIT}" -b --no-pager 2>/dev/null | tail -4 | sed 's/^/    /' >&2
+    echo "" >&2
+  fi
+fi
+
 systemctl daemon-reload
 systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"
@@ -635,6 +681,7 @@ Service user:    ${SERVICE_USER}
 Service file:    ${SERVICE_FILE}
 Server URL:      ${SERVER_URL}
 NAS root:        ${NAS_ROOT}
+NAS mount:       ${NAS_MOUNT_STATE}
 Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
 Audio device:    ${ALSA_DEVICE}
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
