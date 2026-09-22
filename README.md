@@ -1,6 +1,6 @@
 # PiFrame Client
 
-`piframe_client.py` is the client that connects to the PiFrame Manager server over WebSocket and renders all media through a single Chromium kiosk session running under `cage`.
+`piframe_client.py` is the client that connects to the PiFrame Manager server (the `pfm/` side of [woozlescape](https://github.com/woozleton/woozlescape), the only manager the frames talk to) over WebSocket and renders all media through a single Chromium kiosk session running under `cage`.
 
 This client now uses one browser-based renderer for:
 
@@ -122,7 +122,7 @@ wall-clock lockstep instead of free-running:
 
 Requires NTP-synced clocks (standard Raspberry Pi OS setup). The
 server-side model (timetable generation, dedup registry, degradation
-ladder) is documented in the manager repo at
+ladder) is documented in the woozlescape repo at
 `docs/subsystems/display-sync.md`.
 
 ## Mural / Clock-Synced Video
@@ -171,7 +171,7 @@ mode.
 While mural is active the client reports `playback_state: "mural"` in its
 heartbeat (the manager's schedule / companion guards key on it). Requires
 NTP-synced clocks, exactly like the clock-synced slideshow above. The
-server-side model is documented in the manager repo at
+server-side model is documented in the woozlescape repo at
 `docs/plans/mural.md`.
 
 ### Sprite overlay (mural Road B)
@@ -290,7 +290,7 @@ malformed command is dropped (logged as `sprite_show_invalid` with a
 reason) and nothing on screen changes.
 
 Requires NTP-synced clocks, like every other clock-driven mode here. The
-server-side model lives in the manager repo at `docs/plans/mural.md`.
+server-side model lives in the woozlescape repo at `docs/plans/mural.md`.
 
 ## Display Features
 
