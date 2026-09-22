@@ -2070,8 +2070,15 @@ class PiFrameClient:
             _log("register_failed", error=exc)
         self._start_status_updates()
         self.renderer.set_banner(None)
-        # Ensure the screen is always owned by the browser renderer.
-        self.renderer.ensure_idle(self._get_idle_media())
+        # Ensure the screen is always owned by the browser renderer -
+        # but only start it when it's NOT running. A reconnect must not
+        # replace content that survived the disconnect (see on_close);
+        # ensure_idle() would, because its "(idle)" check never matches
+        # the "browser idle ..." command string and it always re-shows
+        # idle. That always-idle behaviour is what webview_close wants,
+        # so it is left alone there.
+        if not self.renderer.is_running:
+            self.renderer.show_idle(self._get_idle_media())
 
     def on_message(self, ws, message: str) -> None:  # pylint: disable=unused-argument
         try:
@@ -3060,27 +3067,38 @@ class PiFrameClient:
         self.renderer.set_sprite(None)
 
     def on_close(self, ws, close_status_code, close_msg) -> None:  # pylint: disable=unused-argument
+        """Manager connection lost. Keep playing.
+
+        Whatever is on screen stays there with a "Server disconnected"
+        banner over it. Slides come from the NAS mount and clock-slot
+        sync keys off wall-clock time, so a frame needs nothing from the
+        manager to keep flipping in step with its neighbours. Until
+        2026-09-21 this dropped to the idle page instead - which meant
+        every manager restart, crash or network blip blanked the whole
+        fleet, and since the manager does not replay manual plays on
+        reconnect, the screens stayed blank until someone noticed.
+
+        The playback bookkeeping is deliberately left intact: the next
+        heartbeat after reconnect reports the slideshow that is still
+        genuinely running. Only when the renderer itself is gone (cage
+        died) do we fall back to idle and clear state, so the manager
+        never sees PLAYING against a dead screen."""
         _log("websocket_closed", code=close_status_code, message=close_msg)
         self.ws_connection = None
         self._stop_status_updates()
-        self.renderer.show_idle(self._get_idle_media())
+        if not self.renderer.is_running:
+            self.renderer.show_idle(self._get_idle_media())
+            self.current_video = ""
+            self.current_slideshow = []
+            self.current_sync = None
+            self.current_video_sync = None
+            self.current_playlist_name = ""
+            self.current_playlist_id = ""
+            self.playback_state = "stopped"
+            self.slideshow_started_at = None
+            BROWSER_EVENT_STATE.clear_slideshow_index()
+            BROWSER_EVENT_STATE.set_paused(False)
         self.renderer.set_banner("Server disconnected", level="error")
-        # Renderer is now idle - clear the playback bookkeeping so the
-        # next heartbeat (after reconnect) reports the truth instead of
-        # the stale slideshow/playing state from before the disconnect.
-        # Without this, the manager's Now Playing panel paints PLAYING
-        # against the last content for every reconnect, even though the
-        # Pi has been on idle.html the whole time.
-        self.current_video = ""
-        self.current_slideshow = []
-        self.current_sync = None
-        self.current_video_sync = None
-        self.current_playlist_name = ""
-        self.current_playlist_id = ""
-        self.playback_state = "stopped"
-        self.slideshow_started_at = None
-        BROWSER_EVENT_STATE.clear_slideshow_index()
-        BROWSER_EVENT_STATE.set_paused(False)
 
     def on_error(self, ws, error: Exception) -> None:  # pylint: disable=unused-argument
         _log("websocket_error", error=error)

@@ -1191,6 +1191,13 @@ Behavior:
 
 - the banner overlays current content
 - it clears automatically when valid content resumes
+- `Server disconnected` does NOT stop playback: the frame keeps its
+  current playlist (slides come from the NAS mount, clock-slot sync
+  keys off wall-clock time) and the banner clears on reconnect. The
+  manager does not replay manual plays on reconnect, so this is what
+  keeps a manager restart from blanking the fleet. Before 2026-09-21
+  the client dropped to the idle page on disconnect instead. Only when
+  the renderer itself is dead does a disconnect fall back to idle.
 - it is sized for the post-rotation viewport (the compositor rotates
   the framebuffer; the renderer treats the canvas as native portrait
   on a portrait-mounted Pi)
