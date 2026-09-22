@@ -16,14 +16,27 @@
 #     archived to the logfile and clobbered on update - this checkout
 #     is a deployment artifact, not a workspace.
 #   * Deploy key (or HTTPS creds) is configured so `git pull` doesn't prompt.
-#   * Sudoers entry allows the service user to restart without a password.
+#   * Sudoers entry allows the service user to restart without a password
+#     (preferred - a clean cgroup restart). Without it the script asks the
+#     running client to exit instead; see restart_service.
 #   * Service unit has `Restart=always` so the in-flight restart self-heals
-#     even if the new code crashes on boot.
+#     even if the new code crashes on boot - and so the no-sudo exit path
+#     above respawns at all.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 SERVICE_NAME="${PIFRAME_SERVICE_NAME:-piframe-client}"
+# Set by the client when it spawns us: the short SHA it is actually
+# RUNNING (read once at its boot) and its pid. Both are optional so the
+# script still works when run by hand. They drive two fixes:
+#   * restart when the running code != HEAD even if the checkout is
+#     already current (a previous run pulled fine but its restart
+#     failed - without this every later run said "already up to date,
+#     skipping restart" and the old process lived on forever);
+#   * a no-sudo restart path (see restart_service).
+RUNNING_SHORT="${PIFRAME_RUNNING_SHA:-}"
+CLIENT_PID="${PIFRAME_CLIENT_PID:-}"
 LAST_UPDATE_FILE="${PIFRAME_LAST_UPDATE_FILE:-/tmp/piframe_last_update.json}"
 LOG_FILE="${PIFRAME_UPDATE_LOG:-/tmp/piframe_update.log}"
 
@@ -80,9 +93,48 @@ after_full="$(git rev-parse HEAD)"
 after_short="$(git rev-parse --short HEAD)"
 echo "[update] after:  $after_short"
 
-# Already up to date - no restart needed. Drop a marker so the UI can
-# show "already up to date" instead of implying we never got the click.
-if [ "$before_full" = "$after_full" ]; then
+restart_service() {
+  # Preferred: systemd restarts the whole unit (kills cage/chromium/mpv
+  # with the cgroup, respawns us on the new code). sudo -n so a missing
+  # passwordless rule fails fast instead of hanging on a password prompt
+  # ("a terminal is required to read the password" in this log was the
+  # signature of exactly that on three frames after an interrupted OS
+  # upgrade removed the Pi's sudoers file).
+  echo "[update] handing off to systemctl restart"
+  if sudo -n /bin/systemctl restart "$SERVICE_NAME"; then
+    exit 0
+  fi
+  # Fallback: no sudo. Ask the running client to exit; the unit has
+  # Restart=always, so systemd respawns it on the code now on disk. The
+  # client's children die with the cgroup when the main process goes.
+  echo "[update] sudo restart unavailable - asking the client (pid ${CLIENT_PID:-?}) to exit so systemd respawns it"
+  if [ -n "$CLIENT_PID" ] && kill -0 "$CLIENT_PID" 2>/dev/null; then
+    kill -TERM "$CLIENT_PID" && exit 0
+  fi
+  echo "[update] could not restart: no sudo and no live client pid. New code is on disk; restart or reboot the frame."
+  exit 4
+}
+
+# Restart when the checkout moved, OR when the running process is on a
+# different commit than HEAD (an earlier run's restart failed).
+needs_restart=0
+if [ "$before_full" != "$after_full" ]; then
+  needs_restart=1
+fi
+if [ -n "$RUNNING_SHORT" ] && [ "$RUNNING_SHORT" != "$after_short" ]; then
+  if [ "$needs_restart" -eq 0 ]; then
+    echo "[update] running client is $RUNNING_SHORT but HEAD is $after_short - restarting even though the checkout was already current"
+    # Report the change the operator actually sees: running -> HEAD.
+    before_short="$RUNNING_SHORT"
+    before_full="$(git rev-parse "$RUNNING_SHORT" 2>/dev/null || echo "$before_full")"
+  fi
+  needs_restart=1
+fi
+
+# Already up to date AND already running it - no restart needed. Drop a
+# marker so the UI can show "already up to date" instead of implying we
+# never got the click.
+if [ "$needs_restart" -eq 0 ]; then
   echo "[update] already up to date, skipping restart"
   BEFORE_SHORT="$before_short" AFTER_SHORT="$after_short" LAST_UPDATE_FILE="$LAST_UPDATE_FILE" python3 - <<'PY'
 import json, os, time
@@ -143,7 +195,4 @@ with open(os.environ["LAST_UPDATE_FILE"], "w", encoding="utf-8") as f:
     json.dump(payload, f)
 PY
 
-echo "[update] handing off to systemctl restart"
-# `exec` so the script's PID is replaced; systemctl will fire the
-# restart and our parent process (the running client) gets killed.
-exec sudo /bin/systemctl restart "$SERVICE_NAME"
+restart_service

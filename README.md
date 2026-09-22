@@ -643,17 +643,29 @@ Flow:
    not a workspace), runs `git fetch origin main` (bounded by
    `timeout 45` so a dead network path fails loudly instead of
    hanging) `&& git reset --hard origin/main`, writes a marker file
-   describing what changed, then
-   `exec sudo systemctl restart piframe-client`
+   describing what changed, then restarts: `sudo -n systemctl restart
+   piframe-client` when passwordless sudo exists, otherwise it sends
+   the running client SIGTERM and lets the unit's `Restart=always`
+   respawn it (the cgroup takes cage/chromium/mpv down with it)
 5. systemd respawns the client; on boot it reads the marker file,
    ships it home in the next status heartbeat, and deletes it
+
+The client passes `PIFRAME_RUNNING_SHA` (the commit it is actually
+running, read once at its boot) and `PIFRAME_CLIENT_PID` to
+`update.sh`. The restart fires when the checkout moved OR when the
+running commit differs from HEAD - so a run whose restart failed (no
+sudo, killed mid-way) is repaired by the next click instead of every
+later run reporting "already up to date, skipping restart" while the
+old process lives on. That exact loop is what kept three frames on an
+old build for a day on 2026-09-21/22.
 
 The marker carries:
 
 - from/to short SHAs
 - list of changed files
 - one-line subjects for each new commit
-- `noop=true` flag if before==after (skips the restart entirely)
+- `noop=true` flag if before==after AND the running client is already
+  on that commit (skips the restart entirely)
 
 Marker location:
 
@@ -698,10 +710,12 @@ blank screen.
 
 ### Sudoers prerequisite
 
-`update.sh` ends with `exec sudo /bin/systemctl restart
-piframe-client`, the Restart action runs `sudo systemctl restart
-piframe-client`, and the maintenance chord runs `sudo systemctl stop
-piframe-vnc piframe-client` - all need passwordless sudo.
+`update.sh` and the Restart action prefer `sudo -n systemctl restart
+piframe-client` (a clean cgroup restart) and fall back to exiting the
+client so systemd's `Restart=always` respawns it, so OTA and Restart
+work without sudo. The maintenance chord runs `sudo systemctl stop
+piframe-vnc piframe-client` and has no fallback - stopping a unit
+needs root.
 `bootstrap_pi.sh` writes `/etc/sudoers.d/020_piframe` (validated with
 `visudo -c`) granting exactly those `systemctl restart|stop|start`
 forms for the two units, under both `/bin` and `/usr/bin` spellings.

@@ -18,6 +18,7 @@ import os
 import random
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -2621,15 +2622,31 @@ class PiFrameClient:
         restart doesn't have to wait for the WS reader thread to
         unwind before systemd can exec."""
         _log("restart_service_starting")
-        try:
-            subprocess.Popen(
-                ["sudo", "systemctl", "restart", "piframe-client"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except OSError as exc:
-            _log("restart_service_spawn_failed", error=exc)
+
+        def _go() -> None:
+            # sudo -n: fail fast when there is no passwordless rule
+            # instead of hanging on a prompt we can never answer. On
+            # success systemd kills this process mid-call; we only get
+            # past run() when the restart did NOT happen.
+            try:
+                rc = subprocess.run(
+                    ["sudo", "-n", "systemctl", "restart", "piframe-client"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=30,
+                    check=False,
+                ).returncode
+            except Exception as exc:  # OSError, TimeoutExpired
+                _log("restart_service_sudo_error", error=exc)
+                rc = -1
+            if rc != 0:
+                # No sudo. Exit instead: the unit has Restart=always, so
+                # systemd respawns us (and reaps cage/chromium/mpv with
+                # the cgroup). Same fallback update.sh uses.
+                _log("restart_service_sudo_unavailable_exiting", rc=rc)
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_go, name="restart-service", daemon=True).start()
 
     def _handle_update_self(self, data: Dict[str, Any], params: Dict[str, Any]) -> None:  # pylint: disable=unused-argument
         """Server-pushed in-place update. Spawns `update.sh` from the
@@ -2650,12 +2667,20 @@ class PiFrameClient:
             # Detached so we don't block the WS reader thread, and so
             # the systemctl restart doesn't have to kill our parent
             # before it can exec.
+            env = dict(os.environ)
+            # Tell update.sh what we are actually RUNNING and who we are,
+            # so it restarts when HEAD != running code even if the
+            # checkout is already current, and can ask us to exit when
+            # sudo is unavailable (systemd Restart=always respawns us).
+            env["PIFRAME_RUNNING_SHA"] = self.client_version or ""
+            env["PIFRAME_CLIENT_PID"] = str(os.getpid())
             subprocess.Popen(
                 ["/bin/bash", str(script)],
                 cwd=str(repo_dir),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
+                env=env,
             )
         except OSError as exc:
             _log("update_self_spawn_failed", error=exc)
