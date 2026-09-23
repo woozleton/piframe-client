@@ -770,24 +770,29 @@ if [[ -n "${MOUNT_UNIT}" ]]; then
 fi
 
 # ----------------------------------------------------------------
-# piframe-firstboot: gives a cloned SD card its own identity (new
-# machine-id + SSH host keys + hostname from piframe-hostname.txt on
-# the FAT partition) on its first boot, then reboots once. Inert on a
-# normal boot. See scripts/piframe_firstboot.sh and README "Cloning a
-# frame"; scripts/prepare_image.sh arms it.
+# piframe-firstboot: when the card boots in a Pi board it hasn't
+# recorded as its owner (a cloned or moved card), it gives itself a new
+# machine-id + SSH host keys + hostname (frames.conf, else
+# piclient-<MAC suffix>) and reboots once. A no-op on every normal boot.
+# Recording the owner here, on the real board, means a card imaged from
+# this frame is recognised as a copy wherever it boots. See
+# scripts/piframe_firstboot.sh and README "Cloning a frame".
 # ----------------------------------------------------------------
 install -m 0755 "${REPO_DIR}/scripts/piframe_firstboot.sh" /usr/local/sbin/piframe-firstboot
+install -d -m 0755 /etc/piframe
+if [[ ! -s /etc/piframe/owner-serial ]]; then
+  tr -d '\0' < /sys/firmware/devicetree/base/serial-number > /etc/piframe/owner-serial 2>/dev/null || true
+fi
 cat > /etc/systemd/system/piframe-firstboot.service <<EOF
 [Unit]
-Description=PiFrame first boot (identity for a cloned SD card)
+Description=PiFrame identity check (new identity for a cloned or moved card)
 Documentation=https://github.com/woozleton/piframe-client
-ConditionPathExists=|/etc/piframe/firstboot-pending
-ConditionPathExists=|/boot/firmware/piframe-hostname.txt
 After=local-fs.target
 Before=NetworkManager.service ssh.service ${SERVICE_NAME}.service ${VNC_SERVICE_NAME}.service ${CEC_SERVICE_NAME}.service
 
 [Service]
 Type=oneshot
+Environment=PIFRAME_FRAMES_CONF=${REPO_DIR}/frames.conf
 ExecStart=/usr/local/sbin/piframe-firstboot
 TimeoutStartSec=600
 
@@ -841,7 +846,7 @@ Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
 Audio device:    ${ALSA_DEVICE:-auto (follows the connected HDMI port)}
 Output mode:     ${OUTPUT_MODE}
 NAS unit:        ${NAS_UNIT_FILE}
-First boot:      piframe-firstboot.service (armed by scripts/prepare_image.sh)
+Identity:        $(hostname) on board $(cat /etc/piframe/owner-serial 2>/dev/null || echo unknown) (piframe-firstboot re-identifies a cloned card)
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}
 CEC service:     ${CEC_SERVICE_FILE} (MQTT ${MQTT_USER}@${MQTT_HOST}$([[ -n "${MQTT_PASSWORD}" ]] || echo ', NO PASSWORD - CEC-only'))

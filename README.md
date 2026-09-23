@@ -22,8 +22,8 @@ This client now uses one browser-based renderer for:
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
-- `scripts/prepare_image.sh` - arms a frame's SD card to be imaged as the template for new frames (see [Cloning a frame](#cloning-a-frame-sd-image))
-- `scripts/piframe_firstboot.sh` - installed as `/usr/local/sbin/piframe-firstboot` + `piframe-firstboot.service`; gives a cloned card its own identity on first boot
+- `scripts/piframe_firstboot.sh` - installed as `/usr/local/sbin/piframe-firstboot` + `piframe-firstboot.service`; gives a cloned or moved card its own identity (see [Cloning a frame](#cloning-a-frame-sd-image))
+- `frames.conf` - known Pi board serial -> hostname (a re-flashed frame keeps its name; unlisted boards become `piclient-<MAC suffix>`)
 - `scripts/asoundrc_for_hdmi.sh` - the kiosk unit's `ExecStartPre`; points ALSA at whichever HDMI port has the TV
 - `scripts/test_webview.sh` - manual webview-mode test driver (see [Remote Control](#remote-control-vnc))
 - `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
@@ -948,40 +948,44 @@ Useful flags:
 
 ## Cloning a frame (SD image)
 
-Every frame runs the same SD contents; only the hostname differs, and
-the hostname is the frame's identity everywhere (the manager's client
-id, the Home Assistant device, the CEC name). Per-TV differences are
-decided at runtime (output mode, audio port, CEC input), so a copy of
-one frame's card works on any frame.
+Every frame runs the same SD contents; per-TV differences (output
+mode, audio port, CEC input) are decided at runtime. To make a new
+frame, copy any working frame's card:
 
-1. **Pick a healthy, fully bootstrapped frame** as the template.
-2. **Arm it:** `sudo ~/piframe_client/scripts/prepare_image.sh`. It
-   stops the kiosk, marks the card for re-identification, clears
-   per-frame state (CEC desired state, volume, shell history, apt
-   cache) and powers off.
-3. **Image the card** on a PC (e.g. Win32 Disk Imager: *Read* to a
-   `.img`). Keep that file as the template.
-4. **Write the image** to each new card (Raspberry Pi Imager: *Use
-   custom*, and **no** OS customisation - it would fight the identity
-   step). The target card must be at least as large as the original.
-5. **Name it:** on the card's small FAT partition (`bootfs`, the one
-   Windows opens), create `piframe-hostname.txt` containing one line,
-   e.g. `frame-hall`. Do this for the template card too before it goes
-   back in its frame, or it renames itself.
-6. **Boot it.** `piframe-firstboot` generates a new machine-id and SSH
-   host keys, sets the hostname (without the file: `frame-<last 6 of
-   the Wi-Fi MAC>`), deletes the file and reboots once. Then it comes up
-   like any frame and appears in the manager and in Home Assistant.
-7. **Per TV, once:** HDMI-CEC on (Samsung: Anynet+) and Power Button
-   Option = On/Off. `piframe_cec.py --probe` confirms.
-8. On machines that SSH to frames, drop the old host key if the new
-   frame reuses an address: `ssh-keygen -R 192.168.110.x`.
+1. Shut the frame down, take its SD card out, image it (e.g. Win32
+   Disk Imager *Read*), optionally shrink it (PiShrink, default
+   auto-expand), and put the card back.
+2. Write the image to the new card (Raspberry Pi Imager: *Use custom*,
+   **no** OS customisation).
+3. Put the card in the new Pi and power it on.
 
-`piframe-hostname.txt` on its own also renames an existing frame on
-its next boot. The first-boot step deliberately avoids systemd's own
-"first boot" mode (an empty `/etc/machine-id`): on Raspberry Pi OS that
-runs `systemd-firstboot --prompt-*`, which can wait on the console for
-a keyboard.
+That's all. `piframe-firstboot` runs on every boot and compares the
+Pi's board serial with the one recorded on the card
+(`/etc/piframe/owner-serial`, written by bootstrap). In a different
+board it gives the card a new machine-id and SSH host keys, takes the
+board's name from `frames.conf` (unlisted boards become
+`piclient-<last 6 of the Wi-Fi MAC>`), forgets the old frame's CEC
+screen state and reboots once (PiShrink's expansion adds one more
+reboot). The frame then registers in the manager and Home Assistant
+under that name; the display name can be changed in the manager. On
+its own board a card never changes, so the original card goes
+straight back in.
+
+Re-flashing an existing frame from the template keeps its identity:
+its board is in `frames.conf`, so it comes back under its old
+hostname (the manager's groups, arrangement and schedules and its
+Home Assistant entities key on it). To name a new frame permanently,
+add its serial (`tr -d '\0' < /sys/firmware/devicetree/base/serial-number`)
+to `frames.conf`; the name applies the next time a card is moved to
+that board. Per TV, once: HDMI-CEC on (Samsung: Anynet+) and Power
+Button Option = On/Off; `piframe_cec.py --probe` confirms. Machines
+that SSH to frames will see a changed host key for the new frame's
+address: `ssh-keygen -R <ip>`.
+
+Deliberately not systemd's own "first boot" mode (an empty
+`/etc/machine-id`): on Raspberry Pi OS that runs
+`systemd-firstboot --prompt-*`, which can wait on the console for a
+keyboard.
 
 ## Logging
 
