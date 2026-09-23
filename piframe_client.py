@@ -2069,7 +2069,14 @@ class PiFrameClient:
                 )
                 app.on_open = self.on_open
                 self.ws_connection = app
-                app.run_forever()
+                # Ping the manager every 20s; no pong within 10s ends
+                # run_forever and the loop below reconnects. Without it
+                # a connection that dies silently (Wi-Fi drop, AP
+                # reboot, the route's interface vanishing - an unplugged
+                # Ethernet cable on 2026-09-22) left the frame blocked
+                # on a dead socket, never reconnecting, while the
+                # manager (which pings its side) marked it offline.
+                app.run_forever(ping_interval=20, ping_timeout=10)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
