@@ -800,8 +800,46 @@ TimeoutStartSec=600
 WantedBy=multi-user.target
 EOF
 
+# ----------------------------------------------------------------
+# Network self-heal, no reboots. Wi-Fi profiles retry forever instead of
+# NetworkManager's default 4 attempts, and piframe-netwatch (every
+# minute) alternates a Wi-Fi radio restart and a brcmfmac driver reload
+# while the default gateway stays unreachable for 5+ minutes. On
+# 2026-09-23 four frames never rejoined after an access point came back.
+# Log: /var/lib/piframe-netwatch/log. See scripts/piframe_netwatch.sh.
+# ----------------------------------------------------------------
+nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}' | \
+  while read -r wifi_uuid; do
+    nmcli connection modify "${wifi_uuid}" connection.autoconnect-retries 0 || true
+  done
+install -m 0755 "${REPO_DIR}/scripts/piframe_netwatch.sh" /usr/local/sbin/piframe-netwatch
+cat > /etc/systemd/system/piframe-netwatch.service <<'EOF'
+[Unit]
+Description=PiFrame network self-heal (Wi-Fi restart / driver reload while offline)
+Documentation=https://github.com/woozleton/piframe-client
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/piframe-netwatch
+TimeoutStartSec=120
+EOF
+cat > /etc/systemd/system/piframe-netwatch.timer <<'EOF'
+[Unit]
+Description=Run piframe-netwatch every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable -q piframe-firstboot.service
+systemctl enable -q --now piframe-netwatch.timer
 systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
@@ -846,6 +884,7 @@ Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
 Audio device:    ${ALSA_DEVICE:-auto (follows the connected HDMI port)}
 Output mode:     ${OUTPUT_MODE}
 NAS unit:        ${NAS_UNIT_FILE}
+Net self-heal:   piframe-netwatch.timer (log /var/lib/piframe-netwatch/log); Wi-Fi retries forever
 Identity:        $(hostname) on board $(cat /etc/piframe/owner-serial 2>/dev/null || echo unknown) (piframe-firstboot re-identifies a cloned card)
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}

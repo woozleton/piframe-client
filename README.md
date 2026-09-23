@@ -24,6 +24,7 @@ This client now uses one browser-based renderer for:
 - `scripts/bootstrap_pi.sh`
 - `scripts/piframe_firstboot.sh` - installed as `/usr/local/sbin/piframe-firstboot` + `piframe-firstboot.service`; gives a cloned or moved card its own identity (see [Cloning a frame](#cloning-a-frame-sd-image))
 - `frames.conf` - known Pi board serial -> hostname (a re-flashed frame keeps its name; unlisted boards become `piclient-<MAC suffix>`)
+- `scripts/piframe_netwatch.sh` - installed as `/usr/local/sbin/piframe-netwatch` + `piframe-netwatch.timer` (every minute); brings the frame back onto Wi-Fi without rebooting - see [Network self-heal](#network-self-heal)
 - `scripts/asoundrc_for_hdmi.sh` - the kiosk unit's `ExecStartPre`; points ALSA at whichever HDMI port has the TV
 - `scripts/test_webview.sh` - manual webview-mode test driver (see [Remote Control](#remote-control-vnc))
 - `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
@@ -945,6 +946,22 @@ Useful flags:
 - `--alsa-device plughw:X,Y` - pin the audio device. Default: follow
   whichever HDMI port has the TV, re-checked at every kiosk start.
 - `--skip-apt`
+
+## Network self-heal
+
+On 2026-09-23 an access point went down and four frames never rejoined
+after it came back; frames that could see a second AP roamed within
+seconds. Bootstrap now sets every Wi-Fi profile to retry forever
+(`connection.autoconnect-retries 0`; NetworkManager's default gives up
+after 4 attempts), and `piframe-netwatch.timer` runs
+`/usr/local/sbin/piframe-netwatch` every minute. "Online" means the
+default gateway answers a ping. After 5 minutes offline it alternates
+two fixes - a Wi-Fi radio off/on, then a `brcmfmac` driver reload with
+`wpa_supplicant` + NetworkManager restarted - waiting 5, 5, 10, 20, then
+30 minutes between attempts. It never reboots; the kiosk keeps running.
+Every action and recovery goes to `/var/lib/piframe-netwatch/log`
+(persistent, last 500 lines), so the next outage shows which step
+brought a frame back.
 
 ## Cloning a frame (SD image)
 
