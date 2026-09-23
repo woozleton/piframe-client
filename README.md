@@ -22,12 +22,16 @@ This client now uses one browser-based renderer for:
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
+- `scripts/prepare_image.sh` - arms a frame's SD card to be imaged as the template for new frames (see [Cloning a frame](#cloning-a-frame-sd-image))
+- `scripts/piframe_firstboot.sh` - installed as `/usr/local/sbin/piframe-firstboot` + `piframe-firstboot.service`; gives a cloned card its own identity on first boot
+- `scripts/asoundrc_for_hdmi.sh` - the kiosk unit's `ExecStartPre`; points ALSA at whichever HDMI port has the TV
 - `scripts/test_webview.sh` - manual webview-mode test driver (see [Remote Control](#remote-control-vnc))
 - `idle.jpg`, `idle.html` - idle fallback (HTML preferred when present)
 - `/etc/systemd/system/piframe-client.service` (installed by bootstrap)
 - `/etc/systemd/system/piframe-vnc.service` (installed by bootstrap; runs `wayvnc` against the cage Wayland session)
 - `/etc/systemd/system/piframe-cec.service` + `/etc/piframe/cec.env` (installed by bootstrap; the env file is root-only and holds the MQTT login)
 - `/etc/sudoers.d/020_piframe` (installed by bootstrap; passwordless `systemctl` for the three piframe units only)
+- `/etc/systemd/system/mnt-nas.mount` (installed by bootstrap; the NAS share - a native mount unit, deliberately not an `/etc/fstab` line, see [OS packages](#os-packages-dont-apt-upgrade-the-frames))
 - `/usr/local/sbin/piframe-wifi-migrate` + `/var/log/piframe-wifi-migrate.log` (written by bootstrap only when an imager netplan Wi-Fi profile is found; see [OS packages](#os-packages-dont-apt-upgrade-the-frames))
 
 ## How It Works
@@ -817,6 +821,25 @@ upgrade: run bootstrap first so the profile is already native, upgrade
 ONE frame, reboot it, check `dpkg --audit` is empty and
 `/etc/sudoers.d/020_piframe` still exists, then do the rest.
 
+**Why the NAS is a mount unit, not an fstab line.** On
+`network-manager 1.52.1-1+rpt4`, every NetworkManager restart runs
+`netplan generate`, which runs `systemctl daemon-reload` while Wi-Fi is
+down. The reload's `systemd-fstab-generator` then hung in the kernel on
+the CIFS `/mnt/nas` fstab entry for systemd's full 90s generator
+timeout (journal: `Failed to fork off sandboxing environment for
+executing generators` / `Reloading finished in 90192 ms`), and
+NetworkManager, waiting on that reload, couldn't bring Wi-Fi back. The
+Raspberry Pi OS hardware watchdog (60s) reset the board first. That was
+the real reason stairs and both living-room frames stayed
+half-configured from 2026-09-20 to 09-22: configuring network-manager
+restarts it. Boot-time starts were fine (the share isn't mounted yet).
+Generators never read unit files, so bootstrap writes
+`/etc/systemd/system/mnt-nas.mount` and comments out any fstab line
+(backup `/etc/fstab.piframe-bak`). With it, the same restart reloads in
+~0.3s. Don't try to fix this with a longer watchdog: on these Pi 5s a
+runtime change reset a frame (systemd 257.8) and a 3-minute drop-in
+boot-looped one (257.13).
+
 ### Line-ending guard
 
 `.gitattributes` pins `*.sh` and `*.py` to LF. Without it, a commit
@@ -911,14 +934,54 @@ Useful flags:
   on first run), `portrait-ccw`, `upside-down`. If omitted the
   bootstrap prompts on first run and reuses the existing setting
   from the installed service file on re-runs.
-- `--output-mode <mode>` - force the cage framebuffer mode via
-  `wlr-randr --mode`. Empty / omitted = honor the TV's EDID-native
-  mode. Useful on 4K TVs to drop output to 1080p so the visualizer
-  + Chromium composite at 1/4 the pixels and the TV's built-in
-  scaler upsamples to native. Example: `--output-mode 1920x1080@60`.
-  Survives reboots + `update_self`; re-runs of bootstrap without
-  the flag inherit the existing value from the service file.
+- `--output-mode <mode>` - cage framebuffer mode (`wlr-randr --mode`).
+  Default `auto`: at every kiosk start the client reads the connected
+  TV's preferred mode and drops anything bigger than 1080p to
+  `1920x1080@60` (the visualizer + Chromium composite at 1/4 the
+  pixels; the TV's scaler upsamples) and leaves the rest native - so
+  the unit is the same on every frame. `native` or an explicit
+  `1920x1080@60` pin it. Re-runs without the flag inherit the existing
+  value; pass `--output-mode auto` to move a pinned frame onto auto.
+- `--alsa-device plughw:X,Y` - pin the audio device. Default: follow
+  whichever HDMI port has the TV, re-checked at every kiosk start.
 - `--skip-apt`
+
+## Cloning a frame (SD image)
+
+Every frame runs the same SD contents; only the hostname differs, and
+the hostname is the frame's identity everywhere (the manager's client
+id, the Home Assistant device, the CEC name). Per-TV differences are
+decided at runtime (output mode, audio port, CEC input), so a copy of
+one frame's card works on any frame.
+
+1. **Pick a healthy, fully bootstrapped frame** as the template.
+2. **Arm it:** `sudo ~/piframe_client/scripts/prepare_image.sh`. It
+   stops the kiosk, marks the card for re-identification, clears
+   per-frame state (CEC desired state, volume, shell history, apt
+   cache) and powers off.
+3. **Image the card** on a PC (e.g. Win32 Disk Imager: *Read* to a
+   `.img`). Keep that file as the template.
+4. **Write the image** to each new card (Raspberry Pi Imager: *Use
+   custom*, and **no** OS customisation - it would fight the identity
+   step). The target card must be at least as large as the original.
+5. **Name it:** on the card's small FAT partition (`bootfs`, the one
+   Windows opens), create `piframe-hostname.txt` containing one line,
+   e.g. `frame-hall`. Do this for the template card too before it goes
+   back in its frame, or it renames itself.
+6. **Boot it.** `piframe-firstboot` generates a new machine-id and SSH
+   host keys, sets the hostname (without the file: `frame-<last 6 of
+   the Wi-Fi MAC>`), deletes the file and reboots once. Then it comes up
+   like any frame and appears in the manager and in Home Assistant.
+7. **Per TV, once:** HDMI-CEC on (Samsung: Anynet+) and Power Button
+   Option = On/Off. `piframe_cec.py --probe` confirms.
+8. On machines that SSH to frames, drop the old host key if the new
+   frame reuses an address: `ssh-keygen -R 192.168.110.x`.
+
+`piframe-hostname.txt` on its own also renames an existing frame on
+its next boot. The first-boot step deliberately avoids systemd's own
+"first boot" mode (an empty `/etc/machine-id`): on Raspberry Pi OS that
+runs `systemd-firstboot --prompt-*`, which can wait on the console for
+a keyboard.
 
 ## Logging
 

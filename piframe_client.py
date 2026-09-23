@@ -69,7 +69,33 @@ OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "
 # built-in scaler upsample to native. Big win on the V3D core; loss
 # of sharpness on photo content is acceptable at typical viewing
 # distances.
+# "auto" (bootstrap's default) decides per kiosk start from the
+# connected TV's preferred mode: bigger than 1080p -> AUTO_4K_MODE,
+# otherwise native. That keeps the unit file identical on every frame
+# (and in a cloned SD image) whatever TV it drives.
 OUTPUT_MODE = os.environ.get("PIFRAME_OUTPUT_MODE", "").strip()
+AUTO_4K_MODE = "1920x1080@60"
+
+
+def _resolve_output_mode(value: str) -> str:
+    """Resolve PIFRAME_OUTPUT_MODE=auto against the connected HDMI TV.
+
+    The first line of a DRM connector's `modes` file is the panel's
+    preferred (EDID-native) mode. A disconnected TV (e.g. unpowered at
+    kiosk start) resolves to native, which is always safe."""
+    if value.lower() == "native":
+        return ""
+    if value.lower() != "auto":
+        return value
+    for status in sorted(Path("/sys/class/drm").glob("card*-HDMI-A-*/status")):
+        try:
+            if status.read_text().strip() != "connected":
+                continue
+            width, height = (int(v) for v in (status.parent / "modes").read_text().split()[0].split("x")[:2])
+        except (OSError, ValueError, IndexError):
+            continue
+        return AUTO_4K_MODE if width * height > 1920 * 1080 else ""
+    return ""
 BROWSER_ROTATION_DEGREES = 0
 # Kiosk vsync policy. Default (unset/0): vsync ON so rAF locks to the
 # panel's refresh - the mural sprite overlay and any UI motion get even
@@ -1002,7 +1028,10 @@ class BrowserController:
         # OUTPUT_TRANSFORM=="normal" + no OUTPUT_MODE means there's
         # nothing to enforce; skip the whole wlr-randr machinery.
         needs_transform = bool(OUTPUT_TRANSFORM) and OUTPUT_TRANSFORM != "normal"
-        needs_mode = bool(OUTPUT_MODE)
+        output_mode = _resolve_output_mode(OUTPUT_MODE)
+        if output_mode != OUTPUT_MODE:
+            _log("output_mode_resolved", configured=OUTPUT_MODE, mode=output_mode or "native")
+        needs_mode = bool(output_mode)
         if wlr_randr_path and (needs_transform or needs_mode):
             # Apply the compositor-side rotation + (optional) framebuffer
             # mode override to every output cage exposes. wlr-randr's
@@ -1015,7 +1044,7 @@ class BrowserController:
             if needs_transform:
                 apply_args += f" --transform {shlex.quote(OUTPUT_TRANSFORM)}"
             if needs_mode:
-                apply_args += f" --mode {shlex.quote(OUTPUT_MODE)}"
+                apply_args += f" --mode {shlex.quote(output_mode)}"
             rotate_cmd = (
                 f"{shlex.quote(wlr_randr_path)} 2>/dev/null | "
                 "awk '/^[^ \\t]/ { print $1 }' | "

@@ -8,11 +8,13 @@ SERVICE_USER="${SUDO_USER:-${USER}}"
 SERVER_URL="ws://192.168.100.100:8080/ws"
 NAS_ROOT="/mnt/nas"
 MOUNT_UNIT="mnt-nas.mount"
-# What the fleet's fstab points at. Only used by the NAS mount check
-# below to flag a frame whose fstab drifted (the share folder was
-# renamed once and one frame kept the old name -> mount failed ->
-# black screen while the client still reported "slideshow").
+# The fleet's NAS share, written into the ${MOUNT_UNIT} unit below (a
+# native mount unit, not /etc/fstab - see the note there). The share
+# folder was renamed once and a frame kept the old name -> black
+# screen while the client still reported "slideshow"; one source of
+# truth here prevents that drift.
 NAS_SHARE_EXPECTED="//192.168.100.15/Media/Displays"
+NAS_OPTIONS="credentials=/root/.nascred,vers=3.0,iocharset=utf8,_netdev"
 SERVICE_NAME="piframe-client"
 VNC_SERVICE_NAME="piframe-vnc"
 VNC_LISTEN_ADDRESS="0.0.0.0"
@@ -27,9 +29,10 @@ ORIENTATION=""
 # Chromium + Butterchurn run at 1/4 the pixels and the Pi 5's V3D
 # core stays in budget; the TV's built-in scaler handles the upsample.
 OUTPUT_MODE=""
-# ALSA device for audio output. Pi 5 has two HDMI ports (0 and 1) with
-# different audio characteristics. Auto-detected from connected display.
-# Format: plughw:X,Y where X is card number, Y is device number.
+# ALSA device for audio output. Empty = follow whichever Pi 5 HDMI port
+# has the TV, re-checked at every kiosk start (scripts/asoundrc_for_hdmi.sh
+# as the unit's ExecStartPre) so one SD image works on either port.
+# --alsa-device plughw:X,Y pins it instead.
 ALSA_DEVICE=""
 # TV power over HDMI-CEC (piframe_cec.py): its own unit, talking MQTT to
 # Home Assistant's Mosquitto broker. Settings live in a root-only env file
@@ -43,40 +46,6 @@ MQTT_USER=""
 MQTT_PASSWORD="${PIFRAME_MQTT_PASSWORD:-}"
 MQTT_HOST_DEFAULT="192.168.130.11"
 MQTT_USER_DEFAULT="piframe"
-
-detect_alsa_device() {
-  # Auto-detect which HDMI port has a display connected.
-  # Checks /sys/class/drm/ to see which HDMI ports are physically connected,
-  # then maps them to ALSA card numbers (vc4hdmi0, vc4hdmi1). Returns the
-  # ALSA device for the first connected port found. Defaults to plughw:0,0
-  # if no display is detected or detection fails.
-  local hdmi_a1_status hdmi_a2_status card
-
-  # Check physical HDMI port status via kernel DRM interface
-  if [[ -f /sys/class/drm/card1-HDMI-A-1/status ]]; then
-    hdmi_a1_status=$(cat /sys/class/drm/card1-HDMI-A-1/status 2>/dev/null || echo "unknown")
-  fi
-  if [[ -f /sys/class/drm/card1-HDMI-A-2/status ]]; then
-    hdmi_a2_status=$(cat /sys/class/drm/card1-HDMI-A-2/status 2>/dev/null || echo "unknown")
-  fi
-
-  # Map DRM outputs to ALSA cards. On Pi 5:
-  #   card1-HDMI-A-1 typically maps to vc4hdmi0 (ALSA card 0)
-  #   card1-HDMI-A-2 typically maps to vc4hdmi1 (ALSA card 1)
-  # Try them in order and use the first connected one found.
-  if [[ "${hdmi_a1_status}" == "connected" ]]; then
-    echo "plughw:0,0"
-    return
-  fi
-
-  if [[ "${hdmi_a2_status}" == "connected" ]]; then
-    echo "plughw:1,0"
-    return
-  fi
-
-  # Fallback to port 0 if no display detected or detection failed
-  echo "plughw:0,0"
-}
 
 usage() {
   cat <<EOF
@@ -101,9 +70,8 @@ Options:
                          mode. Useful on 4K TVs to drop output to
                          1080p; Chromium + visualizer composite at
                          1/4 the pixels and the TV upscales.
-  --alsa-device <dev>    ALSA device for audio (plughw:card,device).
-                         Auto-detected from connected display if omitted.
-                         The Pi 5 has two HDMI ports: 0 and 1.
+  --alsa-device <dev>    Pin the ALSA device (plughw:card,device). Default:
+                         follow the connected HDMI port at every start.
   --mqtt-host <host>     MQTT broker for TV power control (piframe-cec).
                          Default: existing ${CEC_ENV_FILE}, else ${MQTT_HOST_DEFAULT}
   --mqtt-user <name>     MQTT login. Default: existing env file, else ${MQTT_USER_DEFAULT}
@@ -183,11 +151,6 @@ if ! id "${SERVICE_USER}" >/dev/null 2>&1; then
   exit 1
 fi
 
-# Auto-detect ALSA device if not explicitly provided
-if [[ -z "${ALSA_DEVICE}" ]]; then
-  ALSA_DEVICE=$(detect_alsa_device)
-  echo "Auto-detected ALSA device: ${ALSA_DEVICE}"
-fi
 
 USER_UID="$(id -u "${SERVICE_USER}")"
 USER_GID="$(id -g "${SERVICE_USER}")"
@@ -253,6 +216,11 @@ if [[ -z "${OUTPUT_MODE}" && -f "${SERVICE_FILE}" ]]; then
     echo "Reusing existing output mode (${OUTPUT_MODE}) from ${SERVICE_FILE}"
   fi
 fi
+# Nothing set or inherited: "auto" - the client drops 4K panels to
+# 1080p and leaves everything else native, per TV at kiosk start, so
+# the unit is identical on every frame. Pass --output-mode auto to move
+# a frame that still has an explicit value onto it.
+OUTPUT_MODE="${OUTPUT_MODE:-auto}"
 
 if [[ -z "${OUTPUT_TRANSFORM_VALUE}" ]]; then
   if [[ -t 0 ]]; then
@@ -455,12 +423,14 @@ Environment=PIFRAME_NAS_ROOT=${NAS_ROOT}
 # 180=upside-down. See README "Remote Control (VNC)" for why this
 # is at the compositor instead of in CSS.
 Environment=PIFRAME_OUTPUT_TRANSFORM=${OUTPUT_TRANSFORM_VALUE}
-# Optional framebuffer mode override (matches wlr-randr --mode).
-# Empty = honor the TV's EDID-native mode. "1920x1080" or
-# "1920x1080@60" forces 1080p output on 4K TVs so Chromium +
-# Butterchurn composite at 1/4 the pixels; the TV's built-in scaler
-# upsamples to native.
+# Framebuffer mode (wlr-randr --mode). "auto" = 4K panels drop to
+# 1080p (Chromium + Butterchurn composite at 1/4 the pixels; the TV
+# upscales), anything else stays native - decided per TV at kiosk
+# start. "native" or an explicit "1920x1080@60" pin it.
 Environment=PIFRAME_OUTPUT_MODE=${OUTPUT_MODE}
+# ALSA default device: empty = follow the connected HDMI port.
+Environment=PIFRAME_ALSA_DEVICE=${ALSA_DEVICE}
+ExecStartPre=-/bin/sh ${REPO_DIR}/scripts/asoundrc_for_hdmi.sh
 
 [Install]
 WantedBy=multi-user.target
@@ -473,22 +443,11 @@ EOF
 # the runtime dir is created and chromium fails to open a window.
 loginctl enable-linger "${SERVICE_USER}"
 
-# Configure ALSA device. The Pi 5 has two HDMI ports (0 and 1) with
-# different audio characteristics; port 0 produces better audio output.
-# Default is plughw:0,0 (HDMI port 0) but can be overridden with --alsa-device.
-cat > "${USER_HOME}/.asoundrc" <<ASOUNDRC
-pcm.!default {
-  type plug
-  slave.pcm "${ALSA_DEVICE}"
-}
-
-ctl.!default {
-  type hw
-  card $(echo "${ALSA_DEVICE}" | cut -d: -f2 | cut -d, -f1)
-}
-ASOUNDRC
-chown "${USER_UID}:${USER_GID}" "${USER_HOME}/.asoundrc"
-chmod 0644 "${USER_HOME}/.asoundrc"
+# ALSA default device (~/.asoundrc). The unit re-runs this at every
+# kiosk start (ExecStartPre), so it follows the HDMI cable; running it
+# here too just gets the file in place before the first start.
+sudo -u "${SERVICE_USER}" HOME="${USER_HOME}" PIFRAME_ALSA_DEVICE="${ALSA_DEVICE}" \
+  /bin/sh "${REPO_DIR}/scripts/asoundrc_for_hdmi.sh" || true
 
 # Enable and start the PipeWire audio server for the service user.
 # This is required for audio companion to work: Chromium locks the
@@ -732,14 +691,60 @@ MIGRATE
 fi
 
 # ----------------------------------------------------------------
+# NAS share as a native systemd mount unit, NOT an /etc/fstab line.
+# systemd-fstab-generator checks every fstab mount point on each
+# daemon-reload. NetworkManager 1.52.1+rpt4 runs `netplan generate` on
+# every restart, which calls `systemctl daemon-reload` while Wi-Fi is
+# down; the generator then hung on the CIFS path (state D) for
+# systemd's whole 90s generator timeout, NetworkManager (waiting on
+# that reload) couldn't bring Wi-Fi back, and the 60s hardware watchdog
+# reset the board. That is what kept stairs + both living-room frames
+# half-configured 2026-09-20..22 (configuring network-manager restarts
+# it). A unit file is never read by generators. Any old fstab line for
+# the share is commented out (backup: /etc/fstab.piframe-bak).
+# ----------------------------------------------------------------
+NAS_UNIT_FILE="/etc/systemd/system/$(systemd-escape -p --suffix=mount "${NAS_ROOT}")"
+if [[ "$(basename "${NAS_UNIT_FILE}")" != "${MOUNT_UNIT}" ]]; then
+  echo "WARNING: --mount-unit ${MOUNT_UNIT} doesn't match --nas-root ${NAS_ROOT} ($(basename "${NAS_UNIT_FILE}")); using the latter" >&2
+  MOUNT_UNIT="$(basename "${NAS_UNIT_FILE}")"
+fi
+install -d -m 0755 "${NAS_ROOT}"
+cat > "${NAS_UNIT_FILE}" <<EOF
+[Unit]
+Description=NAS media share for the piframe kiosk
+# Written by bootstrap_pi.sh - a native mount unit on purpose, not an
+# /etc/fstab line; see the NAS note in the script.
+After=network-online.target
+Wants=network-online.target
+
+[Mount]
+What=${NAS_SHARE_EXPECTED}
+Where=${NAS_ROOT}
+Type=cifs
+Options=${NAS_OPTIONS}
+# A slow NAS must not hold up boot; WantedBy= (not RequiredBy=) means
+# a failed mount never fails the boot either.
+TimeoutSec=30
+
+[Install]
+WantedBy=multi-user.target
+EOF
+if grep -qE "^[^#].*[[:space:]]${NAS_ROOT}[[:space:]]" /etc/fstab; then
+  cp -a /etc/fstab /etc/fstab.piframe-bak
+  sed -i -E "s|^([^#].*[[:space:]]${NAS_ROOT}[[:space:]].*)|# moved to ${NAS_UNIT_FILE} by bootstrap_pi.sh\n# \1|" /etc/fstab
+  echo "NAS: fstab line for ${NAS_ROOT} commented out (backup /etc/fstab.piframe-bak)"
+fi
+systemctl daemon-reload
+systemctl enable -q "${MOUNT_UNIT}"
+
+# ----------------------------------------------------------------
 # NAS mount check. The kiosk loads every slide over file:// from
 # ${NAS_ROOT}; if the share isn't mounted the page paints black while
 # the client happily reports "slideshow" to the manager. The mount
-# unit is nofail on purpose (a slow NAS must not block boot), so a
-# failure is silent unless someone looks. Try once more now that the
-# network is up, then WARN loudly with the fstab line, the unit's
-# last words and a fix hint when the fstab path drifted from the fleet.
-# Never fatal: the frame still boots to the idle page without it.
+# unit never fails the boot on purpose (a slow NAS must not block it),
+# so a failure is silent unless someone looks. Try once more now that
+# the network is up, then WARN loudly with the unit's last words and
+# the usual cause. Never fatal: the frame still boots to the idle page.
 # ----------------------------------------------------------------
 NAS_MOUNT_STATE="not configured"
 if [[ -n "${MOUNT_UNIT}" ]]; then
@@ -751,20 +756,12 @@ if [[ -n "${MOUNT_UNIT}" ]]; then
     NAS_MOUNT_STATE="active (${NAS_ROOT})"
   else
     NAS_MOUNT_STATE="FAILED - see warning above"
-    fstab_line="$(grep -E "[[:space:]]${NAS_ROOT}[[:space:]]" /etc/fstab 2>/dev/null || true)"
     echo "" >&2
     echo "WARNING: ${NAS_ROOT} is not mounted (${MOUNT_UNIT} failed)." >&2
     echo "  The kiosk will show a black screen for every playlist until this is fixed." >&2
-    if [[ -n "${fstab_line}" ]]; then
-      echo "  fstab: ${fstab_line}" >&2
-      fstab_share="$(printf '%s' "${fstab_line}" | awk '{print $1}')"
-      if [[ -n "${NAS_SHARE_EXPECTED}" && "${fstab_share}" != "${NAS_SHARE_EXPECTED}" ]]; then
-        echo "  The fleet mounts ${NAS_SHARE_EXPECTED} - this frame's fstab points elsewhere." >&2
-        echo "  Fix: sudo sed -i 's#${fstab_share}#${NAS_SHARE_EXPECTED}#' /etc/fstab && sudo systemctl daemon-reload && sudo systemctl start ${MOUNT_UNIT}" >&2
-      fi
-    else
-      echo "  No fstab entry for ${NAS_ROOT}. Expected something like:" >&2
-      echo "  ${NAS_SHARE_EXPECTED}  ${NAS_ROOT}  cifs  credentials=/root/.nascred,vers=3.0,iocharset=utf8,_netdev,nofail  0  0" >&2
+    echo "  Share: ${NAS_SHARE_EXPECTED}  (unit: ${NAS_UNIT_FILE})" >&2
+    if [[ ! -s /root/.nascred ]]; then
+      echo "  /root/.nascred is missing or empty - it must hold username=... and password=... (mode 0600)." >&2
     fi
     echo "  Unit log:" >&2
     journalctl -u "${MOUNT_UNIT}" -b --no-pager 2>/dev/null | tail -4 | sed 's/^/    /' >&2
@@ -772,7 +769,34 @@ if [[ -n "${MOUNT_UNIT}" ]]; then
   fi
 fi
 
+# ----------------------------------------------------------------
+# piframe-firstboot: gives a cloned SD card its own identity (new
+# machine-id + SSH host keys + hostname from piframe-hostname.txt on
+# the FAT partition) on its first boot, then reboots once. Inert on a
+# normal boot. See scripts/piframe_firstboot.sh and README "Cloning a
+# frame"; scripts/prepare_image.sh arms it.
+# ----------------------------------------------------------------
+install -m 0755 "${REPO_DIR}/scripts/piframe_firstboot.sh" /usr/local/sbin/piframe-firstboot
+cat > /etc/systemd/system/piframe-firstboot.service <<EOF
+[Unit]
+Description=PiFrame first boot (identity for a cloned SD card)
+Documentation=https://github.com/woozleton/piframe-client
+ConditionPathExists=|/etc/piframe/firstboot-pending
+ConditionPathExists=|/boot/firmware/piframe-hostname.txt
+After=local-fs.target
+Before=NetworkManager.service ssh.service ${SERVICE_NAME}.service ${VNC_SERVICE_NAME}.service ${CEC_SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/piframe-firstboot
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
+systemctl enable -q piframe-firstboot.service
 systemctl enable --now seatd
 systemctl enable "${SERVICE_NAME}"
 systemctl restart "${SERVICE_NAME}"
@@ -814,7 +838,10 @@ Server URL:      ${SERVER_URL}
 NAS root:        ${NAS_ROOT}
 NAS mount:       ${NAS_MOUNT_STATE}
 Orientation:     transform=${OUTPUT_TRANSFORM_VALUE}
-Audio device:    ${ALSA_DEVICE}
+Audio device:    ${ALSA_DEVICE:-auto (follows the connected HDMI port)}
+Output mode:     ${OUTPUT_MODE}
+NAS unit:        ${NAS_UNIT_FILE}
+First boot:      piframe-firstboot.service (armed by scripts/prepare_image.sh)
 VNC service:     ${VNC_SERVICE_FILE} (listening on ${VNC_LISTEN_ADDRESS}:${VNC_LISTEN_PORT})
 VNC config:      ${VNC_CONFIG_FILE}
 CEC service:     ${CEC_SERVICE_FILE} (MQTT ${MQTT_USER}@${MQTT_HOST}$([[ -n "${MQTT_PASSWORD}" ]] || echo ', NO PASSWORD - CEC-only'))
