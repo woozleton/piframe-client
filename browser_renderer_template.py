@@ -82,16 +82,23 @@ def render_browser_html(
       overflow: hidden;
       background: #050505;
     }}
+    /* Banner + OSD sit in two slots at the bottom edge, clear of the
+       picture: the banner lowest (it can stay up, e.g. "Server
+       disconnected" while playback carries on), the OSD just above it so
+       the two never overlap. Offsets and widths use rotated_full_* - the
+       screen's real extent in either rotation mode. The old 50vw / vh
+       units assumed the CSS-rotated landscape page and put both boxes
+       over the image once the compositor took over the rotation. */
     .banner {{
       position: fixed;
       top: 50%;
       left: 50%;
       transform: translate(-50%, -50%) rotate({rotation_degrees}deg)
-        translateY(calc(-50vw + 90px));
+        translateY(calc({rotated_full_height} / 2 - 80px));
       transform-origin: center center;
       z-index: 40;
       min-width: 320px;
-      max-width: min(70vh, 1100px);
+      max-width: min(calc({rotated_full_width} * 0.7), 1100px);
       padding: 18px 28px;
       border-radius: 18px;
       background: rgba(20, 16, 10, 0.82);
@@ -120,7 +127,7 @@ def render_browser_html(
       top: 50%;
       z-index: 45;
       min-width: 250px;
-      max-width: min(56vh, 760px);
+      max-width: min(calc({rotated_full_width} * 0.56), 760px);
       padding: 20px 24px 22px;
       border-radius: 24px;
       background:
@@ -131,7 +138,7 @@ def render_browser_html(
         inset 0 1px 0 rgba(255, 255, 255, 0.06);
       backdrop-filter: blur(14px);
       transform: translate(-50%, -50%) rotate({rotation_degrees}deg)
-        translateY(calc(50vw - 150px)) scale(0.92);
+        translateY(calc({rotated_full_height} / 2 - 200px)) scale(0.92);
       transform-origin: center center;
       opacity: 0;
       pointer-events: none;
@@ -142,7 +149,7 @@ def render_browser_html(
     .osd.visible {{
       opacity: 1;
       transform: translate(-50%, -50%) rotate({rotation_degrees}deg)
-        translateY(calc(50vw - 150px)) scale(1);
+        translateY(calc({rotated_full_height} / 2 - 200px)) scale(1);
     }}
     .osd-head {{
       display: flex;
@@ -224,7 +231,7 @@ def render_browser_html(
       line-height: 1.35;
       white-space: normal;
       text-align: left;
-      max-width: 44vh;
+      max-width: calc({rotated_full_width} * 0.44);
       color: #fff1ec;
     }}
     .stage {{
