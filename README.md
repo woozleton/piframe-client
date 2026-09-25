@@ -13,12 +13,14 @@ This client now uses one browser-based renderer for:
 ## Files
 
 - `piframe_client.py` - WebSocket client + browser orchestrator + audio companion sidecar
+- `audio_sync.py` - whole-house synced audio: verbatim mirror of woozlescape `core/audio_sync.py`'s timeline math (see [Synced companion audio](#synced-companion-audio-whole-house))
 - `browser_renderer_template.py` - Chromium kiosk HTML/JS template
 - `piframe_cec.py` - TV power over HDMI-CEC for Home Assistant (own unit; see [TV Power (HDMI-CEC)](#tv-power-hdmi-cec))
 - `vendor/butterchurn/` - Butterchurn (MilkDrop port) + preset bundle for the audio visualizer overlay
 - `vendor/h264ify/` - bundled Chromium extension that forces video sites
   off AV1 in webview mode (see [Remote Control](#remote-control-vnc))
 - `update.sh` - in-place self-updater (see Self-update below)
+- `tests/` - unit tests (`python -m pytest tests -q`, no Pi/mpv/network required)
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
@@ -1203,6 +1205,89 @@ journalctl -u piframe-client -b | grep companion_chromium_mute
 # Expected: count=1 muted=True (when override on),
 #           count=1 muted=False (when override off / cleared)
 ```
+
+### Synced companion audio (whole-house)
+
+Companion playlists can carry an additive `sync` block so this
+frame's companion mpv locks to the same shared timeline as every
+other frame plus the Virtual Window, instead of free-running:
+
+```json
+{"cmd": "audio_playlist", "params": {"items": [...], "is_companion": true,
+  "sync": {"session": "<12-hex id>", "epoch": <server time.time() when track 0 starts>,
+           "durations": [<seconds per item, aligned with items>], "latency_ms": <int>}}}
+```
+
+No `sync` key (old server) - or a structurally invalid one (bad
+types, a `durations` list that doesn't line up with `items`, a
+non-positive cycle length) - falls back to today's free-running
+companion playback unchanged (`_extract_audio_sync` logs
+`audio_sync_ignored` with the reason). A synced start that matches
+the ALREADY-loaded session (same `session` id, same `items`, mpv
+still running) never reloads - only `latency_ms` refreshes - so a
+visual swap or companion re-route that re-sends the same queue
+doesn't restart the music.
+
+`audio_sync.py` at the repo root is a byte-for-byte mirror of the
+pure timeline math in woozlescape's `core/audio_sync.py` (the
+constants block plus `cycle_pos` / `locate` / `signed_error` /
+`discipline_action` / `clock_offset` / etc.) - woozlescape's
+`tests/test_audio_sync.py` pins it against this file, so change both
+together.
+
+#### Clock sync
+
+Every connected frame estimates the server's clock over the existing
+WebSocket: it sends `{"type": "time_ping", "t0": time.time()}` and
+the server echoes back `{"type": "time_pong", "cmd": "time_pong",
+"t0": <echoed>, "server_time": <float>}`. `ClockSync` (in
+`piframe_client.py`) keeps the last `CLOCK_WINDOW` `(offset, rtt)`
+samples and estimates the offset as the median of the `CLOCK_BEST`
+lowest-RTT ones (a slow round trip is an asymmetric one, so it's the
+least trustworthy). Ping cadence is `CLOCK_PING_S` (1s) while a
+synced session is loaded, `CLOCK_IDLE_PING_S` (10s) otherwise - only
+while connected. Before the first sample, offset is 0.
+
+#### Discipline loop
+
+`MpvCompanion` runs a background thread (`companion-discipline`,
+started lazily on the first synced `load()`, stopped in
+`shutdown()`) that re-checks every `CADENCE_S` (0.5s):
+
+- reads mpv's actual `pause` property; if it's true and the
+  discipline loop didn't set it itself (an operator pause via the
+  existing pause-toggle command), it reports action `"paused"` and
+  backs off untouched
+- computes where the shared timeline should be right now
+  (`server_now + latency_ms/1000`) and compares it to mpv's actual
+  `(playlist-pos, playback-time)`, read together over one persistent
+  Unix-socket connection (`_CompanionIPCReader`) so replies correlate
+  by `request_id` instead of racing the fire-and-forget command
+  socket `_send_command` already uses for writes
+- inside `BOUNDARY_GUARD_S` of a track edge, or with a null
+  `playback-time` (mpv between files - NEVER treated as 0), it skips
+  the tick rather than correcting on stale data
+- small drift gets a tiny `speed` nudge (pitch-correction is off for
+  a synced session, so this resamples instead of time-stretching -
+  inaudible on ambience); gross drift pauses, seeks `ARM_LEAD_S`
+  ahead of the timeline, and releases exactly on the wall-clock mark
+  (`_resync`) - a session that isn't armed yet (first load, or just
+  joined mid-play) always takes this path once regardless of the
+  current error
+
+Every `load()` / `stop()` bumps a generation counter; a resync that
+finds the generation stale after any wait aborts without unpausing -
+a newer load already redefined what "the session" means.
+
+#### Live latency + heartbeat
+
+`{"cmd": "audio_sync_latency", "params": {"latency_ms": <int>}}`
+updates the loaded session's delay in place (no reload) and clears
+the discipline error window. The `status_update` heartbeat's
+`audio_sync` field is `null` when no synced session is loaded, else
+`{"session", "err_ms", "action", "rate", "offset_ms", "rtt_ms",
+"latency_ms"}` - `action` is one of `none | nudge | resync | hold |
+skip | arming | paused`.
 
 ## Audio Visualizer
 

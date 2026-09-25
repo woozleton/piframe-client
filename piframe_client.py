@@ -24,6 +24,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -31,6 +32,12 @@ from typing import Any, Dict, List, Optional
 
 import websocket
 from browser_renderer_template import render_browser_html
+
+# Shared whole-house-audio timeline math - verbatim mirror of
+# woozlescape core/audio_sync.py's pure-function section (module
+# docstring there explains the mirror relationship; woozlescape's
+# tests/test_audio_sync.py pins this file's constants + math).
+import audio_sync
 
 try:
     import psutil  # type: ignore
@@ -1587,6 +1594,141 @@ class BrowserController:
             self._write_state()
 
 
+class ClockSync:
+    """Rolling estimate of ``server_time - this Pi's time.time()``.
+
+    Fed by ``time_pong`` replies to our own ``time_ping`` messages (see
+    ``PiFrameClient._handle_time_pong`` / ``_clock_ping_loop``). The
+    companion discipline loop and the status heartbeat both read
+    ``offset()`` / ``server_now()``; before the first sample both
+    return offset 0, matching the shared contract ("Before the first
+    sample, use offset 0")."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples = deque(maxlen=audio_sync.CLOCK_WINDOW)
+
+    def add_sample(self, t0: float, server_time: float, t3: float) -> None:
+        sample = audio_sync.clock_sample(t0, server_time, t3)
+        with self._lock:
+            self._samples.append(sample)
+
+    def estimate(self) -> Optional[tuple[float, float]]:
+        """``(offset, rtt)`` in seconds, or None before the first sample."""
+        with self._lock:
+            samples = list(self._samples)
+        return audio_sync.clock_offset(samples)
+
+    def offset(self) -> float:
+        est = self.estimate()
+        return est[0] if est else 0.0
+
+    def server_now(self) -> float:
+        return time.time() + self.offset()
+
+
+class _CompanionIPCReader:
+    """Persistent Unix-socket connection to the companion mpv's JSON
+    IPC, owned exclusively by ``MpvCompanion``'s discipline thread.
+
+    Separate from ``MpvCompanion._send_command`` (which opens a fresh
+    one-shot socket per fire-and-forget write from the WS thread): the
+    discipline loop needs REPLIES (``get_property``) correlated to the
+    request that asked for them, so this keeps one connection open and
+    matches ``request_id``s, skipping any event lines mpv pushes
+    unprompted. Reconnects lazily on the next call after any error."""
+
+    def __init__(self, socket_path: Path) -> None:
+        self._socket_path = socket_path
+        self._sock: Optional[socket.socket] = None
+        self._buf = b""
+        self._next_id = 1
+
+    def close(self) -> None:
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except Exception:
+                pass
+            self._sock = None
+        self._buf = b""
+
+    def _ensure_connected(self) -> bool:
+        if self._sock is not None:
+            return True
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(1.0)
+            sock.connect(str(self._socket_path))
+        except Exception:
+            return False
+        self._sock = sock
+        self._buf = b""
+        return True
+
+    def command(self, cmd: List[Any]) -> bool:
+        """Fire-and-forget write on the persistent connection (no reply
+        wait) - the discipline loop's own set_property / seek /
+        playlist-play-index writes."""
+        if not self._ensure_connected():
+            return False
+        try:
+            self._sock.sendall(json.dumps({"command": cmd}).encode("utf-8") + b"\n")
+            return True
+        except Exception:
+            self.close()
+            return False
+
+    def get_property(self, name: str, timeout: float = 1.0) -> Any:
+        """Query one mpv property; None on timeout, IPC failure, OR a
+        genuinely null property value (``playback-time`` while mpv is
+        between files) - callers must never treat None as zero."""
+        return self._request(["get_property", name], timeout)
+
+    def _request(self, command: List[Any], timeout: float) -> Any:
+        if not self._ensure_connected():
+            return None
+        req_id = self._next_id
+        self._next_id += 1
+        try:
+            self._sock.sendall(
+                json.dumps({"command": command, "request_id": req_id}).encode("utf-8") + b"\n"
+            )
+        except Exception:
+            self.close()
+            return None
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                self._sock.settimeout(remaining)
+                chunk = self._sock.recv(4096)
+            except socket.timeout:
+                return None
+            except Exception:
+                self.close()
+                return None
+            if not chunk:
+                self.close()
+                return None
+            self._buf += chunk
+            while b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                if not line.strip():
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("request_id") != req_id:
+                    continue  # event line, or a stale reply - keep reading
+                if obj.get("error") == "success":
+                    return obj.get("data")
+                return None
+
+
 class MpvCompanion:
     """Sidecar mpv process for companion audio playback.
 
@@ -1602,9 +1744,21 @@ class MpvCompanion:
     a Unix socket. Shutdown() during PiFrameClient teardown.
 
     Mirrors vwm/audio_companion.py from the woozlescape repo - same
-    one-mpv-per-pipe pattern, just on Linux instead of Windows."""
+    one-mpv-per-pipe pattern, just on Linux instead of Windows.
 
-    def __init__(self) -> None:
+    Whole-house synced audio: a companion `load()` carrying a shape-
+    valid `sync` block (session id + epoch + per-track durations, see
+    audio_sync.py's module docstring) is disciplined toward that
+    shared timeline by a dedicated background thread instead of just
+    played back free-running. `_sync` / `_loaded_items` / `_armed` /
+    `_generation` / `_err_window` are that thread's state, guarded by
+    `_sync_lock` since `load()` / `stop()` / `set_latency()` run on the
+    WS message thread while the discipline thread reads them every
+    CADENCE_S. `_generation` is bumped on every load()/stop() so an
+    in-flight resync() started under a since-replaced session aborts
+    instead of releasing mpv into a stale position."""
+
+    def __init__(self, clock: ClockSync) -> None:
         self.process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._last_volume: float = 75.0
@@ -1613,6 +1767,26 @@ class MpvCompanion:
         # toggle (browser flips its own state on each press), so the
         # companion mirrors by flipping this flag too.
         self._paused: bool = False
+        # --- synced-session state (see class docstring) -----------------
+        self._clock = clock
+        self._sync_lock = threading.Lock()
+        self._sync: Optional[Dict[str, Any]] = None
+        self._loaded_items: List[str] = []
+        self._generation: int = 0
+        self._armed: bool = False
+        # True only while THIS class is deliberately holding mpv paused
+        # (initial load, or mid-resync) - distinguishes that from an
+        # operator-issued pause so the discipline loop can tell them
+        # apart by reading mpv's actual `pause` property.
+        self._self_paused: bool = False
+        self._last_resync: float = 0.0
+        self._err_window = deque(maxlen=audio_sync.ERR_WINDOW)
+        self._last_set_speed: float = 1.0
+        self._last_rate: float = 1.0
+        self._last_action: str = "none"
+        self._ipc = _CompanionIPCReader(COMPANION_MPV_SOCKET)
+        self._discipline_thread: Optional[threading.Thread] = None
+        self._discipline_running: bool = False
 
     def _is_running(self) -> bool:
         if self.process is None:
@@ -1711,40 +1885,363 @@ class MpvCompanion:
             _log("companion_mpv_ipc_failed", cmd=str(cmd[:1]), error=str(exc))
             return False
 
-    def load(self, items: List[str], *, repeat: bool = True) -> bool:
-        """Replace the queue with `items` and start playback. Mirrors
-        the loadfile-replace + N-1 appends pattern."""
+    def load(
+        self,
+        items: List[str],
+        *,
+        repeat: bool = True,
+        sync: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Replace the queue with `items` and start playback.
+
+        `sync` is the shape-valid companion clock-sync descriptor built
+        by `PiFrameClient._extract_audio_sync` (None for plain unsynced
+        playback - today's behavior, unchanged). A synced load whose
+        session + items match what's already loaded (mpv still running)
+        is a re-route of the SAME queue - the server re-sends the start
+        message often (visual swaps, companion re-routes) - so it must
+        NOT reload the music; only `latency_ms` is refreshed."""
         items = [s for s in items if s]
         if not items:
             self.stop()
             return False
+        if sync is not None:
+            with self._sync_lock:
+                same_session = (
+                    self._sync is not None
+                    and sync["session"] == self._sync["session"]
+                    and items == self._loaded_items
+                    and self._is_running()
+                )
+                if same_session:
+                    self._sync["latency_ms"] = sync["latency_ms"]
+            if same_session:
+                _log(
+                    "companion_sync_latency_updated",
+                    session=sync["session"],
+                    latency_ms=sync["latency_ms"],
+                )
+                return True
         if not self._ensure_running():
             return False
-        # Prime mpv: set loop + reset state, then load the queue.
-        self._send_command(["set_property", "loop-file", "no"])
-        self._send_command(["set_property", "loop-playlist", "inf" if repeat else "no"])
+        was_synced = self._clear_sync()
+        # Fresh content always starts with no operator-pause carried
+        # over. Without this, a stale _paused=True from an earlier
+        # pause-toggle would silence the newly-loaded queue and the
+        # operator would think nothing was playing.
+        self._paused = False
+        if sync is None:
+            self._send_command(["set_property", "loop-file", "no"])
+            self._send_command(["set_property", "loop-playlist", "inf" if repeat else "no"])
+            self._send_command(["set_property", "volume", float(self._last_volume)])
+            self._send_command(["set_property", "mute", bool(self._last_muted)])
+            if was_synced:
+                # Leaving a synced queue: undo the discipline loop's
+                # nudges so plain playback isn't left pitch-corrected
+                # off / at a non-1.0 speed.
+                self._send_command(["set_property", "speed", 1.0])
+                self._send_command(["set_property", "audio-pitch-correction", "yes"])
+            self._send_command(["set_property", "pause", False])
+            self._send_command(["loadfile", items[0], "replace"])
+            for path in items[1:]:
+                self._send_command(["loadfile", path, "append"])
+            _log("companion_mpv_loaded", count=len(items), repeat=repeat)
+            return True
+        # Synced load: audio-pitch-correction off so speed nudges resample
+        # instead of time-stretch (no audible warble); gapless + prefetch
+        # so the track-boundary gap the discipline loop guards around
+        # stays tiny; one-item queues loop the file itself (there's no
+        # "next" item for loop-playlist to rotate to). Starts paused -
+        # the discipline loop's first tick arms + releases it on the
+        # timeline (see _resync).
+        self._send_command(["set_property", "audio-pitch-correction", "no"])
+        self._send_command(["set_property", "gapless-audio", "yes"])
+        self._send_command(["set_property", "prefetch-playlist", "yes"])
+        if len(items) == 1:
+            self._send_command(["set_property", "loop-file", "inf"])
+            self._send_command(["set_property", "loop-playlist", "no"])
+        else:
+            self._send_command(["set_property", "loop-file", "no"])
+            self._send_command(["set_property", "loop-playlist", "inf"])
         self._send_command(["set_property", "volume", float(self._last_volume)])
         self._send_command(["set_property", "mute", bool(self._last_muted)])
-        # Fresh content always starts unpaused. Without this, a stale
-        # _paused=True from an earlier pause-toggle would silence the
-        # newly-loaded queue and the operator would think nothing was
-        # playing. The pause command also wouldn't fix it because the
-        # toggle logic flips it to True again.
-        self._paused = False
-        self._send_command(["set_property", "pause", False])
+        self._send_command(["set_property", "pause", True])
+        self._self_paused = True
         self._send_command(["loadfile", items[0], "replace"])
         for path in items[1:]:
             self._send_command(["loadfile", path, "append"])
-        _log("companion_mpv_loaded", count=len(items), repeat=repeat)
+        with self._sync_lock:
+            self._sync = dict(sync)
+            self._loaded_items = list(items)
+        self._ensure_discipline_thread()
+        _log(
+            "companion_sync_loaded",
+            session=sync["session"],
+            items=len(items),
+            repeat=repeat,
+        )
         return True
 
     def stop(self) -> None:
         """Drop the queue + leave mpv idle. Keeps the process warm
-        for the next load (avoids spawn cost)."""
+        for the next load (avoids spawn cost). Always clears any
+        synced-session state first - every companion-stop path in
+        PiFrameClient routes through here (directly or via load([]))
+        so this is the one place that guarantees the discipline loop
+        lets go, even if mpv itself isn't currently running."""
+        was_synced = self._clear_sync()
         if not self._is_running():
             return
         self._send_command(["stop"])
+        if was_synced:
+            self._send_command(["set_property", "speed", 1.0])
+            self._send_command(["set_property", "audio-pitch-correction", "yes"])
         _log("companion_mpv_stopped")
+
+    def is_synced(self) -> bool:
+        with self._sync_lock:
+            return self._sync is not None
+
+    def set_latency(self, latency_ms: int) -> None:
+        """Live per-surface audio-delay change for the loaded session -
+        no reload. Clears the error window so the next discipline tick
+        doesn't react to error accumulated under the OLD latency."""
+        with self._sync_lock:
+            if self._sync is None:
+                return
+            self._sync["latency_ms"] = int(latency_ms)
+            self._err_window.clear()
+        _log("companion_sync_latency_set", latency_ms=latency_ms)
+
+    def sync_heartbeat(self) -> Optional[Dict[str, Any]]:
+        """The `audio_sync` status heartbeat field: None when no synced
+        session is loaded, else the live discipline snapshot."""
+        with self._sync_lock:
+            if self._sync is None:
+                return None
+            session = self._sync["session"]
+            latency_ms = self._sync["latency_ms"]
+            err = audio_sync.median(self._err_window)
+        est = self._clock.estimate()
+        return {
+            "session": session,
+            "err_ms": err * 1000.0 if err is not None else None,
+            "action": self._last_action,
+            "rate": self._last_rate,
+            "offset_ms": est[0] * 1000.0 if est else None,
+            "rtt_ms": est[1] * 1000.0 if est else None,
+            "latency_ms": latency_ms,
+        }
+
+    def _clear_sync(self) -> bool:
+        """Reset all synced-session bookkeeping and bump the generation
+        counter so any in-flight `_resync()` abandons its wait instead
+        of releasing mpv into a now-stale position. Returns True if a
+        session was actually loaded (callers use this to decide whether
+        the speed/pitch-correction undo is needed)."""
+        with self._sync_lock:
+            had_sync = self._sync is not None
+            self._sync = None
+            self._loaded_items = []
+            self._armed = False
+            self._generation += 1
+            self._err_window.clear()
+        if had_sync:
+            self._self_paused = False
+            self._last_action = "none"
+            self._last_rate = 1.0
+        return had_sync
+
+    # --- discipline thread ------------------------------------------------
+
+    def _ensure_discipline_thread(self) -> None:
+        """Start the discipline thread once, lazily, on first synced
+        use. Left running for the life of the process (companion
+        re-routes happen often) - it no-ops every tick that no synced
+        session is loaded, so idling it is cheap."""
+        if self._discipline_thread and self._discipline_thread.is_alive():
+            return
+        self._discipline_running = True
+        self._discipline_thread = threading.Thread(
+            target=self._discipline_loop, daemon=True, name="companion-discipline"
+        )
+        self._discipline_thread.start()
+
+    def _discipline_loop(self) -> None:
+        while self._discipline_running:
+            try:
+                self._discipline_tick()
+            except Exception as exc:
+                _log("companion_discipline_error", error=str(exc))
+            time.sleep(audio_sync.CADENCE_S)
+
+    def _discipline_tick(self) -> None:
+        """One discipline pass. Never raises - `_discipline_loop` also
+        guards it, but keeping this method itself defensive means a
+        unit test can call it directly without a running thread."""
+        with self._sync_lock:
+            sync = dict(self._sync) if self._sync else None
+            generation = self._generation
+        if sync is None:
+            return
+        reader = self._ipc
+        epoch = sync["epoch"]
+        durations = sync["durations"]
+        latency_s = sync["latency_ms"] / 1000.0
+
+        pause_val = reader.get_property("pause")
+        if pause_val is True and not self._self_paused:
+            # Operator pause (toggle_pause/set_paused) - not ours. Leave
+            # mpv exactly as the operator left it and clear the error
+            # window so resuming doesn't react to stale drift.
+            with self._sync_lock:
+                self._err_window.clear()
+            self._last_action = "paused"
+            return
+
+        now = self._clock.server_now()
+        tl = now + latency_s
+        pos = audio_sync.cycle_pos(epoch, durations, tl)
+        if pos < 0 or not self._armed:
+            self._resync(sync, generation, label="arming")
+            return
+        if audio_sync.near_boundary(durations, pos):
+            with self._sync_lock:
+                self._err_window.clear()
+            self._last_action = "skip"
+            return
+
+        t_before = time.time()
+        playlist_pos = reader.get_property("playlist-pos")
+        playback_time = reader.get_property("playback-time")
+        t_after = time.time()
+        if (
+            playback_time is None
+            or not isinstance(playlist_pos, int)
+            or isinstance(playlist_pos, bool)
+        ):
+            # Never treat a null playhead (or a timed-out playlist-pos)
+            # as 0 - it's null while mpv is idle/between files, not "at
+            # the start of the file / queue".
+            self._last_action = "skip"
+            return
+        t_mid = (t_before + t_after) / 2.0
+        pos_mid = audio_sync.cycle_pos(epoch, durations, t_mid + self._clock.offset() + latency_s)
+        actual = audio_sync.player_cycle_pos(durations, playlist_pos, float(playback_time))
+        if audio_sync.near_boundary(durations, actual):
+            self._last_action = "skip"
+            return
+
+        cyc = audio_sync.cycle_length(durations)
+        err = audio_sync.signed_error(pos_mid, actual, cyc)
+        with self._sync_lock:
+            self._err_window.append(err)
+            e = audio_sync.median(self._err_window) or 0.0
+        action, rate = audio_sync.discipline_action(e, now - self._last_resync)
+        self._last_rate = rate
+        if action == "none":
+            if self._last_set_speed != 1.0:
+                reader.command(["set_property", "speed", 1.0])
+                self._last_set_speed = 1.0
+            self._last_action = "none"
+        elif action == "nudge":
+            reader.command(["set_property", "speed", rate])
+            self._last_set_speed = rate
+            self._last_action = "nudge"
+        elif action == "hold":
+            self._last_action = "hold"
+        elif action == "resync":
+            self._resync(sync, generation, label="resync")
+
+    def _resync(self, sync: Dict[str, Any], generation: int, *, label: str) -> None:
+        """Pause, seek to the timeline, and release exactly on the mark.
+
+        `label` is "arming" for the pre-roll/not-yet-armed first call
+        and "resync" for a mid-stream gross-error correction - same
+        mechanics, only the heartbeat action name differs. Aborts
+        (leaving mpv paused) if `generation` goes stale mid-wait - a
+        newer load()/stop() has already redefined what "the session"
+        means - or if the discipline thread is being shut down."""
+        self._last_action = label
+        reader = self._ipc
+        epoch = sync["epoch"]
+        durations = sync["durations"]
+        latency_s = sync["latency_ms"] / 1000.0
+
+        reader.command(["set_property", "pause", True])
+        self._self_paused = True
+
+        def _target(mark: float) -> tuple[int, float]:
+            return audio_sync.locate(durations, audio_sync.cycle_pos(epoch, durations, mark + latency_s))
+
+        def _stale() -> bool:
+            return self._generation != generation or not self._discipline_running
+
+        mark = self._clock.server_now() + audio_sync.ARM_LEAD_S
+        idx, off = _target(mark)
+        if idx == 0 and off < 0:
+            # Pre-roll: release exactly when track 0 should start.
+            idx, off = 0, 0.0
+            mark = epoch - latency_s
+
+        if _stale():
+            return
+
+        if reader.get_property("playlist-pos") != idx:
+            reader.command(["playlist-play-index", idx])
+        # Always wait for the target file to be loaded, not only after a
+        # switch: the first arming tick can land while load()'s loadfile
+        # is still opening the file off the share, and a seek before
+        # playback initializes fails - releasing at 0:00 instead.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if _stale():
+                return
+            if (
+                reader.get_property("playlist-pos") == idx
+                and reader.get_property("playback-time") is not None
+            ):
+                break
+            time.sleep(0.05)
+
+        if _stale():
+            return
+
+        if mark - self._clock.server_now() < 0.1:
+            mark = self._clock.server_now() + audio_sync.ARM_LEAD_S
+            idx, off = _target(mark)
+            if idx == 0 and off < 0:
+                idx, off = 0, 0.0
+                mark = epoch - latency_s
+            if reader.get_property("playlist-pos") != idx:
+                reader.command(["playlist-play-index", idx])
+
+        reader.command(["seek", off, "absolute+exact"])
+
+        while True:
+            if _stale():
+                return
+            remaining = mark - self._clock.server_now()
+            if remaining <= 0:
+                break
+            # Short sleeps (capped at 50ms) that shrink to the exact
+            # remainder near the mark, so the last leg is a sub-5ms
+            # sleep rather than a CPU-spinning busy-wait.
+            time.sleep(min(remaining, 0.05))
+
+        if _stale():
+            return
+
+        reader.command(["set_property", "pause", False])
+        reader.command(["set_property", "speed", 1.0])
+        self._last_set_speed = 1.0
+        self._last_rate = 1.0
+        self._self_paused = False
+        with self._sync_lock:
+            self._err_window.clear()
+        self._last_resync = self._clock.server_now()
+        self._armed = True
+        self._last_action = label
 
     def set_volume(self, level: float) -> None:
         """Forward a volume change to the running mpv. mpv expects
@@ -1783,6 +2280,12 @@ class MpvCompanion:
     def shutdown(self) -> None:
         """Kill the mpv process entirely. Used during PiFrameClient
         teardown so we don't leave orphan companions running."""
+        self._clear_sync()
+        self._discipline_running = False
+        if self._discipline_thread and self._discipline_thread.is_alive():
+            self._discipline_thread.join(timeout=2.0)
+        self._discipline_thread = None
+        self._ipc.close()
         with self._lock:
             if not self._is_running():
                 self.process = None
@@ -1991,7 +2494,11 @@ class PiFrameClient:
         self.config = config
         self.ws_connection: Optional[websocket.WebSocketApp] = None
         self.renderer = BrowserController()
-        self.companion_mpv = MpvCompanion()
+        # Rolling server-clock offset estimate (time_ping/time_pong) -
+        # shared by the companion discipline loop and the status
+        # heartbeat. Fed by _handle_time_pong; sent by _clock_ping_loop.
+        self.clock = ClockSync()
+        self.companion_mpv = MpvCompanion(self.clock)
         self.current_playlist_name: str = ""
         self.current_playlist_id: str = ""
         self.current_video: str = ""
@@ -2019,6 +2526,9 @@ class PiFrameClient:
         self.playback_state: str = "stopped"
         self.status_thread: Optional[threading.Thread] = None
         self.status_running = False
+        # Companion clock-sync ping thread, started/stopped alongside
+        # the status thread (see _start_status_updates).
+        self.clock_ping_thread: Optional[threading.Thread] = None
         # Loopback HTTP server the kiosk POSTs slide-change events to.
         # Started alongside the status loop in _start_status_updates().
         self.browser_event_server: Optional[HTTPServer] = None
@@ -2143,6 +2653,8 @@ class PiFrameClient:
             "webview_close": self._handle_webview_close,
             "sprite_show": self._handle_sprite_show,
             "sprite_stop": self._handle_sprite_stop,
+            "time_pong": self._handle_time_pong,
+            "audio_sync_latency": self._handle_audio_sync_latency,
         }.get(cmd)
         if handler:
             handler(data, params)
@@ -2331,6 +2843,63 @@ class PiFrameClient:
             BROWSER_EVENT_STATE.set_paused(False)
             self._send_render_command()
 
+    @staticmethod
+    def _extract_audio_sync(
+        items: List[str], data: Dict[str, Any], params: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Return a shape-valid companion clock-sync descriptor or None.
+
+        Mirrors _extract_sync / _extract_video_sync's defensive style
+        for the whole-house-audio `sync` block (see audio_sync.py's
+        module docstring for the wire shape). A missing `sync` key is
+        the normal case for an old server or a plain unsynced companion
+        - silent None, no log. A `sync` key that IS present but
+        structurally wrong (bad types, a `durations` list that doesn't
+        line up with `items`, or a non-positive cycle length) logs
+        `audio_sync_ignored` with the reason and returns None so the
+        caller falls back to today's free-running companion playback."""
+        raw = params.get("sync", data.get("sync"))
+        if raw is None:
+            return None
+        if not isinstance(raw, dict):
+            _log("audio_sync_ignored", reason="not_dict")
+            return None
+        session = raw.get("session")
+        if not isinstance(session, str) or not session.strip():
+            _log("audio_sync_ignored", reason="session")
+            return None
+        epoch = raw.get("epoch")
+        if isinstance(epoch, bool) or not isinstance(epoch, (int, float)):
+            _log("audio_sync_ignored", reason="epoch")
+            return None
+        raw_durations = raw.get("durations")
+        if (
+            not isinstance(raw_durations, list)
+            or len(raw_durations) != len(items)
+            or any(isinstance(d, bool) for d in raw_durations)
+        ):
+            _log("audio_sync_ignored", reason="durations")
+            return None
+        try:
+            durations = [float(d) for d in raw_durations]
+        except (TypeError, ValueError):
+            _log("audio_sync_ignored", reason="durations")
+            return None
+        if audio_sync.cycle_length(durations) <= 0:
+            _log("audio_sync_ignored", reason="cycle")
+            return None
+        try:
+            latency_ms = int(round(float(raw.get("latency_ms", 0))))
+        except (TypeError, ValueError, OverflowError):
+            _log("audio_sync_ignored", reason="latency")
+            return None
+        return {
+            "session": session.strip(),
+            "epoch": float(epoch),
+            "durations": durations,
+            "latency_ms": latency_ms,
+        }
+
     def _handle_audio_playlist(
         self, data: Dict[str, Any], params: Dict[str, Any]
     ) -> None:
@@ -2378,7 +2947,8 @@ class PiFrameClient:
         )
 
         if is_companion:
-            self._set_companion_state(items, repeat=repeat, mute_visual=mute_visual)
+            sync = self._extract_audio_sync(items, data, params)
+            self._set_companion_state(items, repeat=repeat, mute_visual=mute_visual, sync=sync)
             _log(
                 "audio_companion_command",
                 items=len(items),
@@ -2387,6 +2957,7 @@ class PiFrameClient:
                 target=target,
                 playlist=playlist_name or "",
                 playlist_id=playlist_id or "",
+                sync=bool(sync),
             )
             return
 
@@ -2429,16 +3000,24 @@ class PiFrameClient:
             self._send_render_command()
 
     def _set_companion_state(
-        self, items: List[str], *, repeat: bool, mute_visual: bool
+        self,
+        items: List[str],
+        *,
+        repeat: bool,
+        mute_visual: bool,
+        sync: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Drive the audio companion. Audio plays through the
         MpvCompanion sidecar (separate process - Chromium on Pi
         locks the audio device while a video plays, so an in-page
         <audio> element can't claim HDMI). The renderer's
         video_mute_override flag handles the visual side of the
-        override-mute path."""
+        override-mute path. `sync` (see _extract_audio_sync) drives
+        whole-house synced playback; every stop path here - `items`
+        empty - routes through `companion_mpv.stop()`, which is the
+        one place that clears any synced-session state."""
         if items:
-            self.companion_mpv.load(items, repeat=repeat)
+            self.companion_mpv.load(items, repeat=repeat, sync=sync)
         else:
             self.companion_mpv.stop()
         # Visual side: video_mute_override applies only while companion
@@ -3127,6 +3706,37 @@ class PiFrameClient:
         _log("sprite_stop_command")
         self.renderer.set_sprite(None)
 
+    def _handle_time_pong(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:
+        """Reply to our own time_ping (see _clock_ping_loop). Feeds the
+        estimator the companion discipline loop and the status
+        heartbeat both read. Malformed fields drop silently - an old
+        server that never sends this just leaves the estimate at its
+        last value (offset 0 before the first good sample)."""
+        t0 = params.get("t0", data.get("t0"))
+        server_time = params.get("server_time", data.get("server_time"))
+        try:
+            t0 = float(t0)
+            server_time = float(server_time)
+        except (TypeError, ValueError):
+            return
+        self.clock.add_sample(t0, server_time, time.time())
+
+    def _handle_audio_sync_latency(
+        self, data: Dict[str, Any], params: Dict[str, Any]
+    ) -> None:
+        """Live per-surface audio-delay change for the loaded companion
+        session - updates in place, no reload (mirrors the same-session
+        guard's own latency-only path in MpvCompanion.load)."""
+        latency_raw = params.get("latency_ms", data.get("latency_ms"))
+        try:
+            latency_ms = int(round(float(latency_raw)))
+        except (TypeError, ValueError, OverflowError):
+            _log("audio_sync_latency_ignored", reason="latency")
+            return
+        self.companion_mpv.set_latency(latency_ms)
+
     def on_close(self, ws, close_status_code, close_msg) -> None:  # pylint: disable=unused-argument
         """Manager connection lost. Keep playing.
 
@@ -3200,6 +3810,10 @@ class PiFrameClient:
         self.status_running = True
         self.status_thread = threading.Thread(target=self._status_loop, daemon=True)
         self.status_thread.start()
+        self.clock_ping_thread = threading.Thread(
+            target=self._clock_ping_loop, daemon=True, name="clock-ping"
+        )
+        self.clock_ping_thread.start()
 
     def _stop_status_updates(self) -> None:
         self.status_running = False
@@ -3209,6 +3823,34 @@ class PiFrameClient:
         if self.status_thread and self.status_thread.is_alive():
             self.status_thread.join(timeout=2.0)
         self.status_thread = None
+        if self.clock_ping_thread and self.clock_ping_thread.is_alive():
+            self.clock_ping_thread.join(timeout=2.0)
+        self.clock_ping_thread = None
+
+    def _clock_ping_loop(self) -> None:
+        """Periodic time_ping so ClockSync keeps a live offset estimate.
+        Faster cadence while a synced companion session is loaded
+        (tighter discipline needs a fresher estimate); slower otherwise
+        just to keep it warm. Only sends while connected - on_close
+        already drops self.ws_connection to None on disconnect."""
+        # Re-checks the cadence every 0.25s (rather than sleeping a whole
+        # interval) so the first ping goes out right away and a synced
+        # load switches to the fast cadence immediately, not up to
+        # CLOCK_IDLE_PING_S later.
+        last_ping = 0.0
+        while self.status_running:
+            interval = (
+                audio_sync.CLOCK_PING_S
+                if self.companion_mpv.is_synced()
+                else audio_sync.CLOCK_IDLE_PING_S
+            )
+            if self.ws_connection and time.monotonic() - last_ping >= interval:
+                last_ping = time.monotonic()
+                try:
+                    self.ws_connection.send(json.dumps({"type": "time_ping", "t0": time.time()}))
+                except Exception:
+                    pass
+            time.sleep(0.25)
 
     def _start_browser_event_server(self) -> None:
         if getattr(self, "browser_event_server", None) is not None:
@@ -3345,6 +3987,10 @@ class PiFrameClient:
                 # Static across the lifetime of this client; cheap to
                 # ship every heartbeat (small list).
                 "visualizer_presets": list(AUDIO_VISUALIZER_PRESETS),
+                # None when no synced companion session is loaded, else
+                # the live discipline snapshot (session/err_ms/action/
+                # rate/offset_ms/rtt_ms/latency_ms) - see MpvCompanion.
+                "audio_sync": self.companion_mpv.sync_heartbeat(),
             }
             metrics = _collect_system_metrics()
             if metrics:
