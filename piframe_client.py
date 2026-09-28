@@ -21,6 +21,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -81,6 +82,7 @@ OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "
 # otherwise native. That keeps the unit file identical on every frame
 # (and in a cloned SD image) whatever TV it drives.
 OUTPUT_MODE = os.environ.get("PIFRAME_OUTPUT_MODE", "").strip()
+DISPLAY_WATCH_SCRIPT = Path(__file__).resolve().parent / "display_watch.py"
 AUTO_4K_MODE = "1920x1080@60"
 
 
@@ -1059,26 +1061,19 @@ class BrowserController:
                 f"--output \"$o\"{apply_args} "
                 ">/dev/null 2>&1 || true; done"
             )
-            # Re-apply on drift. When the TV suspends, HDMI link drops
-            # and cage forgets both transform AND mode; on resume the
-            # output comes back at "normal" + EDID-native mode. Watch
-            # the Transform line; if it doesn't match, reapply BOTH the
-            # transform and the mode in one wlr-randr call so the
-            # framebuffer never lands in a half-fixed state. When only
-            # the mode is overridden (no rotation), we skip the watch
-            # because there's nothing rotation-shaped to key off.
-            if needs_transform:
-                rotate_watch_cmd = (
-                    "while sleep 1; do "
-                    f"current=$({shlex.quote(wlr_randr_path)} 2>/dev/null | "
-                    "awk '/^[^ \\t]/ { name=$1 } /^  Transform:/ "
-                    f"{{ print name, $2 }}'); "
-                    "echo \"$current\" | while read o t; do "
-                    f"if [ -n \"$o\" ] && [ \"$t\" != {shlex.quote(OUTPUT_TRANSFORM)} ]; then "
-                    f"{shlex.quote(wlr_randr_path)} --output \"$o\"{apply_args} "
-                    ">/dev/null 2>&1 || true; "
-                    "fi; done; done"
-                )
+        # Keep rotation AND resolution right for the kiosk's lifetime
+        # (display_watch.py): a TV suspend drops the HDMI link and cage
+        # forgets the transform; a TV whose EDID was unreadable when the
+        # link came up leaves cage on a 1024x768 fallback the 16:9 TV
+        # stretches. The watcher re-applies the transform, keeps asking the
+        # kernel for the EDID and switches to the TV's mode once it answers.
+        if wlr_randr_path:
+            rotate_watch_cmd = shlex.join([
+                sys.executable, str(DISPLAY_WATCH_SCRIPT),
+                "--wlr-randr", wlr_randr_path,
+                "--transform", OUTPUT_TRANSFORM if needs_transform else "",
+                "--mode", OUTPUT_MODE or "native",
+            ])
         if wlrctl_path:
             park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])
             launcher_lines = ["set -eu"]

@@ -417,6 +417,17 @@ the cage output) makes the framebuffer itself portrait, so:
 The transform direction (90, 180, 270) is configurable via the
 `PIFRAME_OUTPUT_TRANSFORM` environment variable. Default is `90`.
 
+`display_watch.py` runs inside the cage session for the kiosk's lifetime
+and keeps the output right once a second: it re-applies the transform
+when a TV suspend drops it, and it recovers from a TV whose EDID was
+unreadable when the HDMI link came up. Without an EDID the kernel offers
+only fallback modes, cage settles on 1024x768, and the 16:9 TV stretches
+that 4:3 page (pictures squished between dark bars). While a connected
+port has no EDID the watcher asks the kernel to read it again every 30s;
+once the TV answers it replugs the port in software (wlroots only
+rebuilds its mode list on a reconnect) and switches to the TV's mode.
+Its log lines (`[display_watch] ...`) land in `/tmp/piframe_browser.log`.
+
 ### Connecting
 
 Any VNC viewer that speaks RFB will work. Tested setups:
