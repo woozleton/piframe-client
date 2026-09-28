@@ -1,19 +1,29 @@
 """Keep the kiosk's display at the right rotation and resolution.
 
 Started by piframe_client.py's launcher INSIDE the cage session, so
-wlr-randr talks to the kiosk's own compositor. Once a second it compares
-every output with what it should be and puts it right:
+wlr-randr talks to the kiosk's own compositor. Once a second it checks
+every output:
 
 - Rotation (PIFRAME_OUTPUT_TRANSFORM). A TV suspend drops the HDMI link
-  and cage forgets the transform; the output comes back unrotated.
-- Resolution. The mode comes from the TV's EDID. When the EDID can't be
+  and cage forgets the transform; the output comes back unrotated, so the
+  watcher puts the transform back (with the configured mode, one call) -
+  the same thing the old bash watcher did.
+- EDID recovery. The mode comes from the TV's EDID. When the EDID can't be
   read at the moment the kiosk starts or the link comes back (the TV
   waking up, a marginal HDMI contact), the kernel offers only fallback
   modes and cage settles on 1024x768: a 4:3 page the 16:9 TV then
   stretches - squished pictures between dark bars. While a connected HDMI
   port has no EDID, the watcher asks the kernel to read it again (at most
-  every EDID_RETRY_S); as soon as the TV answers, it switches to the TV's
-  mode (`auto` caps 4K at 1920x1080@60, the same rule as the kiosk start).
+  every EDID_RETRY_S); once it has it, the watcher replugs the port in
+  software if the compositor's mode list is behind the kernel's (wlroots
+  rebuilds it only on a reconnect), then switches to the TV's mode.
+
+A TV that identifies itself normally is never touched beyond the rotation:
+the resolution is only changed while recovering from the fallback or
+together with a rotation re-apply, and a replug only happens when the
+kernel offers a mode the compositor doesn't list - once per recovery.
+`--no-recover` (PIFRAME_DISPLAY_RECOVERY=0) turns the EDID recovery off
+and leaves just the rotation watch.
 
 Logs go to stdout, i.e. the browser log (/tmp/piframe_browser.log).
 """
@@ -80,14 +90,16 @@ def _same_mode(a: dict | None, b: dict | None) -> bool:
         b["width"], b["height"], round(float(b["refresh"]), 2))
 
 
-def plan(output: dict, transform: str, configured: str) -> list[str]:
+def plan(output: dict, transform: str, configured: str, *, recovering: bool = False) -> list[str]:
     """wlr-randr arguments that bring this output in line ([] = nothing to
-    do). Mode and transform always go in ONE call - applying them apart
-    flashed a landscape frame between the two."""
+    do). The mode is only set while recovering from the EDID fallback or
+    together with a rotation re-apply - never on its own for a TV that
+    identified itself. Mode and transform always go in ONE call - applying
+    them apart flashed a landscape frame between the two."""
     modes = output.get("modes") or []
     current = next((m for m in modes if m.get("current")), None)
-    want = desired_mode(modes, configured)
     wrong_transform = bool(transform) and str(output.get("transform") or "normal") != transform
+    want = desired_mode(modes, configured) if (recovering or wrong_transform) else None
     wrong_mode = want is not None and not _same_mode(want, current)
     if not (wrong_transform or wrong_mode):
         return []
@@ -107,10 +119,16 @@ def edid_missing(connector: Path) -> bool:
         return False
 
 
-def stale_modes(output: dict) -> bool:
-    """The compositor's list for this output holds only fallback modes
-    (nothing preferred) - it was built while the EDID was unreadable."""
-    return not any(m.get("preferred") for m in output.get("modes") or [])
+def compositor_behind(connector: Path, output: dict) -> bool:
+    """The kernel's first mode (the EDID's preferred one) is missing from
+    the compositor's list - wlroots built that list while the EDID was
+    unreadable and only rebuilds it on a reconnect."""
+    try:
+        first = (connector / "modes").read_text().split()[0]
+        width, height = (int(v) for v in first.split("x")[:2])
+    except (OSError, ValueError, IndexError):
+        return False
+    return not any(m.get("width") == width and m.get("height") == height for m in output.get("modes") or [])
 
 
 def connector_for(name: str) -> Path | None:
@@ -138,10 +156,8 @@ def reprobe(connector: Path) -> bool:
 
 def replug(connector: Path) -> bool:
     """Make the compositor see the port unplug and come back - what a TV
-    power cycle does. wlroots rebuilds an output's mode list only on a
-    reconnect, so an EDID the kernel re-read with the port still connected
-    never reaches it otherwise. Always re-enables the port ('off' would
-    otherwise stick until the next write)."""
+    power cycle does. Always re-enables the port ('off' would otherwise
+    stick until the next write)."""
     _write_status(connector, "off")
     time.sleep(1.0)
     for _ in range(5):
@@ -168,43 +184,61 @@ def apply(wlr_randr: str, name: str, args: list[str]) -> bool:
 
 
 class Watcher:
-    def __init__(self, wlr_randr: str, transform: str, configured: str):
+    def __init__(self, wlr_randr: str, transform: str, configured: str, *, recover: bool = True):
         self.wlr_randr = wlr_randr
         self.transform = "" if transform in ("", "normal") else transform
         self.configured = configured
+        self.recover = recover
         self.next_reprobe: dict[str, float] = {}
         self.next_apply: dict[str, float] = {}
         self.no_edid: set[str] = set()
+        self.recovering: set[str] = set()
         self.seen: set[str] = set()
+
+    def _recover_step(self, name: str, output: dict, now: float) -> bool:
+        """EDID recovery for one output. True = the port is being replugged,
+        leave the output alone this tick."""
+        connector = connector_for(name)
+        first_sight = name not in self.seen
+        self.seen.add(name)
+        if connector is None:
+            return False
+        if edid_missing(connector):
+            if name not in self.no_edid:
+                self.no_edid.add(name)
+                self.recovering.add(name)
+                log("edid_missing", output=name, note="TV identification unreadable - retrying")
+            if now >= self.next_reprobe.get(name, 0.0):
+                self.next_reprobe[name] = now + EDID_RETRY_S
+                reprobe(connector)
+            return False
+        if name in self.no_edid or first_sight:
+            came_back = name in self.no_edid
+            self.no_edid.discard(name)
+            if compositor_behind(connector, output):
+                # Once per recovery (or kiosk start): the next ticks put the
+                # rotation back and, while recovering, the TV's mode.
+                self.recovering.add(name)
+                log("edid_back", output=name, action="replug", ok=replug(connector))
+                return True
+            if came_back:
+                log("edid_back", output=name)
+        return False
 
     def tick(self, now: float) -> None:
         for output in read_outputs(self.wlr_randr):
             name = output.get("name") or ""
             if not name or not output.get("enabled", True):
                 continue
-            connector = connector_for(name)
-            first_sight = name not in self.seen
-            self.seen.add(name)
-            if connector is not None and edid_missing(connector):
-                if name not in self.no_edid:
-                    self.no_edid.add(name)
-                    log("edid_missing", output=name, note="TV identification unreadable - retrying")
-                if now >= self.next_reprobe.get(name, 0.0):
-                    self.next_reprobe[name] = now + EDID_RETRY_S
-                    reprobe(connector)
-            elif connector is not None and (name in self.no_edid or first_sight):
-                self.no_edid.discard(name)
-                if stale_modes(output):
-                    # The kernel has the EDID, the compositor still only the
-                    # fallback modes it built while it was unreadable: replug
-                    # so it rebuilds the list and picks the TV's mode. Once
-                    # per recovery - the next ticks put the rotation back.
-                    log("edid_back", output=name, action="replug", ok=replug(connector))
-                    continue
-                if not first_sight:
-                    log("edid_back", output=name)
-            args = plan(output, self.transform, self.configured)
-            if args and now >= self.next_apply.get(name, 0.0):
+            if self.recover and self._recover_step(name, output, now):
+                continue
+            recovering = name in self.recovering and name not in self.no_edid
+            args = plan(output, self.transform, self.configured, recovering=recovering)
+            if not args:
+                if recovering:
+                    self.recovering.discard(name)
+                continue
+            if now >= self.next_apply.get(name, 0.0):
                 self.next_apply[name] = now + APPLY_RETRY_S
                 log("apply", output=name, args=" ".join(args), ok=apply(self.wlr_randr, name, args))
 
@@ -214,9 +248,10 @@ def main() -> None:
     parser.add_argument("--wlr-randr", default="wlr-randr")
     parser.add_argument("--transform", default="")
     parser.add_argument("--mode", default="auto", help="auto | native | WxH[@Hz]")
+    parser.add_argument("--no-recover", action="store_true", help="rotation watch only, no EDID recovery")
     parser.add_argument("--once", action="store_true", help="one pass, then exit")
     opts = parser.parse_args()
-    watcher = Watcher(opts.wlr_randr, opts.transform, opts.mode)
+    watcher = Watcher(opts.wlr_randr, opts.transform, opts.mode, recover=not opts.no_recover)
     while True:
         watcher.tick(time.monotonic())
         if opts.once:

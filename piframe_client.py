@@ -83,6 +83,12 @@ OUTPUT_TRANSFORM = os.environ.get("PIFRAME_OUTPUT_TRANSFORM", "90").strip() or "
 # (and in a cloned SD image) whatever TV it drives.
 OUTPUT_MODE = os.environ.get("PIFRAME_OUTPUT_MODE", "").strip()
 DISPLAY_WATCH_SCRIPT = Path(__file__).resolve().parent / "display_watch.py"
+# display_watch.py's EDID recovery (re-read a missing EDID, replug, switch
+# to the TV's mode). PIFRAME_DISPLAY_RECOVERY=0 leaves only the rotation
+# watch - for a TV that misbehaves under it.
+DISPLAY_RECOVERY = os.environ.get("PIFRAME_DISPLAY_RECOVERY", "1").strip().lower() not in (
+    "0", "false", "no", "off"
+)
 AUTO_4K_MODE = "1920x1080@60"
 
 
@@ -1073,6 +1079,7 @@ class BrowserController:
                 "--wlr-randr", wlr_randr_path,
                 "--transform", OUTPUT_TRANSFORM if needs_transform else "",
                 "--mode", OUTPUT_MODE or "native",
+                *([] if DISPLAY_RECOVERY else ["--no-recover"]),
             ])
         if wlrctl_path:
             park_cursor_cmd = shlex.join([wlrctl_path, "pointer", "move", "-100000", "100000"])

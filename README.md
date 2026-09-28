@@ -424,8 +424,14 @@ unreadable when the HDMI link came up. Without an EDID the kernel offers
 only fallback modes, cage settles on 1024x768, and the 16:9 TV stretches
 that 4:3 page (pictures squished between dark bars). While a connected
 port has no EDID the watcher asks the kernel to read it again every 30s;
-once the TV answers it replugs the port in software (wlroots only
-rebuilds its mode list on a reconnect) and switches to the TV's mode.
+once the TV answers it replugs the port in software if the compositor's
+mode list is behind the kernel's (wlroots only rebuilds it on a
+reconnect) and switches to the TV's mode. A TV that identifies itself
+normally - a Frame or any other make - is never touched beyond the
+rotation: the resolution only changes while recovering or together with
+a rotation re-apply, and a replug happens at most once per recovery.
+`PIFRAME_DISPLAY_RECOVERY=0` in the service's `Environment=` turns the
+EDID recovery off and leaves just the rotation watch.
 Its log lines (`[display_watch] ...`) land in `/tmp/piframe_browser.log`.
 
 ### Connecting
