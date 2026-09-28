@@ -142,6 +142,33 @@ BOOT_WINDOW_SECONDS = 600.0
 VERIFY_SECONDS = 4.0
 MAX_RESENDS = 2
 SOURCE_THEN_STANDBY_GAP = 1.0
+# Display rescue. A TV that stops answering its EDID over DDC when the HDMI
+# link comes up leaves the kiosk on a 1024x768 fallback the 16:9 TV then
+# stretches - squished pictures (office-back, about weekly). The kiosk's
+# display_watch.py asks the kernel for the EDID again every 30s; if the TV
+# still hasn't answered after RESCUE_AFTER_SECONDS, power-cycling it over
+# CEC makes it announce itself again - what the nightly off/on did.
+# Universal by construction - it only ever acts on a TV that:
+#   * reports "on" and whose screen Home Assistant wants on (never wakes an
+#     off TV, never fights HA or a command in flight);
+#   * has been seen answering CEC while in standby (standby_reachable,
+#     learned per frame and persisted) - a TV that drops off the bus in
+#     standby could not be woken again, and one that ignores standby (the
+#     mirror's Vizio always reports "on") is never learned, so neither is
+#     ever cycled;
+#   * is already broken: EDID unreadable for RESCUE_AFTER_SECONDS.
+# At most one cycle per RESCUE_COOLDOWN_SECONDS and RESCUE_MAX_ATTEMPTS per
+# episode (a setup whose EDID never reads isn't cycled forever); a readable
+# EDID starts a fresh episode. PIFRAME_CEC_RESCUE=0 turns it off.
+RESCUE_ENABLED = os.environ.get("PIFRAME_CEC_RESCUE", "1").strip().lower() not in ("0", "false", "no", "off")
+RESCUE_CHECK_SECONDS = 30.0
+RESCUE_AFTER_SECONDS = 180.0
+RESCUE_OFF_SECONDS = 20.0
+RESCUE_COOLDOWN_SECONDS = 3600.0
+RESCUE_MAX_ATTEMPTS = 2
+OFF_POWER_STATES = ("standby", "to-standby", "to-on")
+STANDBY_PROOF_SECONDS = 120.0
+DRM = Path("/sys/class/drm")
 
 MQTT_HOST = os.environ.get("PIFRAME_MQTT_HOST", "").strip()
 MQTT_PORT = int(os.environ.get("PIFRAME_MQTT_PORT", "1883") or 1883)
@@ -316,6 +343,30 @@ class Adapter:
         return None
 
 
+def display_stuck(drm: Path = DRM) -> bool:
+    """A connected HDMI port whose EDID came back empty - the kiosk is on a
+    fallback mode (display_watch.py keeps asking the kernel again)."""
+    for status in sorted(drm.glob("card*-HDMI-A-*/status")):
+        try:
+            if status.read_text().strip() == "connected" and not (status.parent / "edid").read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def display_readable(drm: Path = DRM) -> bool:
+    """A connected HDMI port whose EDID reads - the TV identifies itself.
+    (A port that's merely disconnected is neither this nor stuck.)"""
+    for status in sorted(drm.glob("card*-HDMI-A-*/status")):
+        try:
+            if status.read_text().strip() == "connected" and (status.parent / "edid").read_bytes():
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def open_adapters(follower: bool) -> List[Adapter]:
     adapters = []
     for path in sorted(str(p) for p in Path("/dev").glob("cec[0-9]*")):
@@ -467,6 +518,14 @@ class Service:
         # A fresh boot (power cut, reboot) wakes the screen once the TV is
         # reachable, if it is meant to be on. A plain restart does not.
         self.wake_reason: Optional[str] = "pi booted" if uptime_seconds() < BOOT_WINDOW_SECONDS else None
+        # Display rescue (see RESCUE_*): when the unreadable EDID was first
+        # seen with the TV on, when the next power cycle is allowed, how many
+        # this episode, and whether this TV answers CEC in standby.
+        self.stuck_since: Optional[float] = None
+        self.rescue_next = 0.0
+        self.rescue_attempts = 0
+        self.off_since: Optional[float] = None
+        self.standby_reachable = self._load_flag("standby_reachable")
 
     # persistence ----------------------------------------------------------
     def _load_desired(self) -> bool:
@@ -475,11 +534,18 @@ class Service:
         except (OSError, ValueError, AttributeError):
             return True  # frames are meant to be on
 
+    def _load_flag(self, key: str) -> bool:
+        try:
+            return json.loads(self.state_file.read_text()).get(key) is True
+        except (OSError, ValueError, AttributeError):
+            return False
+
     def _save_desired(self) -> None:
         try:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.state_file.with_suffix(".tmp")
-            tmp.write_text(json.dumps({"screen": "ON" if self.desired else "OFF"}))
+            tmp.write_text(json.dumps({"screen": "ON" if self.desired else "OFF",
+                                       "standby_reachable": bool(getattr(self, "standby_reachable", False))}))
             tmp.replace(self.state_file)
         except OSError as exc:
             log(f"cannot persist desired state: {exc}")
@@ -512,6 +578,20 @@ class Service:
             self.power = power
             self.ha.publish(self.ha.t_power, power)
             self.ha.publish(self.ha.t_state, "ON" if power == "on" else "OFF")
+        # Learn whether this TV stays on the CEC bus in standby (so a wake-up
+        # reaches it): off AND still answering us STANDBY_PROOF_SECONDS
+        # later. A TV that says "to-standby" and then drops off the bus
+        # reads as disconnected by the next poll and is never learned.
+        now = time.monotonic()
+        if power in OFF_POWER_STATES:
+            if self.off_since is None:
+                self.off_since = now
+            elif not self.standby_reachable and now - self.off_since >= STANDBY_PROOF_SECONDS:
+                self.standby_reachable = True
+                self._save_desired()
+                log(f"TV answers CEC in standby ({power}) - display rescue available")
+        else:
+            self.off_since = None
 
     def poll_power(self) -> str:
         ad = self.active
@@ -561,6 +641,39 @@ class Service:
         # from what we already had; a live command from HA always acts.
         if changed or not retained:
             self.command(on, "home assistant" + (" (while offline)" if retained else ""))
+
+    # display rescue -------------------------------------------------------
+    def _rescue_check(self) -> None:
+        self.schedule("rescue", RESCUE_CHECK_SECONDS, self._rescue_check)
+        now = time.monotonic()
+        stuck = display_stuck()
+        if display_readable():
+            self.rescue_attempts = 0  # the EDID reads: a later episode starts fresh
+        if not (stuck and self.desired and self.power == "on" and self.target is None and self.standby_reachable):
+            self.stuck_since = None
+            return
+        if self.stuck_since is None:
+            self.stuck_since = now
+            log("display: the TV is on but its EDID is unreadable - the kiosk is on a fallback mode")
+            return
+        if now - self.stuck_since < RESCUE_AFTER_SECONDS or now < self.rescue_next:
+            return
+        if self.rescue_attempts >= RESCUE_MAX_ATTEMPTS:
+            if self.rescue_attempts == RESCUE_MAX_ATTEMPTS:
+                self.rescue_attempts += 1  # log it once
+                log(f"display rescue: {RESCUE_MAX_ATTEMPTS} power cycles didn't help - stopping until the EDID reads again")
+            return
+        self.stuck_since = None
+        self.rescue_next = now + RESCUE_COOLDOWN_SECONDS
+        self.rescue_attempts += 1
+        log(f"display rescue: EDID still unreadable after {RESCUE_AFTER_SECONDS:.0f}s - power-cycling the TV "
+            f"(attempt {self.rescue_attempts}/{RESCUE_MAX_ATTEMPTS})")
+        self.command(False, "display rescue")
+        self.schedule("rescue-wake", RESCUE_OFF_SECONDS, self._rescue_wake)
+
+    def _rescue_wake(self) -> None:
+        if self.desired:  # Home Assistant may have turned the screen off meanwhile
+            self.command(True, "display rescue")
 
     # CEC events + messages ------------------------------------------------
     def on_pa_change(self, ad: Adapter, pa: int) -> None:
@@ -641,6 +754,8 @@ class Service:
         else:
             self.set_power("disconnected")
         self.ha.start()
+        if RESCUE_ENABLED:
+            self.schedule("rescue", RESCUE_CHECK_SECONDS, self._rescue_check)
 
         poller = select.poll()
         by_fd = {a.fd: a for a in self.adapters}
