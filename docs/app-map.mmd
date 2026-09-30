@@ -1,0 +1,38 @@
+%% name: PiFrame client
+%% description: The kiosk on each Pi picture frame, driven by WoozleScape on SPUT-SERV
+flowchart LR
+  %% Every Pi frame runs the same parts, so they share one frame, as in WoozleScape's map,
+  %% and the ids of the parts both maps draw match. Not drawn: each frame sets its clock
+  %% from SPUT-SERV's NTP server (timesyncd), which keeps the synced slides in step, and a
+  %% timer brings Wi-Fi back when it drops.
+  subgraph internet ["Internet"]
+    github("GitHub")
+  end
+  subgraph home_assistant ["Home Assistant"]
+    mosquitto("Mosquitto<br/>1883")
+  end
+  subgraph sput_serv ["SPUT-SERV"]
+    woozlescape("WoozleScape<br/>8080")
+  end
+  subgraph pi_frames ["Pi frames"]
+    piframe_client("Frame client")
+    piframe_cec("TV power<br/>HDMI-CEC")
+    frame_music("Music player")
+    kiosk("Chromium kiosk<br/>cage")
+    wayvnc("wayvnc<br/>5900")
+  end
+  subgraph prod_nas ["PROD-NAS"]
+    nas_media[("Media share")]
+  end
+  tv("TV")
+  piframe_client -->|"IPC"| frame_music
+  wayvnc -->|"Wayland"| kiosk
+  piframe_client -.->|"Git pull"| github
+  kiosk -->|"SMB"| nas_media
+  frame_music -->|"SMB"| nas_media
+  piframe_cec -->|"HDMI-CEC"| tv
+  piframe_cec -->|"MQTT"| mosquitto
+  piframe_client <-->|"State, events"| kiosk
+  woozlescape <-->|"WebSocket"| piframe_client
+  kiosk -->|"HDMI"| tv
+  woozlescape -->|"VNC 5900"| wayvnc
