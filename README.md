@@ -357,19 +357,6 @@ What it sends (field-tested 2026-09-22):
 - Answers the TV's `<Request Active Source>` so a TV woken by its own
   remote lands on the kiosk. TV-remote key passthrough is deliberately
   off (keys must not reach the kiosk browser).
-- **Display rescue**: a TV that stays on with an unreadable EDID leaves
-  the kiosk on a squished 1024x768 fallback (see `display_watch.py`).
-  After 3 minutes like that, the service power-cycles the TV (off, 20s,
-  on) so it announces itself again. It works with any TV because it only
-  ever acts on one that reports `on`, whose screen is meant to be on,
-  and that has been seen answering CEC while off for 2+ minutes (learned
-  per frame, remembered in the state file) - a TV that drops off the bus
-  in standby, ignores standby, or has no CEC is never cycled. At most
-  once an hour and twice per episode; a readable EDID starts a new one.
-  `PIFRAME_CEC_RESCUE=0` turns it off. It can't act when the EDID never
-  arrived, since the Pi's CEC address comes from the EDID (office-back,
-  2026-10-13: "no TV connected"); `display_watch.py`'s kept EDID covers
-  that case.
 
 Per TV, once: enable HDMI-CEC (Samsung: **Anynet+**) and, on Samsung
 Frames, set **Power Button Option = On/Off** so standby turns the TV
