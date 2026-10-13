@@ -123,12 +123,15 @@ def test_compositor_behind_only_when_it_lacks_the_kernels_mode(tmp_path):
 class _Fleet:
     """Fake compositor + kernel for one output."""
 
-    def __init__(self, monkeypatch, output, edid=False, behind=False):
+    def __init__(self, monkeypatch, output, edid=False, behind=False, saved=False):
         self.output = output
         self.edid = edid
         self.behind = behind
+        self.saved = saved  # a kept copy of the TV's EDID on disk
+        self.connected = True
         self.reprobes, self.replugs, self.applied = [], [], []
-        monkeypatch.setattr(dw, "read_outputs", lambda _w: [self.output])
+        self.kept, self.loads, self.clears = [], [], []
+        monkeypatch.setattr(dw, "read_outputs", lambda _w: [self.output] if self.output else [])
         monkeypatch.setattr(dw, "connector_for", lambda name: Path("/fake") / name)
         monkeypatch.setattr(dw, "edid_missing", lambda _c: not self.edid)
         monkeypatch.setattr(dw, "compositor_behind", lambda _c, _o: self.behind)
@@ -136,6 +139,17 @@ class _Fleet:
         monkeypatch.setattr(dw, "replug", lambda c: self.replugs.append(c) or True)
         monkeypatch.setattr(dw, "apply", lambda _w, name, args: self.applied.append(list(args)) or True)
         monkeypatch.setattr(dw, "log", lambda *a, **k: None)
+        monkeypatch.setattr(dw, "keep_edid", lambda c, name: self.kept.append(name) or False)
+        monkeypatch.setattr(dw, "saved_edid", lambda name: type("P", (), {"exists": lambda _s: self.saved})())
+        monkeypatch.setattr(dw, "load_saved_edid", self._load)
+        monkeypatch.setattr(dw, "clear_saved_edid", lambda c: self.clears.append(c) or True)
+        monkeypatch.setattr(dw, "port_connected", lambda _c: self.connected)
+
+    def _load(self, connector, name):
+        """The kernel takes the kept copy: the port reads an EDID again."""
+        self.loads.append(name)
+        self.edid = True
+        return True
 
 
 def test_stuck_output_is_asked_again_every_30s_then_recovers(monkeypatch):
@@ -212,3 +226,91 @@ def test_a_fix_that_does_not_take_is_retried_slowly(monkeypatch):
     for t in range(0, 10):
         w.tick(float(t))
     assert len(fleet.applied) == 2  # t=0 and t=5, not ten times
+
+
+# --- the TV's own EDID, kept -------------------------------------------------------
+
+
+def test_keep_edid_keeps_a_real_edid_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(dw, "STATE_DIR", tmp_path / "state")
+    real = dw.EDID_HEADER + bytes(248)
+    conn = _connector(tmp_path, edid=real)
+    assert dw.keep_edid(conn, "HDMI-A-2")
+    assert dw.saved_edid("HDMI-A-2").read_bytes() == real
+    assert not dw.keep_edid(conn, "HDMI-A-2")  # unchanged: not written again
+    assert not dw.keep_edid(_connector(tmp_path, edid=bytes(128)), "HDMI-A-2")  # not an EDID
+    assert not dw.keep_edid(_connector(tmp_path, edid=b""), "HDMI-A-2")
+    assert dw.saved_edid("HDMI-A-2").read_bytes() == real
+    other = dw.EDID_HEADER + b"" + bytes(119)
+    assert dw.keep_edid(_connector(tmp_path, edid=other), "HDMI-A-2")  # a new TV on the port
+
+
+def test_the_kept_copy_goes_to_the_ports_debugfs_file():
+    assert dw._override_file(Path("/sys/class/drm/card1-HDMI-A-2")) == Path("/sys/kernel/debug/dri/1/HDMI-A-2/edid_override")
+
+
+def test_a_tv_that_answers_has_its_edid_kept_every_30s(monkeypatch):
+    fleet = _Fleet(monkeypatch, _output(_tv()), edid=True)
+    w = dw.Watcher("wlr-randr", "90", "auto")
+    for t in range(0, 61):
+        w.tick(float(t))
+    assert fleet.kept == ["HDMI-A-2"] * 3  # t=0, 30, 60
+
+
+def test_a_silent_tv_gets_its_kept_edid_after_a_minute_once(monkeypatch):
+    fleet = _Fleet(monkeypatch, _output(FALLBACK), saved=True)
+    w = dw.Watcher("wlr-randr", "90", "auto")
+    for t in range(0, 60):
+        w.tick(float(t))
+    assert fleet.loads == [] and len(fleet.reprobes) == 2  # asks the TV first
+    fleet.behind = True
+    w.tick(60.0)
+    assert fleet.loads == ["HDMI-A-2"]
+    w.tick(61.0)  # the kernel has an EDID again: the usual recovery
+    assert len(fleet.replugs) == 1
+    fleet.output, fleet.behind = _output(_tv()), False
+    for t in range(62, 300):
+        w.tick(float(t))
+    assert fleet.loads == ["HDMI-A-2"] and fleet.clears == []
+    assert fleet.kept == []  # the loaded copy is never kept as the TV's
+
+
+def test_without_a_kept_copy_it_only_keeps_asking(monkeypatch):
+    fleet = _Fleet(monkeypatch, _output(FALLBACK))
+    w = dw.Watcher("wlr-randr", "90", "auto")
+    for t in range(0, 120):
+        w.tick(float(t))
+    assert fleet.loads == [] and len(fleet.reprobes) == 4
+
+
+def test_a_disconnect_drops_the_kept_copy_and_asks_the_tv_first(monkeypatch):
+    fleet = _Fleet(monkeypatch, _output(FALLBACK), saved=True)
+    w = dw.Watcher("wlr-randr", "90", "auto")
+    for t in range(0, 61):
+        w.tick(float(t))
+    fleet.output = _output(_tv())
+    w.tick(61.0)
+    # The TV sleeps: wlroots drops the output, the kernel says disconnected.
+    fleet.output, fleet.connected = None, False
+    w.tick(62.0)
+    w.tick(63.0)
+    assert len(fleet.clears) == 1
+    # It wakes up silent again: a minute of asking it before the copy.
+    fleet.output, fleet.connected, fleet.edid = _output(FALLBACK), True, False
+    for t in range(64, 124):
+        w.tick(float(t))
+    assert fleet.loads == ["HDMI-A-2"]
+    w.tick(124.0)
+    assert fleet.loads == ["HDMI-A-2"] * 2
+
+
+def test_a_moment_off_the_list_while_still_connected_keeps_the_copy(monkeypatch):
+    """The replug drops the output from wlroots for a moment; the kernel still
+    says connected, so the copy stays."""
+    fleet = _Fleet(monkeypatch, _output(FALLBACK), saved=True)
+    w = dw.Watcher("wlr-randr", "90", "auto")
+    for t in range(0, 61):
+        w.tick(float(t))
+    fleet.output = None
+    w.tick(61.0)
+    assert fleet.clears == []

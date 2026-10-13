@@ -366,7 +366,10 @@ What it sends (field-tested 2026-09-22):
   per frame, remembered in the state file) - a TV that drops off the bus
   in standby, ignores standby, or has no CEC is never cycled. At most
   once an hour and twice per episode; a readable EDID starts a new one.
-  `PIFRAME_CEC_RESCUE=0` turns it off.
+  `PIFRAME_CEC_RESCUE=0` turns it off. It can't act when the EDID never
+  arrived, since the Pi's CEC address comes from the EDID (office-back,
+  2026-10-13: "no TV connected"); `display_watch.py`'s kept EDID covers
+  that case.
 
 Per TV, once: enable HDMI-CEC (Samsung: **Anynet+**) and, on Samsung
 Frames, set **Power Button Option = On/Off** so standby turns the TV
@@ -440,6 +443,16 @@ reconnect) and switches to the TV's mode. A TV that identifies itself
 normally - a Frame or any other make - is never touched beyond the
 rotation: the resolution only changes while recovering or together with
 a rotation re-apply, and a replug happens at most once per recovery.
+Some TVs stay silent until they power-cycle (office-back's Samsung), and
+the Pi's CEC address comes from the EDID too, so CEC can't cycle them.
+So while a TV answers, the watcher keeps a copy of its EDID
+(`~/.local/state/piframe/edid-<port>.bin`, rewritten only when it
+changes); once a TV has stayed silent for a minute, it hands that copy to
+the kernel (debugfs `edid_override`) and recovers as if the TV had
+answered - the TV's modes, sound and CEC address come back with it. The
+copy stays loaded until the port disconnects (the TV asleep, unplugged or
+swapped) or a reboot; the next connection asks the TV first again. A
+frame whose TV has never answered has no copy and only keeps asking.
 `PIFRAME_DISPLAY_RECOVERY=0` in the service's `Environment=` turns the
 EDID recovery off and leaves just the rotation watch.
 Its log lines (`[display_watch] ...`) land in `/tmp/piframe_browser.log`.

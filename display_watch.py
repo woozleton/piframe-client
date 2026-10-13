@@ -17,6 +17,15 @@ every output:
   every EDID_RETRY_S); once it has it, the watcher replugs the port in
   software if the compositor's mode list is behind the kernel's (wlroots
   rebuilds it only on a reconnect), then switches to the TV's mode.
+- The TV's own EDID, kept. Some TVs stay silent until they power-cycle
+  (office-back's Samsung, about weekly), and the Pi's CEC address comes
+  from the EDID too, so CEC can't cycle them either. While a TV answers,
+  the watcher keeps a copy of its EDID (STATE_DIR); when it has stayed
+  silent for SAVED_EDID_AFTER_S, the watcher hands that copy to the kernel
+  (debugfs edid_override) and the recovery above carries on as if the TV
+  had answered. The copy stays loaded until the port disconnects (the TV
+  asleep, unplugged or swapped) or a reboot; the next connection asks the
+  TV first again.
 
 A TV that identifies itself normally is never touched beyond the rotation:
 the resolution is only changed while recovering from the fallback or
@@ -41,7 +50,11 @@ EDID_RETRY_S = 30.0
 # A fix that didn't take (wlr-randr failed, the TV refused the mode) is
 # retried after this long instead of every second.
 APPLY_RETRY_S = 5.0
+SAVED_EDID_AFTER_S = 60.0
 DRM = Path("/sys/class/drm")
+DEBUGFS_DRI = Path("/sys/kernel/debug/dri")
+STATE_DIR = Path.home() / ".local" / "state" / "piframe"
+EDID_HEADER = b"\x00\xff\xff\xff\xff\xff\xff\x00"
 
 
 def log(event: str, **fields) -> None:
@@ -136,17 +149,68 @@ def connector_for(name: str) -> Path | None:
     return hits[0] if hits else None
 
 
-def _write_status(connector: Path, value: str) -> bool:
-    """The connector's status file takes 'detect' / 'off' (root only; the
-    kiosk user has passwordless sudo)."""
+def _sudo_write(path: Path, data: bytes) -> bool:
+    """Root-only kernel files (the kiosk user has passwordless sudo)."""
     try:
-        result = subprocess.run(
-            ["sudo", "-n", "tee", str(connector / "status")],
-            input=value.encode(), capture_output=True, timeout=10,
-        )
+        result = subprocess.run(["sudo", "-n", "tee", str(path)], input=data, capture_output=True, timeout=10)
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _write_status(connector: Path, value: str) -> bool:
+    """The connector's status file takes 'detect' / 'off'."""
+    return _sudo_write(connector / "status", value.encode())
+
+
+def port_connected(connector: Path) -> bool:
+    try:
+        return (connector / "status").read_text().strip() == "connected"
+    except OSError:
+        return False
+
+
+def saved_edid(name: str) -> Path:
+    return STATE_DIR / f"edid-{name}.bin"
+
+
+def keep_edid(connector: Path, name: str) -> bool:
+    """Keep a copy of the EDID the TV gave, for the day it wakes up silent.
+    Written only when it changed (a new TV on the port)."""
+    try:
+        edid = (connector / "edid").read_bytes()
+        path = saved_edid(name)
+        if not edid.startswith(EDID_HEADER) or len(edid) % 128 or (path.exists() and path.read_bytes() == edid):
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(edid)
+        tmp.replace(path)
+        return True
+    except OSError:
+        return False
+
+
+def _override_file(connector: Path) -> Path:
+    """card1-HDMI-A-2 -> /sys/kernel/debug/dri/1/HDMI-A-2/edid_override."""
+    card, _, port = connector.name.partition("-")
+    return DEBUGFS_DRI / card.removeprefix("card") / port / "edid_override"
+
+
+def load_saved_edid(connector: Path, name: str) -> bool:
+    """Hand the kernel the TV's kept EDID and have it read the port again:
+    it then offers the TV's modes, and the CEC address, as if the TV had
+    answered."""
+    try:
+        edid = saved_edid(name).read_bytes()
+    except OSError:
+        return False
+    return _sudo_write(_override_file(connector), edid) and reprobe(connector)
+
+
+def clear_saved_edid(connector: Path) -> bool:
+    """Back to asking the TV."""
+    return _sudo_write(_override_file(connector), b"reset")
 
 
 def reprobe(connector: Path) -> bool:
@@ -194,6 +258,11 @@ class Watcher:
         self.no_edid: set[str] = set()
         self.recovering: set[str] = set()
         self.seen: set[str] = set()
+        self.missing_since: dict[str, float] = {}
+        self.next_keep: dict[str, float] = {}
+        # Ports the kept EDID was tried on this connection (loaded or not:
+        # once per connection, never every second).
+        self.saved_tried: set[str] = set()
 
     def _recover_step(self, name: str, output: dict, now: float) -> bool:
         """EDID recovery for one output. True = the port is being replugged,
@@ -207,11 +276,21 @@ class Watcher:
             if name not in self.no_edid:
                 self.no_edid.add(name)
                 self.recovering.add(name)
+                self.missing_since[name] = now
                 log("edid_missing", output=name, note="TV identification unreadable - retrying")
+            if name not in self.saved_tried and now - self.missing_since[name] >= SAVED_EDID_AFTER_S \
+                    and saved_edid(name).exists():
+                self.saved_tried.add(name)
+                log("edid_kept_copy", output=name, ok=load_saved_edid(connector, name))
+                return False
             if now >= self.next_reprobe.get(name, 0.0):
                 self.next_reprobe[name] = now + EDID_RETRY_S
                 reprobe(connector)
             return False
+        if name not in self.saved_tried and now >= self.next_keep.get(name, 0.0):
+            self.next_keep[name] = now + EDID_RETRY_S
+            if keep_edid(connector, name):
+                log("edid_kept", output=name)
         if name in self.no_edid or first_sight:
             came_back = name in self.no_edid
             self.no_edid.discard(name)
@@ -225,11 +304,24 @@ class Watcher:
                 log("edid_back", output=name)
         return False
 
+    def _drop_kept_copies(self, listed: set[str]) -> None:
+        """A port the kept EDID went into that has since disconnected (the
+        TV asleep, unplugged or swapped) asks the TV first next time."""
+        for name in sorted(self.saved_tried - listed):
+            connector = connector_for(name)
+            if connector is not None and port_connected(connector):
+                continue
+            self.saved_tried.discard(name)
+            if connector is not None:
+                log("edid_kept_copy_cleared", output=name, ok=clear_saved_edid(connector))
+
     def tick(self, now: float) -> None:
+        listed: set[str] = set()
         for output in read_outputs(self.wlr_randr):
             name = output.get("name") or ""
             if not name or not output.get("enabled", True):
                 continue
+            listed.add(name)
             if self.recover and self._recover_step(name, output, now):
                 continue
             recovering = name in self.recovering and name not in self.no_edid
@@ -241,6 +333,8 @@ class Watcher:
             if now >= self.next_apply.get(name, 0.0):
                 self.next_apply[name] = now + APPLY_RETRY_S
                 log("apply", output=name, args=" ".join(args), ok=apply(self.wlr_randr, name, args))
+        if self.recover:
+            self._drop_kept_copies(listed)
 
 
 def main() -> None:
