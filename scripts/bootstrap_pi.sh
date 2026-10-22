@@ -803,9 +803,10 @@ EOF
 # ----------------------------------------------------------------
 # Network self-heal, no reboots. Wi-Fi profiles retry forever instead of
 # NetworkManager's default 4 attempts, and piframe-netwatch (every
-# minute) alternates a Wi-Fi radio restart and a brcmfmac driver reload
-# while the default gateway stays unreachable for 5+ minutes. On
-# 2026-09-23 four frames never rejoined after an access point came back.
+# minute) alternates a Wi-Fi radio restart and a brcmfmac driver reload,
+# each followed by `nmcli connection up`, every 10 minutes while the
+# default gateway stays unreachable. On 2026-09-23 four frames never
+# rejoined after an access point came back.
 # Log: /var/lib/piframe-netwatch/log. See scripts/piframe_netwatch.sh.
 # ----------------------------------------------------------------
 nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="802-11-wireless"{print $1}' | \

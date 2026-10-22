@@ -986,11 +986,18 @@ after 4 attempts), and `piframe-netwatch.timer` runs
 `/usr/local/sbin/piframe-netwatch` every minute. "Online" means the
 default gateway answers a ping. After 5 minutes offline it alternates
 two fixes - a Wi-Fi radio off/on, then a `brcmfmac` driver reload with
-`wpa_supplicant` + NetworkManager restarted - waiting 5, 5, 10, 20, then
-30 minutes between attempts. It never reboots; the kiosk keeps running.
-Every action and recovery goes to `/var/lib/piframe-netwatch/log`
-(persistent, last 500 lines), so the next outage shows which step
-brought a frame back.
+`wpa_supplicant` + NetworkManager restarted - one every 10 minutes, and
+each ends with `nmcli connection up` for the frame's Wi-Fi profile. That
+last step matters: after failed WPA3 handshakes NetworkManager holds the
+profile back (it takes them for a wrong password), and a radio off/on
+alone doesn't change that; an explicit "up" does. It never reboots; the
+kiosk keeps running. Every action and recovery goes to
+`/var/lib/piframe-netwatch/log` (persistent, last 500 lines), so the
+next outage shows which step brought a frame back.
+
+The watchdog is installed by bootstrap (`/usr/local/sbin/piframe-netwatch`),
+not run from the checkout, so a change to it reaches a frame when
+bootstrap is re-run there, not on a self-update.
 
 ## Cloning a frame (SD image)
 
