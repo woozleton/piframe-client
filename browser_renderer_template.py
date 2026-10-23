@@ -2383,12 +2383,14 @@ def render_browser_html(
        Two sprite kinds: `circle` (size + color, drawn with a background
        color and a 50% radius) and `image` (w/h + a file:// src, painted
        as a background-image scaled to the box). An image may also carry
-       `anim` {{frames, fps}}: the src is then a HORIZONTAL strip of
-       equal-width frames, painted by stretching the background to
-       frames * boxW and stepping background-position-x one box per frame
-       index (floor(t_e * fps) mod frames). Every entity stays a single
-       div either way - background-image keeps the compositor path and
-       needs no load-event plumbing.
+       `anim` {{frames, fps, cols?, seq?}}: the src is then a SHEET of
+       equal cells, `cols` to a row (one row without cols), painted by
+       stretching the background to cols * boxW by rows * boxH and moving
+       background-position one cell at a time: the cell at tick
+       floor(t_e * fps) is seq[tick mod seq.length], or tick mod frames
+       without a seq. Every entity stays a single div either way -
+       background-image keeps the compositor path and needs no load-event
+       plumbing.
 
        Pooling: one div per entity, created lazily into #spriteLayer, at
        most SPRITE_MAX_ENTITIES of them, claimed BY ENTITY ID and released
@@ -2436,7 +2438,16 @@ def render_browser_html(
       const frames = Math.floor(spriteNum(anim.frames));
       const fps = spriteNum(anim.fps);
       if (!(frames >= 2) || !(fps > 0)) return null;
-      return {{ frames: frames, fps: fps }};
+      // A sheet's cells to a row (all in one row without) and its play
+      // order; junk degrades to one row played straight through.
+      let cols = Math.floor(spriteNum(anim.cols));
+      if (!(cols >= 1 && cols <= frames)) cols = frames;
+      let seq = null;
+      if (Array.isArray(anim.seq) && anim.seq.length >= 2 &&
+          anim.seq.every(function (i) {{ return Number.isInteger(i) && i >= 0 && i < frames; }})) {{
+        seq = anim.seq;
+      }}
+      return {{ frames: frames, fps: fps, cols: cols, seq: seq }};
     }}
 
     function spriteEntityValid(ent) {{
@@ -2673,7 +2684,7 @@ def render_browser_html(
       // frame count changed repaints once.
       const boxKey =
         boxW.toFixed(1) + "x" + boxH.toFixed(1) + "|" + box.kind + "|" +
-        (isImage ? box.src : box.color) + (anim ? "|a" + anim.frames : "");
+        (isImage ? box.src : box.color) + (anim ? "|a" + anim.frames + "c" + anim.cols : "");
       if (boxKey !== slot.boxKey) {{
         slot.boxKey = boxKey;
         slot.el.style.width = boxW.toFixed(1) + "px";
@@ -2682,34 +2693,40 @@ def render_browser_html(
           // JSON.stringify quotes + escapes the url for the CSS string.
           slot.el.style.backgroundImage = "url(" + JSON.stringify(box.src) + ")";
           if (anim) {{
-            // The strip is stretched so ONE frame fills the box exactly;
-            // background-position-x then slides the strip frame by frame.
+            // The sheet is stretched so ONE cell fills the box exactly;
+            // background-position then moves it a cell at a time.
             slot.el.style.backgroundSize =
-              (anim.frames * boxW).toFixed(1) + "px " + boxH.toFixed(1) + "px";
-            // boxW just changed, so the offset must be rewritten below
-            // even if the frame index itself did not move.
+              (anim.cols * boxW).toFixed(1) + "px " +
+              (Math.ceil(anim.frames / anim.cols) * boxH).toFixed(1) + "px";
+            // The box just changed, so the offset must be rewritten below
+            // even if the cell itself did not move.
             slot.frameIndex = -1;
           }} else {{
             slot.el.style.backgroundSize = "100% 100%";
-            if (slot.isAnim) slot.el.style.backgroundPositionX = "0px";
+            if (slot.isAnim) slot.el.style.backgroundPosition = "0px 0px";
           }}
           slot.el.style.backgroundColor = "transparent";
           slot.el.style.borderRadius = "0";
         }} else {{
           slot.el.style.backgroundImage = "none";
-          if (slot.isAnim) slot.el.style.backgroundPositionX = "0px";
+          if (slot.isAnim) slot.el.style.backgroundPosition = "0px 0px";
           slot.el.style.backgroundColor = box.color;
           slot.el.style.borderRadius = "50%";
         }}
         slot.isAnim = !!anim;
       }}
       if (anim) {{
-        // Frame index off the same per-entity clock as the position, so
-        // the walk cycle is in phase across screens by construction.
-        const index = spriteMod(Math.floor(t * anim.fps), anim.frames);
+        // Cell off the same per-entity clock as the position, so the walk
+        // cycle is in phase across screens by construction.
+        const tick = Math.floor(t * anim.fps);
+        const index = anim.seq
+          ? anim.seq[spriteMod(tick, anim.seq.length)]
+          : spriteMod(tick, anim.frames);
         if (index !== slot.frameIndex) {{
           slot.frameIndex = index;
-          slot.el.style.backgroundPositionX = (-(index * boxW)).toFixed(1) + "px";
+          slot.el.style.backgroundPosition =
+            (-((index % anim.cols) * boxW)).toFixed(1) + "px " +
+            (-(Math.floor(index / anim.cols) * boxH)).toFixed(1) + "px";
         }}
       }}
       // Facing: travel mirrors the art (reverse), flip mirrors it again

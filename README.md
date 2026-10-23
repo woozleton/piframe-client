@@ -250,6 +250,19 @@ paints a media file instead, with independent world width / height:
   pre-warms the cache the moment a new src appears, normally while the
   sprite is still off-window
 
+**Animation.** An image may carry `"anim": {"frames", "fps", "cols"?,
+"seq"?}`: the url is then a SHEET of `frames` equal cells, `cols` to a row
+(all in one row without `cols`), left to right then top to bottom, and
+`w` / `h` are ONE cell's world size. The cell at tick
+`floor(t * fps)` is `seq[tick mod len(seq)]`, or `tick mod frames`
+without a `seq` (a hold is one cell repeated in `seq`). There is no most
+on `frames` (the manager keeps every sheet within what a Pi 5 draws well:
+4096 px a side and 8.4 MP, measured 2026-10-23); `fps` is 0.5 to 30. A
+present but broken `anim` drops that entity alone (`anim_frames`,
+`anim_fps`, `anim_cols`, `anim_seq`). The status reports
+`"sprite_sheets": 1`; a kiosk from before it gets the old one-row strip
+of at most 32 frames from the manager instead.
+
 Every animation frame the kiosk computes (`spriteW` / `spriteH` are the
 sprite's world dimensions - `w` / `h` for an image, `size` for both on a
 circle)

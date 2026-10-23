@@ -229,12 +229,17 @@ AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 # Matches the server cap (woozlescape core.mural.MURAL_ENTITY_MAX): the
 # wall's mpv overlay-id budget pins the fleet-wide ceiling at 16.
 SPRITE_MAX_ENTITIES = 16
-# Sprite-sheet animation bounds. `frames` is how many equal-width frames
-# the horizontal strip holds; `fps` is how fast the kiosk walks them.
+# Sprite-sheet animation bounds. `frames` is how many equal cells the sheet
+# holds (no most: the manager keeps a sheet within what a frame draws well),
+# `cols` how many to a row (all in one row without), `seq` the cell for each
+# tick when present, and `fps` how fast the kiosk ticks.
 SPRITE_ANIM_MIN_FRAMES = 2
-SPRITE_ANIM_MAX_FRAMES = 32
 SPRITE_ANIM_MIN_FPS = 0.5
 SPRITE_ANIM_MAX_FPS = 30.0
+# Reported in the status: this kiosk reads sprite SHEETS (a grid, a play
+# order, any number of frames). The manager sends a frame that doesn't say
+# so the old one-row strip instead.
+SPRITE_SHEETS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -3515,11 +3520,12 @@ class PiFrameClient:
                 "h": sprite_h,
             }
             # Optional sprite-sheet animation. The url then points at a
-            # HORIZONTAL strip of `frames` equal-width frames and w/h are
-            # the world dimensions of ONE frame. anim is optional, but a
-            # PRESENT-and-broken anim invalidates the entity: silently
-            # painting the whole strip in a one-frame box would look like
-            # a rendering bug, not a dropped creature.
+            # SHEET of `frames` equal cells, `cols` to a row (all in one
+            # row without cols), and w/h are the world dimensions of ONE
+            # cell; `seq`, when present, names the cell for each tick.
+            # anim is optional, but a PRESENT-and-broken anim invalidates
+            # the entity: silently painting the whole sheet in a one-frame
+            # box would look like a rendering bug, not a dropped creature.
             anim = sprite.get("anim")
             if anim is not None:
                 if not isinstance(anim, dict):
@@ -3530,7 +3536,6 @@ class PiFrameClient:
                     isinstance(frames, bool)
                     or not isinstance(frames, int)
                     or frames < SPRITE_ANIM_MIN_FRAMES
-                    or frames > SPRITE_ANIM_MAX_FRAMES
                 ):
                     _bad("anim_frames", id=entity_id, frames=str(frames))
                     return None
@@ -3538,7 +3543,26 @@ class PiFrameClient:
                 if fps is None or fps < SPRITE_ANIM_MIN_FPS or fps > SPRITE_ANIM_MAX_FPS:
                     _bad("anim_fps", id=entity_id, fps=str(anim.get("fps")))
                     return None
+                cols = anim.get("cols", frames)
+                if isinstance(cols, bool) or not isinstance(cols, int) or not 1 <= cols <= frames:
+                    _bad("anim_cols", id=entity_id, cols=str(cols))
+                    return None
+                seq = anim.get("seq")
+                if seq is not None and (
+                    not isinstance(seq, list)
+                    or len(seq) < 2
+                    or any(
+                        isinstance(i, bool) or not isinstance(i, int) or not 0 <= i < frames
+                        for i in seq
+                    )
+                ):
+                    _bad("anim_seq", id=entity_id)
+                    return None
                 sprite_payload["anim"] = {"frames": int(frames), "fps": fps}
+                if cols != frames:
+                    sprite_payload["anim"]["cols"] = int(cols)
+                if seq is not None:
+                    sprite_payload["anim"]["seq"] = [int(i) for i in seq]
         else:
             _bad("sprite_kind", id=entity_id, kind=str(kind))
             return None
@@ -3680,6 +3704,10 @@ class PiFrameClient:
             if box["kind"] == "image":
                 anim = box.get("anim")
                 tail = f" {anim['frames']}f@{anim['fps']:g}fps" if anim else ""
+                if anim and "cols" in anim:
+                    tail += f" {anim['cols']}cols"
+                if anim and "seq" in anim:
+                    tail += f" {len(anim['seq'])}ticks"
                 summary.append(
                     f"{entity['id']}:image {Path(box['url']).name} "
                     f"{box['w']:.0f}x{box['h']:.0f}{tail}"
@@ -3989,6 +4017,9 @@ class PiFrameClient:
                 # Static across the lifetime of this client; cheap to
                 # ship every heartbeat (small list).
                 "visualizer_presets": list(AUDIO_VISUALIZER_PRESETS),
+                # This kiosk reads sprite sheets: the manager sends it the
+                # grid and play order instead of the old one-row strip.
+                "sprite_sheets": SPRITE_SHEETS,
                 # None when no synced companion session is loaded, else
                 # the live discipline snapshot (session/err_ms/action/
                 # rate/offset_ms/rtt_ms/latency_ms) - see MpvCompanion.
