@@ -129,6 +129,9 @@ UNBOUNDED_FPS = os.environ.get("PIFRAME_UNBOUNDED_FPS", "").strip().lower() in (
 # lighter here.
 H264IFY_EXTENSION_DIR = Path(__file__).resolve().parent / "vendor" / "h264ify"
 BROWSER_STATE_FILE = Path("/tmp/piframe_browser_state.json")
+# The mural creatures, in a file of their own: the page reads the state file
+# four times a second but this one only when `sprite_seq` in it changes.
+BROWSER_SPRITE_FILE = Path("/tmp/piframe_browser_sprite.json")
 BROWSER_HTML_FILE = Path("/tmp/piframe_browser.html")
 BROWSER_PROFILE_DIR = Path("/tmp/piframe_chromium_profile")
 BROWSER_CACHE_DIR = Path("/tmp/piframe_chromium_cache")
@@ -224,11 +227,13 @@ VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 
 # Mural sprite overlay (Road B) wire limits. The kiosk keeps one pooled
-# div per entity and one rAF loop, so the cap is really a budget on
-# per-frame DOM work; the renderer enforces the same number.
-# Matches the server cap (woozlescape core.mural.MURAL_ENTITY_MAX): the
-# wall's mpv overlay-id budget pins the fleet-wide ceiling at 16.
-SPRITE_MAX_ENTITIES = 16
+# div per entity and one rAF loop, and only the creatures near its own
+# screen cost it anything to draw; the renderer enforces the same number.
+# Matches the manager's cap (woozlescape pfm/routes/mural.py _MAX_ENTITIES),
+# measured on frame-office-side (its docs/subsystems/mural.md, "How many
+# creatures"), and reported in the status as `sprite_entities`: a manager
+# sends a frame that doesn't say so at most 16.
+SPRITE_MAX_ENTITIES = 256
 # Sprite-sheet animation bounds. `frames` is how many equal cells the sheet
 # holds (no most: the manager keeps a sheet within what a frame draws well),
 # `cols` how many to a row (all in one row without), `seq` the cell for each
@@ -855,6 +860,7 @@ class BrowserController:
         self._last_mute: bool = False
         self._load_persisted_audio_state()
         self._control_token = 0
+        self._sprite_seq = 0
         self._state_lock = threading.Lock()
         self._state: Dict[str, Any] = {
             "mode": "idle",
@@ -944,6 +950,7 @@ class BrowserController:
             show_hud=BROWSER_SHOW_HUD,
             transition_duration_ms=BROWSER_TRANSITION_DURATION_MS,
             state_file_uri=BROWSER_STATE_FILE.as_uri(),
+            sprite_file_uri=BROWSER_SPRITE_FILE.as_uri(),
             nas_root=NAS_ROOT,
             poll_ms=BROWSER_STATE_POLL_MS,
             event_endpoint=f"http://{BROWSER_EVENT_HOST}:{BROWSER_EVENT_PORT}/browser-event",
@@ -1592,12 +1599,22 @@ class BrowserController:
         key list that does NOT include "sprite", so a slideshow / video /
         idle transition leaves the sprite descriptor in place - which is
         exactly what Road B wants (the creature crosses screens OVER a
-        running slideshow). Only sprite_stop clears it."""
+        running slideshow). Only sprite_stop clears it.
+
+        A cast of hundreds is a few hundred KB, so it goes in its own file
+        (BROWSER_SPRITE_FILE), written before the state file names its new
+        `sprite_seq`: the page reads the state four times a second, and this
+        only when the number changes."""
         with self._state_lock:
+            self._sprite_seq += 1
             if value is None:
-                self._state.pop("sprite", None)
+                self._state.pop("sprite_seq", None)
             else:
-                self._state["sprite"] = value
+                tmp_path = BROWSER_SPRITE_FILE.with_suffix(".tmp")
+                with tmp_path.open("w", encoding="utf-8") as handle:
+                    json.dump(value, handle)
+                tmp_path.replace(BROWSER_SPRITE_FILE)
+                self._state["sprite_seq"] = self._sprite_seq
             self._write_state()
 
 
@@ -4020,6 +4037,9 @@ class PiFrameClient:
                 # This kiosk reads sprite sheets: the manager sends it the
                 # grid and play order instead of the old one-row strip.
                 "sprite_sheets": SPRITE_SHEETS,
+                # And draws up to this many creatures (the manager sends
+                # one that doesn't say at most 16).
+                "sprite_entities": SPRITE_MAX_ENTITIES,
                 # None when no synced companion session is loaded, else
                 # the live discipline snapshot (session/err_ms/action/
                 # rate/offset_ms/rtt_ms/latency_ms) - see MpvCompanion.

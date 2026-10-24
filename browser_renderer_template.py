@@ -12,6 +12,7 @@ def render_browser_html(
     show_hud: bool,
     transition_duration_ms: int,
     state_file_uri: str,
+    sprite_file_uri: str = "",
     nas_root: str,
     poll_ms: int,
     event_endpoint: str = "",
@@ -526,6 +527,9 @@ def render_browser_html(
   {butterchurn_scripts}
   <script>
     const stateUrl = {json.dumps(state_file_uri)};
+    // The mural creatures' own file, read only when the state's sprite_seq
+    // changes (piframe_client set_sprite).
+    const spriteUrl = {json.dumps(sprite_file_uri)};
     const eventEndpoint = {json.dumps(event_endpoint)};
     const hiddenCursor = getComputedStyle(document.documentElement)
       .getPropertyValue('--hidden-cursor')
@@ -560,6 +564,9 @@ def render_browser_html(
     let currentControlToken = -1;
     let activeState = null;
     let activeIndex = 0;
+    // The creatures as last read from their file, and its number then.
+    let spriteSeq = null;
+    let spriteState = null;
     let intervalHandle = null;
     // Clock-synced slideshow (params.sync.mode === "clock"). This path
     // owns a wall-clock boundary timer that is distinct from the
@@ -2407,10 +2414,14 @@ def render_browser_html(
        swapped image url - converges with no re-render and no restart.
        ================================================================ */
     const spriteLayer = document.getElementById("spriteLayer");
-    const SPRITE_MAX_ENTITIES = 16;
+    const SPRITE_MAX_ENTITIES = 256;
     // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched }}.
     // id === null means the slot is free for the next new entity.
     const spriteSlots = [];
+    // The slots by entity id and the free ones, so an entity finds its box
+    // in one lookup however many there are.
+    const spriteSlotById = new Map();
+    const spriteFreeSlots = [];
     // Distinct image srcs already warmed, so a school of identical fish
     // costs exactly one preload.
     const spritePreloaded = Object.create(null);
@@ -2539,16 +2550,14 @@ def render_browser_html(
     }}
 
     function spriteClaimSlot(id) {{
-      for (let i = 0; i < spriteSlots.length; i++) {{
-        if (spriteSlots[i].id === id) return spriteSlots[i];
-      }}
-      for (let i = 0; i < spriteSlots.length; i++) {{
-        if (spriteSlots[i].id === null) {{
-          const reused = spriteSlots[i];
-          reused.id = id;
-          spriteResetSlot(reused);
-          return reused;
-        }}
+      const held = spriteSlotById.get(id);
+      if (held) return held;
+      const reused = spriteFreeSlots.pop();
+      if (reused) {{
+        reused.id = id;
+        spriteResetSlot(reused);
+        spriteSlotById.set(id, reused);
+        return reused;
       }}
       if (spriteSlots.length >= SPRITE_MAX_ENTITIES) return null;
       const el = document.createElement("div");
@@ -2565,6 +2574,7 @@ def render_browser_html(
         touched: false
       }};
       spriteSlots.push(slot);
+      spriteSlotById.set(id, slot);
       return slot;
     }}
 
@@ -2572,9 +2582,11 @@ def render_browser_html(
       // An entity that stopped arriving in the live state: hide its box
       // and hand the slot back. Cheap no-op once already free.
       if (slot.id === null) return;
+      spriteSlotById.delete(slot.id);
       slot.id = null;
       spriteResetSlot(slot);
       spriteSetVisible(slot, false);
+      spriteFreeSlots.push(slot);
     }}
 
     function spriteHideAll() {{
@@ -2585,6 +2597,23 @@ def render_browser_html(
 
     function spriteRunning() {{
       return spriteRafHandle !== null;
+    }}
+
+    // A route's running lengths in world units, measured once per route and
+    // world: the points array is the key, and it stays the same object until
+    // the cast is sent again (its own file, read only when it changes).
+    function spriteRouteLengths(pts, worldW, worldH) {{
+      const cache = spriteRouteLengths.cache || (spriteRouteLengths.cache = new WeakMap());
+      const hit = cache.get(pts);
+      if (hit && hit.w === worldW && hit.h === worldH) return hit.cum;
+      const cum = [0];
+      for (let j = 1; j < pts.length; j++) {{
+        cum[j] = cum[j - 1] + Math.hypot(
+          (Number(pts[j][0]) - Number(pts[j - 1][0])) * worldW,
+          (Number(pts[j][1]) - Number(pts[j - 1][1])) * worldH);
+      }}
+      cache.set(pts, {{ w: worldW, h: worldH, cum }});
+      return cum;
     }}
 
     function spriteDrawEntity(slot, sp, ent, tBase) {{
@@ -2622,12 +2651,7 @@ def render_browser_html(
         let spriteFrac = spriteMod(t / Number(motion.sweep_s), 1);
         if (motion.reverse === true) spriteFrac = 1 - spriteFrac;
         const n = pts.length;
-        const cum = [0];
-        for (let j = 1; j < n; j++) {{
-          cum[j] = cum[j - 1] + Math.hypot(
-            (Number(pts[j][0]) - Number(pts[j - 1][0])) * worldW,
-            (Number(pts[j][1]) - Number(pts[j - 1][1])) * worldH);
-        }}
+        const cum = spriteRouteLengths(pts, worldW, worldH);
         const d = spriteFrac * cum[n - 1];
         // The FIRST segment whose far end is past d owns the sprite; the
         // last one absorbs d === L (and a zero-length route, which the
@@ -2797,6 +2821,9 @@ def render_browser_html(
         spriteResetSlot(slot);
         spriteSetVisible(slot, false);
       }}
+      spriteSlotById.clear();
+      spriteFreeSlots.length = 0;
+      spriteFreeSlots.push(...spriteSlots);
       for (const src in spritePreloaded) delete spritePreloaded[src];
     }}
 
@@ -2865,6 +2892,25 @@ def render_browser_html(
       try {{
         const response = await fetch(`${{stateUrl}}?ts=${{Date.now()}}`, {{ cache: "no-store" }});
         const state = await response.json();
+        // The creatures ride in their own file, read again only when its
+        // number changes: a cast of hundreds parsed four times a second
+        // would cost the frame a hitch each time. The same object stays in
+        // place between reads, so the per-route lengths stay measured.
+        if (state.sprite_seq !== spriteSeq) {{
+          if (state.sprite_seq === undefined || state.sprite_seq === null) {{
+            spriteState = null;
+            spriteSeq = state.sprite_seq;
+          }} else {{
+            try {{
+              const spriteResponse = await fetch(`${{spriteUrl}}?ts=${{Date.now()}}`, {{ cache: "no-store" }});
+              spriteState = await spriteResponse.json();
+              spriteSeq = state.sprite_seq;
+            }} catch (error) {{
+              // The next poll reads it again; the last cast plays meanwhile.
+            }}
+          }}
+        }}
+        state.sprite = spriteState;
         const signature = JSON.stringify({{
           mode: state.mode,
           playlist_name: state.playlist_name,

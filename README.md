@@ -44,7 +44,8 @@ At startup, the client:
 1. connects to the server over WebSocket
 2. starts a single Chromium kiosk session under `cage`
 3. writes a local HTML renderer to `/tmp/piframe_browser.html`
-4. writes browser state to `/tmp/piframe_browser_state.json`
+4. writes browser state to `/tmp/piframe_browser_state.json` (and a mural's
+   creatures to `/tmp/piframe_browser_sprite.json`)
 5. updates that state whenever the server sends a playback command
 6. binds a tiny loopback HTTP server on `127.0.0.1:18888` (configurable via
    `PIFRAME_BROWSER_EVENT_PORT`) that the kiosk JS POSTs to whenever it
@@ -263,6 +264,21 @@ present but broken `anim` drops that entity alone (`anim_frames`,
 `"sprite_sheets": 1`; a kiosk from before it gets the old one-row strip
 of at most 32 frames from the manager instead.
 
+**How many.** A `sprite_show` carries up to 256 entities
+(`SPRITE_MAX_ENTITIES`); one more refuses the whole command
+(`entities_too_many`). The status reports `"sprite_entities": 256`, and a
+manager sends a kiosk from before it at most 16. Only the creatures near
+this screen cost it anything to draw: the rest have their place worked out
+each frame (a route's lengths measured once, `spriteRouteLengths`) and do
+no DOM writes, and a creature finds its pooled box by id in one lookup.
+The cast is written to a file of its own, `/tmp/piframe_browser_sprite.json`,
+before the state file names its new `sprite_seq`; the page reads the state
+four times a second but the cast only when that number changes (a cast of
+hundreds is a few hundred KB). What a frame draws smoothly was measured on
+frame-office-side on 2026-10-23 (woozlescape `docs/subsystems/mural.md`,
+"How many creatures"): about 8 big or 32 small creatures on its screen at
+once, and a whole-house mural of 256.
+
 Every animation frame the kiosk computes (`spriteW` / `spriteH` are the
 sprite's world dimensions - `w` / `h` for an image, `size` for both on a
 circle)
@@ -306,8 +322,8 @@ touches no playback state at all - `playback_state`, the current video /
 slideshow and both clock-sync descriptors are left alone, so a slideshow
 keeps flipping underneath and the manager's schedule / companion guards
 see no change. The overlay also survives content changes and re-renders:
-it lives on its own `sprite` key in the browser state file, outside the
-renderer's re-render signature. Only `sprite_stop` clears it. A
+it lives in a file of its own (the state file's `sprite_seq` names its
+version), outside the renderer's re-render signature. Only `sprite_stop` clears it. A
 malformed command is dropped (logged as `sprite_show_invalid` with a
 reason) and nothing on screen changes.
 
