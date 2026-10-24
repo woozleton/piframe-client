@@ -1042,7 +1042,10 @@ def render_browser_html(
               stalledChecks = 0;
               return;
             }}
-            if (v.currentTime > lastSampledTime + 0.05) {{
+            // Moving either way is progress: a looping video jumps back to
+            // its start without ever firing ended, so a short loop (a 12 s
+            // cartoon) read as a stall at its first wrap.
+            if (Math.abs(v.currentTime - lastSampledTime) > 0.05) {{
               lastSampledTime = v.currentTime;
               stalledChecks = 0;
               return;
