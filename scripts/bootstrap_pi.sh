@@ -802,8 +802,8 @@ EOF
 
 # ----------------------------------------------------------------
 # Wi-Fi power save off, so the radio never dozes between beacons. It is
-# its own conf.d file, not part of the Wi-Fi profile: the 2026-09-22
-# profile swap dropped the old profiles' powersave=2 on five frames.
+# its own conf.d file, not part of the Wi-Fi profile: office-side's old
+# profile had powersave=2, and the 2026-09-22 profile swap dropped it.
 # NetworkManager applies it at every connect; iw turns it off now.
 # ----------------------------------------------------------------
 cat > /etc/NetworkManager/conf.d/default-wifi-powersave-off.conf <<'EOF'

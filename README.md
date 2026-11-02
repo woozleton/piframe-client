@@ -1032,8 +1032,8 @@ Wi-Fi power save is off on every frame (since 2026-11-02), so the radio
 never dozes between beacons. Bootstrap writes
 `/etc/NetworkManager/conf.d/default-wifi-powersave-off.conf`
 (`wifi.powersave = 2`) and turns it off at once with `iw`. It lives in
-its own file rather than in the Wi-Fi profile: the 2026-09-22 profile
-swap dropped the old profiles' `powersave=2` on five frames.
+its own file rather than in the Wi-Fi profile: office-side's old profile
+had `powersave=2`, and the 2026-09-22 profile swap dropped it.
 `iw dev wlan0 get power_save` shows it.
 
 ## Cloning a frame (SD image)
