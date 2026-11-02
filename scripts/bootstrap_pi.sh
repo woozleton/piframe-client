@@ -801,6 +801,19 @@ WantedBy=multi-user.target
 EOF
 
 # ----------------------------------------------------------------
+# Wi-Fi power save off, so the radio never dozes between beacons. It is
+# its own conf.d file, not part of the Wi-Fi profile: the 2026-09-22
+# profile swap dropped the old profiles' powersave=2 on five frames.
+# NetworkManager applies it at every connect; iw turns it off now.
+# ----------------------------------------------------------------
+cat > /etc/NetworkManager/conf.d/default-wifi-powersave-off.conf <<'EOF'
+[connection]
+wifi.powersave = 2
+EOF
+nmcli general reload conf || true
+iw dev wlan0 set power_save off 2>/dev/null || true
+
+# ----------------------------------------------------------------
 # Network self-heal, no reboots. Wi-Fi profiles retry forever instead of
 # NetworkManager's default 4 attempts, and piframe-netwatch (every
 # minute) alternates a Wi-Fi radio restart and a brcmfmac driver reload,

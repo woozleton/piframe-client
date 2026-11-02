@@ -1028,6 +1028,14 @@ The watchdog is installed by bootstrap (`/usr/local/sbin/piframe-netwatch`),
 not run from the checkout, so a change to it reaches a frame when
 bootstrap is re-run there, not on a self-update.
 
+Wi-Fi power save is off on every frame (since 2026-11-02), so the radio
+never dozes between beacons. Bootstrap writes
+`/etc/NetworkManager/conf.d/default-wifi-powersave-off.conf`
+(`wifi.powersave = 2`) and turns it off at once with `iw`. It lives in
+its own file rather than in the Wi-Fi profile: the 2026-09-22 profile
+swap dropped the old profiles' `powersave=2` on five frames.
+`iw dev wlan0 get power_save` shows it.
+
 ## Cloning a frame (SD image)
 
 Every frame runs the same SD contents; per-TV differences (output
