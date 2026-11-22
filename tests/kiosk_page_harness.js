@@ -116,6 +116,11 @@ const sandbox = {
 };
 sandbox.window = sandbox;
 vm.createContext(sandbox);
+// The page's wall clock follows the fake timers, from a whole multiple of
+// every interval the tests use, so a clock-synced row's slots are known.
+const CLOCK_BASE_MS = 1700000000000;
+sandbox.__fakeNow = () => CLOCK_BASE_MS + now;
+vm.runInContext("Date.now = () => __fakeNow();", sandbox);
 
 async function flush() {
   for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));

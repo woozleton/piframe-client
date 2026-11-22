@@ -254,3 +254,106 @@ await loadImage(img("p1.jpg"), true);
 report(continueOnScreen(activeState, synced));
 """, first=slideshow(["p1.jpg", "p2.jpg"]), synced=synced))
     assert out == [False]
+
+
+# ---------------------------------------------------------------- A row of a new length
+#
+# The harness clock starts on a whole multiple of 10 s: at time t the slot
+# is floor(1.7e12 / 1e4 + t / 1e4) % length, so 170000000 + k, which is
+# k % 4 for a row of 4 and (2 + k) % 3 for a row of 3.
+
+def synced(names, *, interval=10.0) -> dict:
+    return {**slideshow(names, interval=interval), "sync": {"mode": "clock", "length": len(names)}}
+
+
+def test_a_shorter_synced_row_keeping_the_picture_paints_nothing(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(row4);
+await loadImage(img("a.jpg"), true);
+const t0 = renderToken;
+await advance(3000);
+await setState(row3);
+const swapped = {
+  renders: renderToken - t0, index: activeIndex, shown: lastPaintedSrc,
+  count: activeState.items.length, reported: last("slideshow_index").index,
+};
+await advance(6999);
+const before = renderToken - t0;
+await advance(1);
+report({swapped, before, after: renderToken - t0, index: activeIndex, next: !!img("c.jpg")});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]), row3=synced(["c.jpg", "d.jpg", "a.jpg"])))
+    assert out == [{
+        "swapped": {"renders": 0, "index": 2, "shown": "file:///media/a.jpg", "count": 3, "reported": 2},
+        "before": 0, "after": 1, "index": 0, "next": True,
+    }]
+
+
+def test_a_shorter_synced_row_with_another_picture_cross_fades_once(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(row4);
+await loadImage(img("a.jpg"), true);
+const t0 = renderToken;
+await advance(4000);
+await setState(row3);
+const swapped = {renders: renderToken - t0, index: activeIndex, d: !!img("d.jpg")};
+await loadImage(img("d.jpg"), true);
+const shown = stages[activeStageIndex].image === img("d.jpg");
+await advance(5999);
+const before = {renders: renderToken - t0, c: !!img("c.jpg")};
+await advance(2);
+report({swapped, shown, before, after: renderToken - t0, index: activeIndex, c: !!img("c.jpg")});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]), row3=synced(["c.jpg", "a.jpg", "d.jpg"])))
+    assert out == [{
+        "swapped": {"renders": 1, "index": 2, "d": True}, "shown": True,
+        "before": {"renders": 1, "c": False}, "after": 2, "index": 0, "c": True,
+    }]
+
+
+def test_a_shorter_synced_row_while_paused_waits_for_resume(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await advance(30000);
+await setState(row4);              // slot 3: d.jpg
+await loadImage(img("d.jpg"), true);
+applyControl({action: "pause", token: 1});
+const t0 = renderToken;
+await setState(row3);
+const paused = {renders: renderToken - t0, index: activeIndex, shown: lastPaintedSrc};
+await advance(10000);
+const still = renderToken - t0;
+applyControl({action: "pause", token: 2});
+await flush();
+const resumed = {renders: renderToken - t0, index: activeIndex, c: !!img("c.jpg")};
+await advance(9999);
+const before = renderToken - t0;
+await advance(1);
+report({paused, still, resumed, before, after: renderToken - t0, index: activeIndex});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]), row3=synced(["c.jpg", "a.jpg", "d.jpg"])))
+    assert out == [{
+        "paused": {"renders": 0, "index": 0, "shown": "file:///media/d.jpg"},
+        "still": 0,
+        "resumed": {"renders": 1, "index": 0, "c": True},
+        "before": 1, "after": 2, "index": 1,
+    }]
+
+
+def test_another_synced_list_of_a_new_length_starts_over_and_ends_a_pause(tmp_path):
+    """Only the same list minus gone pictures swaps in place: other content
+    of another length starts the sync afresh, as it always has."""
+    out = run_page(tmp_path, scenario("""
+await setState(row4);
+await loadImage(img("a.jpg"), true);
+applyControl({action: "pause", token: 1});
+const t0 = renderToken;
+await setState(other3);
+const other = {renders: renderToken - t0, paused: syncPaused, index: activeIndex, count: activeState.items.length};
+await loadImage(img("z.jpg"), true);
+applyControl({action: "pause", token: 2});
+const t1 = renderToken;
+await setState(grown5);
+report({other, grown: {renders: renderToken - t1, paused: syncPaused, count: activeState.items.length}});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]), other3=synced(["x.jpg", "y.jpg", "z.jpg"]),
+        grown5=synced(["x.jpg", "y.jpg", "z.jpg", "v.jpg", "w.jpg"])))
+    assert out == [{
+        "other": {"renders": 1, "paused": False, "index": 2, "count": 3},
+        "grown": {"renders": 1, "paused": False, "count": 5},
+    }]

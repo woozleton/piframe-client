@@ -127,6 +127,12 @@ wall-clock lockstep instead of free-running:
   normal cross-fade - no restart at index 0. If the push never arrives
   (server down), the client keeps indexing its old row by the clock:
   still collision-free, just repeating the same lap order
+- when a picture leaves the playlist (deleted or archived) the server
+  sends the same list without it: a shorter row, built so each screen's
+  current slot holds the picture it is showing. The client swaps that in
+  place too (`isPrunedSyncRow`: every item was in the previous row), so
+  the picture on screen stays and the next flip is on time. Any other row
+  of a new length is other content and starts the sync afresh
 - `shuffle` is always `false` in sync mode - the row order is
   authoritative and is never reordered client-side
 - `next`/`previous` show the adjacent item as a momentary "peek"; the next
