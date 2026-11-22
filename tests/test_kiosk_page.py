@@ -357,3 +357,149 @@ report({other, grown: {renders: renderToken - t1, paused: syncPaused, count: act
         "other": {"renders": 1, "paused": False, "index": 2, "count": 3},
         "grown": {"renders": 1, "paused": False, "count": 5},
     }]
+
+
+# ---------------------------------------------------------------- NAS unavailable, only when it is
+
+def nas_item(kind: str, name: str) -> dict:
+    return {"kind": kind, "src": f"file:///mnt/nas/pictures/{name}", "label": name, "is_audio": False}
+
+
+NAS_PRELUDE = """
+const nasImg = (name) => stages.map((s) => s.image).find((i) => i.src === "file:///mnt/nas/pictures/" + name);
+"""
+
+
+def nas_slideshow(names, **extra) -> dict:
+    return {**slideshow(names), "items": [nas_item("image", n) for n in names], **extra}
+
+
+def test_a_failed_nas_picture_names_the_share_only_when_it_is_not_answering(tmp_path):
+    seen = {}
+    for label, extra in (("down", {"nas_ok": False}), ("up", {"nas_ok": True}),
+                         ("unknown", {"nas_ok": None}), ("missing", {})):
+        out = run_page(tmp_path, scenario(NAS_PRELUDE + """
+await setState(s);
+await loadImage(nasImg("gone.jpg"), false);
+report(banner());
+""", s=nas_slideshow(["gone.jpg", "good.jpg"], **extra)))
+        seen[label] = out[0]
+    assert seen == {"down": "NAS unavailable", "up": "Media file missing",
+                    "unknown": "Media file missing", "missing": "Media file missing"}
+
+
+def test_the_latest_nas_ok_is_the_one_read(tmp_path):
+    out = run_page(tmp_path, scenario(NAS_PRELUDE + """
+await setState(up);
+await setState(down);   // only nas_ok differs: nothing repaints, the answer is remembered
+await loadImage(nasImg("gone.jpg"), false);
+const first = banner();
+await setState(up);
+report({first, message: itemErrorMessage(activeState.items[0])});
+""", up=nas_slideshow(["gone.jpg", "good.jpg"], nas_ok=True),
+        down=nas_slideshow(["gone.jpg", "good.jpg"], nas_ok=False)))
+    assert out == [{"first": "NAS unavailable", "message": "Media file missing"}]
+
+
+def test_a_file_outside_the_nas_folder_is_missing_whatever_the_share_says(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(s);
+await loadImage(img("gone.jpg"), false);
+report(banner());
+""", s={**slideshow(["gone.jpg", "good.jpg"]), "nas_ok": False}))
+    assert out == ["Media file missing"]
+
+
+def test_the_nas_banner_goes_when_the_next_picture_shows(tmp_path):
+    out = run_page(tmp_path, scenario(NAS_PRELUDE + """
+await setState(s);
+await loadImage(nasImg("gone.jpg"), false);
+const during = banner();
+await advance(10000);
+await loadImage(nasImg("good.jpg"), true);
+report({during, after: banner(), index: activeIndex});
+""", s=nas_slideshow(["gone.jpg", "good.jpg", "good2.jpg"], nas_ok=False)))
+    assert out == [{"during": "NAS unavailable", "after": "", "index": 1}]
+
+
+def test_a_nas_ok_change_leaves_a_synced_slideshow_alone(tmp_path):
+    row = synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"])
+    out = run_page(tmp_path, scenario("""
+await setState(row);
+const a = img("a.jpg");
+await loadImage(a, true);
+await advance(3000);
+const t0 = renderToken, idx = activeIndex, sets = a.srcSets;
+for (const ok of [false, true, null, false]) {
+  await setState({...row, nas_ok: ok});
+}
+const kept = {renders: renderToken - t0, index: activeIndex - idx, srcSets: a.srcSets - sets,
+              shown: lastPaintedSrc, active: stages[activeStageIndex].image === a};
+await advance(6999);
+const before = renderToken - t0;
+await advance(1);
+report({kept, before, after: renderToken - t0, index: activeIndex});
+""", row=row))
+    assert out == [{
+        "kept": {"renders": 0, "index": 0, "srcSets": 0, "shown": "file:///media/a.jpg", "active": True},
+        "before": 0, "after": 1, "index": 1,
+    }]
+
+
+def test_a_nas_ok_change_leaves_a_playing_video_alone(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(v);
+const a = vid("a.mp4");
+await loadVideo(a);
+a.currentTime = 42;
+const t0 = renderToken, sets = a.srcSets, loads = a.loadCalls;
+await setState({...v, nas_ok: false});
+await setState({...v, nas_ok: true});
+report({same: vid("a.mp4") === a, active: stages[activeStageIndex].video === a, renders: renderToken - t0,
+        srcSets: a.srcSets - sets, loads: a.loadCalls - loads, time: a.currentTime, paused: a.paused,
+        index: activeIndex});
+""", v=videos(["a.mp4", "b.mp4"])))
+    assert out == [{"same": True, "active": True, "renders": 0, "srcSets": 0, "loads": 0,
+                    "time": 42, "paused": False, "index": 0}]
+
+
+def test_a_nas_ok_change_leaves_a_mural_video_alone(tmp_path):
+    mural = {**videos(["m.mp4"]), "sync": {"mode": "clock_video", "epoch": 1699999990, "duration": 30,
+                                           "latency_ms": 0}}
+    out = run_page(tmp_path, scenario("""
+await setState(mural);
+const m = vid("m.mp4");
+await loadVideo(m);
+const t0 = renderToken, sets = m.srcSets, handle = videoSyncHandle;
+await setState({...mural, nas_ok: false});
+report({same: vid("m.mp4") === m, renders: renderToken - t0, srcSets: m.srcSets - sets,
+        handle: videoSyncHandle === handle && handle !== null});
+""", mural=mural))
+    assert out == [{"same": True, "renders": 0, "srcSets": 0, "handle": True}]
+
+
+def test_a_missing_banner_is_renamed_when_the_share_stops_answering(tmp_path):
+    """A file can fail a few seconds before the watch notices the share is
+    down: the banner then says what it was, and nothing repaints."""
+    out = run_page(tmp_path, scenario(NAS_PRELUDE + """
+await setState(up);
+await loadImage(nasImg("gone.jpg"), false);
+const first = banner();
+const t0 = renderToken;
+await setState(down);
+report({first, after: banner(), renders: renderToken - t0});
+""", up=nas_slideshow(["gone.jpg", "good.jpg"], nas_ok=True),
+        down=nas_slideshow(["gone.jpg", "good.jpg"], nas_ok=False)))
+    assert out == [{"first": "Media file missing", "after": "NAS unavailable", "renders": 0}]
+
+
+def test_a_local_files_missing_banner_keeps_its_name_when_the_share_goes(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(up);
+await loadImage(img("gone.jpg"), false);
+const first = banner();
+await setState(down);
+report({first, after: banner()});
+""", up={**slideshow(["gone.jpg", "good.jpg"]), "nas_ok": True},
+        down={**slideshow(["gone.jpg", "good.jpg"]), "nas_ok": False}))
+    assert out == [{"first": "Media file missing", "after": "Media file missing"}]

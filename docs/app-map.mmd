@@ -28,6 +28,7 @@ flowchart LR
   piframe_client -->|"IPC"| frame_music
   wayvnc -->|"Wayland"| kiosk
   piframe_client -.->|"Git pull"| github
+  piframe_client -->|"SMB"| nas_media
   kiosk -->|"SMB"| nas_media
   frame_music -->|"SMB"| nas_media
   piframe_cec -->|"HDMI-CEC"| tv

@@ -633,6 +633,31 @@ What we observed in testing:
 
 If you need to keep 4K masters in the library, the recommended approach is to generate playback-optimized derivatives for the Pi clients.
 
+What the kiosk's Chromium plays (measured on a frame on 2026-10-25): H.264
+and AV1 smoothly at 1080p, 4K only in AV1 (and choppy), VP8 / VP9 in
+Chromium's own software decoders; no HEVC at all (no decoder in this build:
+the screen just sits still), nor MPEG-4, MPEG-2, WMV or ProRes. It opens
+MP4 / M4V / MOV / MKV / WebM files, not AVI / WMV / FLV. (Asked directly on
+2026-11-22, the kiosk's Chromium 153 answers `canPlayType` the same way:
+yes to H.264, VP8, VP9 and AV1, no to HEVC, MPEG-4, AVI, WMV and FLV.) Every status
+heartbeat says so, the same whatever is playing, so the manager stops
+sending a frame what it can't play:
+
+```json
+"video_support": {
+  "codecs": ["av1", "h264", "vp8", "vp9"],
+  "containers": ["m4v", "mkv", "mov", "mp4", "webm"],
+  "max_edge": 1920,
+  "max_edge_by_codec": {"av1": 3840}
+}
+```
+
+The facts live as constants next to `VIDEO_EXTENSIONS` in
+`piframe_client.py`. `.avi`, `.wmv` and `.flv` still count as video there
+(never in `containers`), so one that reaches a frame gets the page's
+"This video format isn't supported on this display" rather than a broken
+picture.
+
 ## Service
 
 Two units are installed by `bootstrap_pi.sh`:
@@ -1512,6 +1537,22 @@ Behavior:
 
 - the banner overlays current content
 - it clears automatically when valid content resumes: an item's banner (`Media file missing`, `NAS unavailable`, `Website unavailable`, `Content unavailable`) goes as soon as the next picture or video loads and shows; a list where every file is missing keeps it up steadily (it never flashes off between failures); `Server disconnected` is untouched by loads
+- `NAS unavailable` means the share itself isn't answering, never just one
+  gone file (that's `Media file missing`). The client's NAS watch reads the
+  share's folder every 15 s or so in a thread of its own (a mount check plus
+  its first entry: a dropped Wi-Fi leaves the CIFS share mounted with reads
+  that hang, so a read not back within 3 s counts as not answering, and no
+  second read starts while one hangs). It runs from the status loop while
+  connected and from the reconnect loop while not. Each change of answer
+  goes into the page's state as `nas_ok` (`true` / `false`, `null` before
+  the first answer); the page only remembers it - it is not in the render
+  signature, so it never repaints or restarts anything - and a file under
+  the NAS folder that fails to load says `NAS unavailable` only while the
+  latest `nas_ok` is `false`. A file can fail a few seconds before the
+  watch notices: a `Media file missing` banner on a NAS file is renamed
+  when `nas_ok` then turns `false` (`relabelMissingAsNas`). The
+  dispatch-time check (a mount check when content arrives) still raises
+  `NAS unavailable` itself.
 - `Server disconnected` does NOT stop playback: the frame keeps its
   current playlist (slides come from the NAS mount, clock-slot sync
   keys off wall-clock time) and the banner clears on reconnect. The

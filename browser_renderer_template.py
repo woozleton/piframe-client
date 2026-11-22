@@ -594,6 +594,10 @@ def render_browser_html(
     // token no longer matches when the older decode settles, so the
     // stale activation is dropped instead of clobbering the new one.
     let renderToken = 0;
+    // The latest state's nas_ok: true / false from the client's NAS watch,
+    // null until known. Read by itemErrorMessage only; kept out of the
+    // render signature, so a change repaints nothing.
+    let latestNasOk = null;
     let osdTimer = null;
     let lastVolume = null;
     let lastMuted = null;
@@ -670,7 +674,9 @@ def render_browser_html(
         return "Content unavailable";
       }}
       if (item.src.startsWith("file://")) {{
-        if (item.src.includes("{nas_root}/")) {{
+        // The share itself only when the client's NAS watch says it isn't
+        // answering; otherwise this one file is gone.
+        if (item.src.includes("{nas_root}/") && latestNasOk === false) {{
           return "NAS unavailable";
         }}
         return "Media file missing";
@@ -679,6 +685,19 @@ def render_browser_html(
         return "Website unavailable";
       }}
       return "Content unavailable";
+    }}
+
+    // A NAS file's "Media file missing" went up before the client's NAS
+    // watch noticed the share had stopped answering (a file can fail a few
+    // seconds ahead of the watch): say what it was.
+    function relabelMissingAsNas() {{
+      if (!bannerEl.classList.contains("visible") || bannerEl.textContent !== "Media file missing") {{
+        return;
+      }}
+      const item = activeState && activeState.items ? activeState.items[activeIndex] : null;
+      if (item && item.src && item.src.startsWith("file://") && item.src.includes("{nas_root}/")) {{
+        showBanner("NAS unavailable", "error");
+      }}
     }}
 
     function describeVideoError(video, item) {{
@@ -3024,6 +3043,13 @@ def render_browser_html(
       try {{
         const response = await fetch(`${{stateUrl}}?ts=${{Date.now()}}`, {{ cache: "no-store" }});
         const state = await response.json();
+        // Remembered on every poll, before anything below can paint and
+        // raise a banner; deliberately NOT in the signature.
+        const nasWasOk = latestNasOk;
+        latestNasOk = typeof state.nas_ok === "boolean" ? state.nas_ok : null;
+        if (latestNasOk === false && nasWasOk !== false) {{
+          relabelMissingAsNas();
+        }}
         // The creatures ride in their own file, read again only when its
         // number changes: a cast of hundreds parsed four times a second
         // would cost the frame a hitch each time. The same object stays in

@@ -223,7 +223,25 @@ IMAGE_EXTENSIONS = {
     ".heic",
     ".avif",
 }
-VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+# What the kiosk's Chromium on a Pi 5 plays, measured on a frame on
+# 2026-10-25 and written up in the manager's docs. H.264 and AV1 play
+# smoothly at 1080p; 4K plays only in AV1 (and choppy). HEVC does not play
+# at all (this Chromium build has no HEVC decoder: the screen just sits
+# still). VP8 / VP9 are Chromium's own software decoders. Anything else
+# (MPEG-4, MPEG-2, WMV, ProRes) it cannot decode. It opens MP4 / M4V / MOV /
+# MKV / WebM files and not AVI / WMV / FLV. Reported in every status as
+# `video_support` (see _video_support), so the manager stops sending this
+# screen what it can't play.
+VIDEO_PLAYABLE_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
+VIDEO_CODECS = ("av1", "h264", "vp8", "vp9")  # ffprobe codec names
+VIDEO_MAX_EDGE = 1920  # longest edge it plays, any codec
+VIDEO_MAX_EDGE_BY_CODEC = {"av1": 3840}  # codecs it plays past that
+# Video files the library accepts that this Chromium can't open. Still
+# video to the frame, so the page tries its <video> and says the format
+# isn't supported instead of showing a broken picture, but never reported
+# as playable.
+VIDEO_UNPLAYABLE_EXTENSIONS = {".avi", ".wmv", ".flv"}
+VIDEO_EXTENSIONS = VIDEO_PLAYABLE_EXTENSIONS | VIDEO_UNPLAYABLE_EXTENSIONS
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".wav", ".flac", ".aac", ".ogg", ".opus"}
 
 # Mural sprite overlay (Road B) wire limits. The kiosk keeps one pooled
@@ -269,6 +287,17 @@ def _normalize_media_url(url: Optional[str]) -> Optional[str]:
             remaining = "/".join(parts[start_idx:])
             return f"{NAS_ROOT}/{remaining}" if remaining else NAS_ROOT
     return value
+
+
+def _video_support() -> Dict[str, Any]:
+    """The status's `video_support`: what videos this screen plays (see
+    VIDEO_PLAYABLE_EXTENSIONS). Always the same, whatever is playing."""
+    return {
+        "codecs": sorted(VIDEO_CODECS),
+        "containers": sorted(ext.lstrip(".") for ext in VIDEO_PLAYABLE_EXTENSIONS),
+        "max_edge": VIDEO_MAX_EDGE,
+        "max_edge_by_codec": dict(VIDEO_MAX_EDGE_BY_CODEC),
+    }
 
 
 def _media_file_src(path_str: str) -> str:
@@ -837,6 +866,139 @@ class ClientConfig:
     group: str = "default"
 
 
+NAS_CHECK_INTERVAL = 15.0  # seconds between reads of the NAS folder
+NAS_CHECK_TIMEOUT = 3.0  # a read that hasn't answered by then: not answering
+
+
+def _read_nas_folder(root: str) -> None:
+    """One read of the NAS folder; raises when the share doesn't answer.
+
+    os.path.ismount alone is not enough: when the Wi-Fi drops, the CIFS
+    share stays mounted and a read hangs. So it takes the folder's first
+    entry too (an empty folder that reads fine is answering). The mount
+    check comes first because an unmounted /mnt/nas is a plain empty local
+    folder that would read fine (the share is a native mount unit, never an
+    automount, so the read is not what mounts it)."""
+    if not os.path.ismount(root):
+        raise OSError(f"{root} is not mounted")
+    with os.scandir(root) as entries:
+        next(entries, None)
+
+
+class NasWatch:
+    """Does the NAS folder answer? True / False, or None before the first
+    read has answered.
+
+    poll() never blocks: called from loops the program already runs, it
+    starts a timed read in a daemon thread at most every `interval`
+    seconds. A read that answers within `timeout` sets the answer; one that
+    raises, or hasn't answered by then (a hung CIFS read), makes it False.
+    Never more than one read in flight: while one hangs the answer stays
+    False and no new read starts; once it finally returns or fails, the
+    next poll starts a fresh one (a late answer only frees the slot - the
+    fresh read decides). `on_change(value)` runs when the answer changes,
+    from the read's thread or its timeout timer. `read` and `clock` are
+    injectable for the tests; `start_thread` / `start_timer` too, so a test
+    can run them by hand."""
+
+    def __init__(
+        self,
+        root: str,
+        *,
+        read=_read_nas_folder,
+        clock=time.monotonic,
+        interval: float = NAS_CHECK_INTERVAL,
+        timeout: float = NAS_CHECK_TIMEOUT,
+        on_change=None,
+        start_thread=None,
+        start_timer=None,
+    ) -> None:
+        self.root = root
+        self._read = read
+        self._clock = clock
+        self._interval = interval
+        self._timeout = timeout
+        self._on_change = on_change
+        self._start_thread = start_thread or self._daemon_thread
+        self._start_timer = start_timer or self._daemon_timer
+        self._lock = threading.Lock()
+        self._ok: Optional[bool] = None
+        self._read_id = 0  # the read in flight, or the last one
+        self._in_flight = False
+        self._last_start: Optional[float] = None
+
+    @property
+    def ok(self) -> Optional[bool]:
+        with self._lock:
+            return self._ok
+
+    @staticmethod
+    def _daemon_thread(target) -> None:
+        threading.Thread(target=target, daemon=True, name="nas-watch").start()
+
+    @staticmethod
+    def _daemon_timer(seconds: float, target) -> None:
+        timer = threading.Timer(seconds, target)
+        timer.daemon = True
+        timer.start()
+
+    def poll(self) -> Optional[bool]:
+        """Start a read if one is due and none is in flight; the answer."""
+        with self._lock:
+            now = self._clock()
+            if self._in_flight:
+                # The timer normally gets here first; this is the backstop.
+                if now - self._last_start >= self._timeout:
+                    self._set_locked(False)
+                return self._ok
+            if self._last_start is not None and now - self._last_start < self._interval:
+                return self._ok
+            self._read_id += 1
+            read_id = self._read_id
+            self._in_flight = True
+            self._last_start = now
+        try:
+            self._start_thread(self._run)
+        except Exception as exc:  # no thread: the next due poll tries again
+            _log("nas_watch_start_failed", error=str(exc))
+            with self._lock:
+                self._in_flight = False
+            return self.ok
+        try:
+            self._start_timer(self._timeout, lambda: self._expire(read_id))
+        except Exception as exc:  # poll() still times the read out
+            _log("nas_watch_timer_failed", error=str(exc))
+        return self.ok
+
+    def _run(self) -> None:
+        try:
+            self._read(self.root)
+            answered = True
+        except Exception:
+            answered = False
+        with self._lock:
+            # Only ever the read in flight: no other starts until this frees it.
+            self._in_flight = False
+            if self._clock() - self._last_start < self._timeout:
+                self._set_locked(answered)
+
+    def _expire(self, read_id: int) -> None:
+        with self._lock:
+            if self._in_flight and read_id == self._read_id:
+                self._set_locked(False)
+
+    def _set_locked(self, value: bool) -> None:
+        if value == self._ok:
+            return
+        self._ok = value
+        _log("nas_watch", root=self.root, answering=value)
+        if self._on_change is not None:
+            try:
+                self._on_change(value)
+            except Exception as exc:
+                _log("nas_watch_notify_failed", error=str(exc))
+
+
 class BrowserController:
     """
     Drives a single Chromium kiosk session under cage and updates a local JSON
@@ -878,6 +1040,10 @@ class BrowserController:
             "muted": self._last_mute,
             "idle_item": None,
             "banner": None,
+            # Does the NAS folder answer (NasWatch)? None until known. The
+            # page only remembers it, for a failed file's message: it is
+            # not in the page's render signature and repaints nothing.
+            "nas_ok": None,
         }
         self._write_html()
         self._write_state()
@@ -1308,10 +1474,23 @@ class BrowserController:
             self._state["banner"] = self._make_banner(message, level=level) if message else None
             self._write_state()
 
+    def set_nas_ok(self, value: Optional[bool]) -> None:
+        """Tell the page whether the NAS folder answers (NasWatch's
+        on_change). Touches this one key, like set_banner; _set_items_state
+        leaves it in place, so content changes keep the latest answer."""
+        with self._state_lock:
+            if self._state.get("nas_ok") == value:
+                return
+            self._state["nas_ok"] = value
+            self._write_state()
+
     def _set_control(self, action: str) -> None:
-        self._control_token += 1
-        self._state["control"] = {"action": action, "token": self._control_token}
-        self._write_state()
+        # Under the lock like every other writer: the NAS watch writes the
+        # state from its own thread, and two writers share one .tmp file.
+        with self._state_lock:
+            self._control_token += 1
+            self._state["control"] = {"action": action, "token": self._control_token}
+            self._write_state()
 
     def _set_items_state(
         self,
@@ -2518,6 +2697,11 @@ class PiFrameClient:
         self.config = config
         self.ws_connection: Optional[websocket.WebSocketApp] = None
         self.renderer = BrowserController()
+        # Does the NAS folder answer? Polled from the status loop while
+        # connected and from the reconnect loop in run() while not (a Wi-Fi
+        # drop takes both the manager and the share away); each answer
+        # change rewrites the page's state as `nas_ok`.
+        self.nas_watch = NasWatch(NAS_ROOT, on_change=self.renderer.set_nas_ok)
         # Rolling server-clock offset estimate (time_ping/time_pong) -
         # shared by the companion discipline loop and the status
         # heartbeat. Fed by _handle_time_pong; sent by _clock_ping_loop.
@@ -2594,6 +2778,8 @@ class PiFrameClient:
                 ),
             )
         while True:
+            # Never blocks: starts a timed read when one is due (see NasWatch).
+            self.nas_watch.poll()
             try:
                 app = websocket.WebSocketApp(
                     self.config.server,
@@ -3949,6 +4135,9 @@ class PiFrameClient:
             # of waiting up to STATUS_UPDATE_INTERVAL seconds.
             BROWSER_EVENT_STATE.wakeup.wait(timeout=STATUS_UPDATE_INTERVAL)
             BROWSER_EVENT_STATE.wakeup.clear()
+            # Never blocks: starts a timed read at most every
+            # NAS_CHECK_INTERVAL seconds (see NasWatch).
+            self.nas_watch.poll()
             if not self.status_running or not self.ws_connection:
                 continue
             # Reassert kiosk Chromium's sink-input volume to 100% every
@@ -4040,6 +4229,9 @@ class PiFrameClient:
                 # And draws up to this many creatures (the manager sends
                 # one that doesn't say at most 16).
                 "sprite_entities": SPRITE_MAX_ENTITIES,
+                # What videos this screen plays: the manager doesn't send
+                # it the ones it can't (see VIDEO_PLAYABLE_EXTENSIONS).
+                "video_support": _video_support(),
                 # None when no synced companion session is loaded, else
                 # the live discipline snapshot (session/err_ms/action/
                 # rate/offset_ms/rtt_ms/latency_ms) - see MpvCompanion.
