@@ -651,6 +651,20 @@ def render_browser_html(
       bannerEl.classList.add("visible");
     }}
 
+    // The banners one item raises (the client's first-item check, or a
+    // slot's own onerror below). They speak for that item only, so the
+    // next item that loads and shows takes them down; any other banner
+    // ("Server disconnected") is left alone. A list where every file is
+    // missing never loads one, so its banner simply stays up.
+    const ITEM_BANNER_MESSAGES = new Set([
+      "Media file missing", "NAS unavailable", "Content unavailable", "Website unavailable",
+    ]);
+    function clearItemBanner() {{
+      if (bannerEl.classList.contains("visible") && ITEM_BANNER_MESSAGES.has(bannerEl.textContent)) {{
+        showBanner("");
+      }}
+    }}
+
     function itemErrorMessage(item) {{
       if (!item || !item.src) {{
         return "Content unavailable";
@@ -936,6 +950,14 @@ def render_browser_html(
       }}, perItemSeconds * 1000);
     }}
 
+    // A one-video list that repeats loops in the element itself.
+    function isSingleRepeatingVideoList(state) {{
+      return state.mode === "playlist" &&
+        !!state.repeat &&
+        Array.isArray(state.items) &&
+        state.items.length === 1;
+    }}
+
     function prepareStage(stage, item, state, perItemSeconds) {{
       if (stage.resetHandle) {{
         window.clearTimeout(stage.resetHandle);
@@ -959,11 +981,10 @@ def render_browser_html(
         }};
         stage.html.src = item.src;
       }} else if (item.kind === "video") {{
-        const isSingleRepeatingPlaylist =
-          state.mode === "playlist" &&
-          !!state.repeat &&
-          Array.isArray(state.items) &&
-          state.items.length === 1;
+        // The list this video plays in. Its handlers read it from here,
+        // not from the closure, so continueOnScreen() can hand a playing
+        // video a new list without reloading it.
+        stage.playState = state;
         const fillMode = state.video_fill_mode || "contain";
         stage.video.style.display = "block";
         // video_mute_override is set by set_companion when the
@@ -977,7 +998,7 @@ def render_browser_html(
         stage.video.dataset.desiredVolume = Math.max(0, Math.min(1, (state.volume || 0) / 100)).toString();
         stage.video.muted = userMuted || forceMute;
         stage.video.volume = forceMute ? 0 : Math.max(0, Math.min(1, (state.volume || 0) / 100));
-        stage.video.loop = state.mode === "single" ? !!state.loop : isSingleRepeatingPlaylist;
+        stage.video.loop = state.mode === "single" ? !!state.loop : isSingleRepeatingVideoList(state);
         stage.video.preload = "auto";
         const failVideo = (reason) => {{
           if (stage.errorTimer) {{
@@ -1004,8 +1025,8 @@ def render_browser_html(
             stage.errorTimer = null;
             // Looping a fundamentally unplayable single video would just
             // retry forever, so always fall back to idle in single mode.
-            if (state.mode === "single") {{
-              showIdle(state.idle_item);
+            if (stage.playState.mode === "single") {{
+              showIdle(stage.playState.idle_item);
             }} else {{
               advancePlaylist(1);
             }}
@@ -1028,6 +1049,9 @@ def render_browser_html(
           stage.video.classList.add("ready");
           if (state.mode !== "idle" && osdEl.classList.contains("error")) {{
             hideOsd();
+          }}
+          if (state.mode !== "idle") {{
+            clearItemBanner();
           }}
           // Progress watchdog — catches videos that decode their first
           // frame but then can't keep up (e.g. 4K H.264 saturating CPU
@@ -1060,11 +1084,12 @@ def render_browser_html(
           failVideo(describeVideoError(stage.video, item));
         }};
         stage.video.onended = () => {{
-          if (state.mode === "single" && !state.loop) {{
-            showIdle(state.idle_item);
+          const playState = stage.playState;
+          if (playState.mode === "single" && !playState.loop) {{
+            showIdle(playState.idle_item);
             return;
           }}
-          if (isSingleRepeatingPlaylist) {{
+          if (isSingleRepeatingVideoList(playState)) {{
             return;
           }}
           advancePlaylist(1);
@@ -1088,6 +1113,11 @@ def render_browser_html(
           stage.image.classList.add("ready");
           if (state.mode !== "idle" && osdEl.classList.contains("error")) {{
             hideOsd();
+          }}
+          // Loaded after its decode wait ran out: it is on screen now.
+          // (Loaded in time, renderItem's activate takes the banner down.)
+          if (state.mode !== "idle" && stage === getActiveStage()) {{
+            clearItemBanner();
           }}
         }};
         stage.image.onerror = () => {{
@@ -1805,6 +1835,16 @@ def render_browser_html(
             scheduleImageAdvance(perItemSeconds);
           }}
           preloadAhead();
+          // A picture that loaded is showing now: an earlier slot's
+          // missing-file banner goes. (A broken one is complete with no
+          // width, so a run of missing files keeps it up.)
+          if (
+            state.mode !== "idle" &&
+            targetStage.image.complete &&
+            targetStage.image.naturalWidth > 0
+          ) {{
+            clearItemBanner();
+          }}
         }}
         hideCursor();
       }};
@@ -1940,15 +1980,85 @@ def render_browser_html(
       notifySlideChange(activeIndex);
     }}
 
-    function startFromState(state) {{
-      // Drop the failed-src cache when the items list itself changes, so
-      // a genuinely new piece of content always gets a fresh attempt.
+    // Drop the failed-src cache when the items list itself changes, so
+    // a genuinely new piece of content always gets a fresh attempt.
+    function noteItemList(state) {{
       const newItemSrcs = (state.items || []).map(i => i && i.src).join("|");
       if (newItemSrcs !== startFromState.lastItemSrcs) {{
         failedSrcs.clear();
         failedSrcReasons.clear();
         startFromState.lastItemSrcs = newItemSrcs;
       }}
+    }}
+
+    // A new free-running list whose first item is the one on screen
+    // carries on from it instead of restarting: the video keeps playing
+    // where it is (no reload, no seek, no flash), a picture keeps its
+    // remaining time, and the list goes on from there. The manager's
+    // prune after a delete or archive sends exactly that (the list
+    // minus the gone files, rotated to start where the frame is).
+    // Anything clock-synced, a failing video, a paused or one-picture
+    // slideshow, or a different first item returns false and takes
+    // startFromState() as before.
+    function continueOnScreen(prevState, state) {{
+      if (!prevState || !Array.isArray(prevState.items) || !Array.isArray(state.items) || !state.items.length) {{
+        return false;
+      }}
+      if (prevState.sync || state.sync || prevState.mode === "idle" || state.mode === "idle") {{
+        return false;
+      }}
+      const onScreen = prevState.items[activeIndex];
+      const first = state.items[0];
+      if (!onScreen || !first || !first.src || onScreen.src !== first.src || onScreen.kind !== first.kind) {{
+        return false;
+      }}
+      if (lastPaintedSrc !== first.src) {{
+        return false;
+      }}
+      const stage = getActiveStage();
+      if (first.kind === "video") {{
+        if (stage.video.style.display !== "block" || stage.errorTimer || !stage.playState) {{
+          return false;
+        }}
+      }} else if (first.kind === "image") {{
+        // Only a running timer has remaining time to keep.
+        if (!intervalHandle || Number(prevState.interval) !== Number(state.interval)) {{
+          return false;
+        }}
+      }} else {{
+        return false;
+      }}
+      noteItemList(state);
+      activeState = state;
+      activeIndex = 0;
+      showBanner(state.banner ? state.banner.message : "", state.banner ? state.banner.level : "warning");
+      let paused = false;
+      if (first.kind === "video") {{
+        stage.playState = state;
+        stage.video.loop = state.mode === "single" ? !!state.loop : isSingleRepeatingVideoList(state);
+        paused = stage.video.paused;
+      }} else {{
+        // The running interval reads activeState at each tick, so it
+        // carries on into the new list. A one-picture repeating list has
+        // nothing to advance to (as in scheduleImageAdvance).
+        if (state.items.length === 1 && state.repeat) {{
+          window.clearInterval(intervalHandle);
+          intervalHandle = null;
+        }}
+        preloadAhead();
+      }}
+      setHud(first, state, state.interval || 5.0);
+      // The client cleared its reported index and paused flag on the new
+      // command; report both again for the new list.
+      lastReportedSlideIndex = -1;
+      notifySlideChange(0);
+      lastReportedPaused = null;
+      notifyPauseState(paused);
+      return true;
+    }}
+
+    function startFromState(state) {{
+      noteItemList(state);
       activeState = state;
       activeIndex = 0;
       lastReportedSlideIndex = -1;
@@ -2957,6 +3067,9 @@ def render_browser_html(
             // next pass. Re-rendering would reload the <video> and defeat
             // the clock-slave.
             softSwapVideoSync(state);
+          }} else if (continueOnScreen(prevState, state)) {{
+            // The item on screen leads the new list: it carries on
+            // where it is (see continueOnScreen).
           }} else {{
             startFromState(state);
           }}

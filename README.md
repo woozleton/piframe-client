@@ -20,7 +20,7 @@ This client now uses one browser-based renderer for:
 - `vendor/h264ify/` - bundled Chromium extension that forces video sites
   off AV1 in webview mode (see [Remote Control](#remote-control-vnc))
 - `update.sh` - in-place self-updater (see Self-update below)
-- `tests/` - unit tests (`python -m pytest tests -q`, no Pi/mpv/network required)
+- `tests/` - unit tests (`python -m pytest tests -q`, no Pi/mpv/network required); `test_kiosk_page.py` runs the kiosk page's script in Node (`kiosk_page_harness.js`, a fake DOM and fake timers) and is skipped where Node isn't installed
 - `.gitattributes` - pins shell + Python files to LF endings
 - `requirements.txt`
 - `scripts/bootstrap_pi.sh`
@@ -87,6 +87,12 @@ Single-video note:
 
 - the server may normalize a bare `play` request into a one-item `video_playlist`
 - the client detects that one-item video playlist case and renders it locally as a true single video
+
+New list led by what's on screen:
+
+- a `video_playlist` (or `play`) whose first item is the video on screen keeps it playing where it is (no reload, no seek; a paused one stays paused) and goes on through the new list from there; the manager's prune after a delete or archive sends exactly that
+- a free-running `slideshow` (no `sync`) whose first item is the picture on screen keeps it and its remaining time, if the interval is the same and the slideshow is running (a paused one restarts as before)
+- a list led by anything else starts from its first item, as before; clock-synced rows and murals keep their own paths
 
 Audio companion note:
 
@@ -1499,7 +1505,7 @@ Current banner cases include:
 Behavior:
 
 - the banner overlays current content
-- it clears automatically when valid content resumes
+- it clears automatically when valid content resumes: an item's banner (`Media file missing`, `NAS unavailable`, `Website unavailable`, `Content unavailable`) goes as soon as the next picture or video loads and shows; a list where every file is missing keeps it up steadily (it never flashes off between failures); `Server disconnected` is untouched by loads
 - `Server disconnected` does NOT stop playback: the frame keeps its
   current playlist (slides come from the NAS mount, clock-slot sync
   keys off wall-clock time) and the banner clears on reconnect. The
