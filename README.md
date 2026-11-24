@@ -250,6 +250,16 @@ paints a media file instead, with independent world width / height:
   the local mount by the same normalizer the playback commands use); the
   client turns it into the `file://` src the kiosk loads, exactly like a
   playlist item
+- `url` may instead be a web picture, but only an `https://` address on
+  `SPRITE_WEB_HOSTS` (`t.plnspttrs.net`, `cdn.planespotters.net`, or a
+  subdomain of either; no credentials, no port): it is kept exactly as sent
+  as both `url` and `src`, and the kiosk loads it itself (Planespotters.net's
+  terms: its photos load straight from the address it returns, on the device
+  that shows them; a flyover card's aircraft photo is pinned over the card's
+  window this way). It is always a still (an `anim` is ignored), a picture
+  that never loads leaves its box empty, and any other web address drops the
+  entity (`sprite_url_unusable`). The status reports `"sprite_web": 1`
+- stacking: a later entity in `entities` draws on top of an earlier one
 - convention: sprite art lives in `<nas>/_mural/sprites/*.png` as
   **transparent PNGs** - the sprite box has no background of its own, so
   the alpha channel is what makes the creature read as a creature

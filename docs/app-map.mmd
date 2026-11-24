@@ -6,6 +6,7 @@ flowchart LR
   %% from SPUT-SERV's NTP server (timesyncd), which keeps the synced slides in step, and a
   %% timer brings Wi-Fi back when it drops.
   subgraph internet ["Internet"]
+    planespotters("Planespotters.net<br/>photos")
     github("GitHub")
   end
   subgraph home_assistant ["Home Assistant"]
@@ -27,9 +28,10 @@ flowchart LR
   tv("TV")
   piframe_client -->|"IPC"| frame_music
   wayvnc -->|"Wayland"| kiosk
-  piframe_client -.->|"Git pull"| github
   piframe_client -->|"SMB"| nas_media
+  piframe_client -.->|"Git pull"| github
   kiosk -->|"SMB"| nas_media
+  kiosk -.->|"HTTPS"| planespotters
   frame_music -->|"SMB"| nas_media
   piframe_cec -->|"HDMI-CEC"| tv
   piframe_cec -->|"MQTT"| mosquitto

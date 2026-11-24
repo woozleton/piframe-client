@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 import websocket
 from browser_renderer_template import render_browser_html
@@ -263,6 +264,14 @@ SPRITE_ANIM_MAX_FPS = 30.0
 # order, any number of frames). The manager sends a frame that doesn't say
 # so the old one-row strip instead.
 SPRITE_SHEETS = 1
+# The only web hosts a sprite image may come from (a host equal to one, or a
+# subdomain of one), always https. Planespotters.net's terms: its photos load
+# straight from the address it returns, unchanged, on the device that shows
+# them, so a flyover card's aircraft photo is fetched by the kiosk itself.
+SPRITE_WEB_HOSTS = ("t.plnspttrs.net", "cdn.planespotters.net")
+# Reported in the status: this kiosk shows web sprite images from those hosts.
+SPRITE_WEB = 1
+_SPRITE_WEB_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +319,28 @@ def _media_file_src(path_str: str) -> str:
     a non-absolute path (Path.as_uri's contract); callers that take remote
     input must guard."""
     return Path(path_str).as_uri()
+
+
+def _sprite_web_url(value: Any) -> bool:
+    """True when `value` is an https address on one of SPRITE_WEB_HOSTS: no
+    credentials, no port, a plain host name. The address is then used exactly
+    as given. A backslash, space or control character anywhere refuses it
+    (a browser reads `\\` as `/`, so the host Python sees would not be the one
+    Chromium fetches from)."""
+    if not isinstance(value, str) or not value.startswith("https://"):
+        return False
+    if any(ch <= " " or ch in "\\\x7f" for ch in value):
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return False
+    host = parts.hostname or ""
+    if not host or parts.netloc.lower() != host:
+        return False  # credentials, a port, or brackets
+    if not set(host) <= _SPRITE_WEB_HOST_CHARS:
+        return False
+    return any(host == allowed or host.endswith("." + allowed) for allowed in SPRITE_WEB_HOSTS)
 
 
 def _finite_number(value: Any) -> Optional[float]:
@@ -3695,6 +3726,23 @@ class PiFrameClient:
                 "size": size,
                 "color": color,
             }
+        elif kind == "image" and _sprite_web_url(sprite.get("url")):
+            # A web picture (SPRITE_WEB_HOSTS): `url` and `src` are the
+            # address exactly as sent, and it is always a still - an `anim`
+            # is ignored, never a reason to drop it.
+            sprite_w = _finite_number(sprite.get("w"))
+            sprite_h = _finite_number(sprite.get("h"))
+            if sprite_w is None or sprite_w <= 0 or sprite_h is None or sprite_h <= 0:
+                _bad("sprite_dims", id=entity_id)
+                return None
+            web_url = sprite["url"]
+            sprite_payload = {
+                "kind": "image",
+                "url": web_url,
+                "src": web_url,
+                "w": sprite_w,
+                "h": sprite_h,
+            }
         elif kind == "image":
             raw_url = sprite.get("url")
             normalized_url = _normalize_media_url(raw_url) if isinstance(raw_url, str) else None
@@ -4229,6 +4277,8 @@ class PiFrameClient:
                 # And draws up to this many creatures (the manager sends
                 # one that doesn't say at most 16).
                 "sprite_entities": SPRITE_MAX_ENTITIES,
+                # And shows sprite images from SPRITE_WEB_HOSTS over https.
+                "sprite_web": SPRITE_WEB,
                 # What videos this screen plays: the manager doesn't send
                 # it the ones it can't (see VIDEO_PLAYABLE_EXTENSIONS).
                 "video_support": _video_support(),

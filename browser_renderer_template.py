@@ -2539,7 +2539,8 @@ def render_browser_html(
        elements get.
 
        Two sprite kinds: `circle` (size + color, drawn with a background
-       color and a 50% radius) and `image` (w/h + a file:// src, painted
+       color and a 50% radius) and `image` (w/h + a file:// src, or an
+       https one from the client's SPRITE_WEB_HOSTS, painted
        as a background-image scaled to the box). An image may also carry
        `anim` {{frames, fps, cols?, seq?}}: the src is then a SHEET of
        equal cells, `cols` to a row (one row without cols), painted by
@@ -2554,7 +2555,10 @@ def render_browser_html(
        most SPRITE_MAX_ENTITIES of them, claimed BY ENTITY ID and released
        (hidden) the first frame their id stops appearing in the live
        state. There is exactly ONE rAF loop no matter how many entities
-       run.
+       run. A later entity in the cast draws on top of an earlier one
+       (each box's z-index is its place in the cast, written only when it
+       changes): a reused box sits anywhere in the DOM, so DOM order alone
+       would not keep a flyover card's photo above the card.
 
        Cheapness: per entity the loop writes only `transform` (compositor
        path), `background-position-x` when an animation frame actually
@@ -2566,7 +2570,7 @@ def render_browser_html(
        ================================================================ */
     const spriteLayer = document.getElementById("spriteLayer");
     const SPRITE_MAX_ENTITIES = 256;
-    // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched }}.
+    // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched, z }}.
     // id === null means the slot is free for the next new entity.
     const spriteSlots = [];
     // The slots by entity id and the free ones, so an entity finds its box
@@ -2643,7 +2647,8 @@ def render_browser_html(
         return true;
       }}
       if (box.kind === "image") {{
-        // src is built client-side (file:// URI); w/h are world units.
+        // src is built client-side (a file:// URI, or an allowed https
+        // address as sent); w/h are world units.
         if (typeof box.src !== "string" || !box.src) return false;
         if (!(spriteNum(box.w) > 0) || !(spriteNum(box.h) > 0)) return false;
         return true;
@@ -2722,7 +2727,8 @@ def render_browser_html(
         boxKey: "",
         frameIndex: -1,
         isAnim: false,
-        touched: false
+        touched: false,
+        z: -1
       }};
       spriteSlots.push(slot);
       spriteSlotById.set(id, slot);
@@ -2944,6 +2950,10 @@ def render_browser_html(
         const slot = spriteClaimSlot(ent.id);
         if (!slot) continue;
         slot.touched = true;
+        if (slot.z !== i) {{
+          slot.z = i;
+          slot.el.style.zIndex = String(i);
+        }}
         drawn += 1;
         spriteDrawEntity(slot, sp, ent, tBase);
       }}
