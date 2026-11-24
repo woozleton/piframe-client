@@ -503,3 +503,65 @@ report({first, after: banner()});
 """, up={**slideshow(["gone.jpg", "good.jpg"]), "nas_ok": True},
         down={**slideshow(["gone.jpg", "good.jpg"]), "nas_ok": False}))
     assert out == [{"first": "Media file missing", "after": "Media file missing"}]
+
+
+# ---------------------------------------------------------------- A guest's own end
+
+# The harness answers every read with the one state, so the cast rides in it
+# too: the page reads it as both its state file and its sprite file.
+SPRITES = """
+const base = 1700000000;
+const ent = (id, until) => Object.assign({id, sprite: {kind: "circle", size: 100, color: "#ffc03c"},
+  motion: {mode: "pinned", x_frac: 0.5, y_frac: 0.5}}, until === undefined ? {} : {until});
+const cast = (seq, entities, latency_ms) => ({mode: "idle", items: [], idle_item: null, banner: null,
+  sprite_seq: seq, world: {w: 1920, h: 1080}, window: {x: 0, y: 0, w: 1920, h: 1080}, latency_ms, entities});
+const shown = (id) => { const s = spriteSlotById.get(id); return !!s && s.visible === true; };
+"""
+
+
+def test_a_guest_goes_at_its_until_and_latency_does_not_move_it(tmp_path):
+    out = run_page(tmp_path, scenario(SPRITES + """
+await setState(cast(1, [ent("fish"), ent("guest", base + 20)], 60000));
+spriteFrame();
+const before = {fish: shown("fish"), guest: shown("guest")};
+const box = spriteSlotById.get("guest").el;
+await advance(20000);
+spriteFrame();
+const look = JSON.stringify(box.style);
+spriteFrame();
+report({before, fish: shown("fish"), guest: spriteSlotById.has("guest"), hidden: box.style.visibility,
+        free: spriteFreeSlots.length, untouched: JSON.stringify(box.style) === look, running: spriteRunning()});
+"""))
+    assert out == [{"before": {"fish": True, "guest": True}, "fish": True, "guest": False, "hidden": "hidden",
+                    "free": 1, "untouched": True, "running": True}]
+
+
+def test_a_cast_that_has_all_ended_is_no_cast(tmp_path):
+    out = run_page(tmp_path, scenario(SPRITES + """
+await setState(cast(1, [ent("guest", base + 5)], 0));
+spriteFrame();
+const before = {guest: shown("guest"), running: spriteRunning()};
+await advance(5000);
+report({before, running: spriteRunning(), held: spriteSlotById.size,
+        hidden: spriteSlots.every((s) => s.el.style.visibility === "hidden")});
+"""))
+    assert out == [{"before": {"guest": True, "running": True}, "running": False, "held": 0, "hidden": True}]
+
+
+def test_a_reloaded_page_never_draws_an_ended_guest(tmp_path):
+    # The cast still on disk after a restart: the ended guest gets no box at all.
+    out = run_page(tmp_path, scenario(SPRITES + """
+await setState(cast(7, [ent("guest", base - 1), ent("fish")], 0));
+spriteFrame();
+const mixed = {boxes: spriteSlots.length, fish: shown("fish"), guest: spriteSlotById.has("guest")};
+report(mixed);
+"""))
+    assert out == [{"boxes": 1, "fish": True, "guest": False}]
+
+
+def test_a_reloaded_page_with_only_ended_guests_starts_no_layer(tmp_path):
+    out = run_page(tmp_path, scenario(SPRITES + """
+await setState(cast(7, [ent("guest", base - 1), ent("other", base)], 0));
+report({running: spriteRunning(), boxes: spriteSlots.length});
+"""))
+    assert out == [{"running": False, "boxes": 0}]

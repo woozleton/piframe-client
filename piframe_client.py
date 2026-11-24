@@ -271,6 +271,9 @@ SPRITE_SHEETS = 1
 SPRITE_WEB_HOSTS = ("t.plnspttrs.net", "cdn.planespotters.net")
 # Reported in the status: this kiosk shows web sprite images from those hosts.
 SPRITE_WEB = 1
+# Reported in the status: this kiosk stops drawing an entity once its own
+# `until` (epoch seconds) has passed, with no take-off from the manager.
+SPRITE_UNTIL = 1
 _SPRITE_WEB_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
 
 
@@ -3818,11 +3821,20 @@ class PiFrameClient:
             _bad("sprite_kind", id=entity_id, kind=str(kind))
             return None
 
-        return {
+        entity_payload: Dict[str, Any] = {
             "id": entity_id,
             "sprite": sprite_payload,
             "motion": motion_payload,
         }
+        # A guest carries its own end: `until` is the wall-clock time
+        # (epoch seconds) after which the kiosk no longer draws it, so a
+        # take-off that never arrives can't leave it crossing forever.
+        # Soft like phase_s: anything but a finite number > 0 is left off
+        # and the entity simply has no end of its own.
+        until = _finite_number(raw.get("until"))
+        if until is not None and until > 0:
+            entity_payload["until"] = until
+        return entity_payload
 
     @classmethod
     def _extract_sprite_show(cls, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -4279,6 +4291,8 @@ class PiFrameClient:
                 "sprite_entities": SPRITE_MAX_ENTITIES,
                 # And shows sprite images from SPRITE_WEB_HOSTS over https.
                 "sprite_web": SPRITE_WEB,
+                # And stops drawing an entity once its `until` has passed.
+                "sprite_until": SPRITE_UNTIL,
                 # What videos this screen plays: the manager doesn't send
                 # it the ones it can't (see VIDEO_PLAYABLE_EXTENSIONS).
                 "video_support": _video_support(),

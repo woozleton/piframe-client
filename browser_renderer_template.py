@@ -2560,6 +2560,17 @@ def render_browser_html(
        changes): a reused box sits anywhere in the DOM, so DOM order alone
        would not keep a flyover card's photo above the card.
 
+       An entity may carry `until` (epoch seconds, a finite number > 0;
+       the client drops anything else): once the wall clock reaches it
+       (Date.now(), never shifted by latency_ms) the entity counts as gone
+       from the cast exactly as if a re-send had left it out - its box is
+       released and hidden, it takes no place in the entity cap, and a
+       cast whose every entity has ended is no cast (spriteConfigValid,
+       so the loop stops). A flyover guest carries its own end this way,
+       so a take-off that never arrives can't leave it crossing forever,
+       even after a reload with the cast still on disk. One number
+       comparison per entity that has one, nothing for the rest.
+
        Cheapness: per entity the loop writes only `transform` (compositor
        path), `background-position-x` when an animation frame actually
        flips, and `visibility` - and only when the value changed; while an
@@ -2656,7 +2667,12 @@ def render_browser_html(
       return false;
     }}
 
-    function spriteConfigValid(sp) {{
+    function spriteEnded(ent, nowS) {{
+      // Past its own `until`: treated as no longer in the cast.
+      return typeof ent.until === "number" && nowS >= ent.until;
+    }}
+
+    function spriteConfigValid(sp, nowS) {{
       if (!sp || typeof sp !== "object") return false;
       const world = sp.world;
       const win = sp.window;
@@ -2668,9 +2684,9 @@ def render_browser_html(
       const list = sp.entities;
       if (!Array.isArray(list) || !list.length) return false;
       // One usable entity is enough to keep the layer running; the frame
-      // loop skips the rest individually.
+      // loop skips the rest individually. An ended one is not usable.
       for (let i = 0; i < list.length; i++) {{
-        if (spriteEntityValid(list[i])) return true;
+        if (spriteEntityValid(list[i]) && !spriteEnded(list[i], nowS)) return true;
       }}
       return false;
     }}
@@ -2929,7 +2945,9 @@ def render_browser_html(
       // stopSprite() ever cancels it.
       spriteRafHandle = window.requestAnimationFrame(spriteFrame);
       const sp = activeState && activeState.sprite;
-      if (!spriteConfigValid(sp)) {{
+      // The wall clock, unshifted: what each entity's `until` is read against.
+      const nowS = Date.now() / 1000;
+      if (!spriteConfigValid(sp, nowS)) {{
         spriteHideAll();
         return;
       }}
@@ -2940,13 +2958,15 @@ def render_browser_html(
       // it) degrades to 0 - uncompensated, never broken.
       const spriteLatencyRaw = Number(sp.latency_ms);
       const spriteLatency = isFinite(spriteLatencyRaw) ? spriteLatencyRaw : 0;
-      const tBase = Date.now() / 1000 + spriteLatency / 1000;
+      const tBase = nowS + spriteLatency / 1000;
       for (let i = 0; i < spriteSlots.length; i++) spriteSlots[i].touched = false;
       const list = sp.entities;
       let drawn = 0;
       for (let i = 0; i < list.length && drawn < SPRITE_MAX_ENTITIES; i++) {{
         const ent = list[i];
         if (!spriteEntityValid(ent)) continue;
+        // Ended: left untouched, so the sweep below releases its box.
+        if (spriteEnded(ent, nowS)) continue;
         const slot = spriteClaimSlot(ent.id);
         if (!slot) continue;
         slot.touched = true;
@@ -3140,7 +3160,7 @@ def render_browser_html(
         // disturbs it. Only the appeared / disappeared edges need
         // handling here - a changed config is picked up by the rAF loop
         // itself, which reads activeState.sprite every frame.
-        const spriteWanted = spriteConfigValid(state.sprite);
+        const spriteWanted = spriteConfigValid(state.sprite, Date.now() / 1000);
         if (spriteWanted && !spriteRunning()) {{
           startSprite();
         }} else if (!spriteWanted && spriteRunning()) {{

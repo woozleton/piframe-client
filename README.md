@@ -260,6 +260,15 @@ paints a media file instead, with independent world width / height:
   that never loads leaves its box empty, and any other web address drops the
   entity (`sprite_url_unusable`). The status reports `"sprite_web": 1`
 - stacking: a later entity in `entities` draws on top of an earlier one
+- an entity may carry `until`, the wall-clock time in epoch seconds after
+  which it is not drawn (a flyover guest carries its own end, so a take-off
+  the manager never gets to send can't leave it crossing again and again).
+  Past it, the kiosk treats the entity as gone from the cast: its box is
+  released, it takes no place in the cap, and a cast that has all ended is
+  no cast. The clock is the plain `Date.now()`, never shifted by
+  `latency_ms`. Anything but a finite number greater than 0 is left off
+  (the entity is kept, with no end of its own). The status reports
+  `"sprite_until": 1`
 - convention: sprite art lives in `<nas>/_mural/sprites/*.png` as
   **transparent PNGs** - the sprite box has no background of its own, so
   the alpha channel is what makes the creature read as a creature
