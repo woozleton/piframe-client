@@ -269,6 +269,21 @@ paints a media file instead, with independent world width / height:
   `latency_ms`. Anything but a finite number greater than 0 is left off
   (the entity is kept, with no end of its own). The status reports
   `"sprite_until": 1`
+- an entity may carry `fx`, how it comes in and goes out (a flyover card
+  fading or sliding): `{"in": "fade" | "slide", "out": "fade" | "slide",
+  "s": 0.6, "dy": 400, "out_at": <epoch seconds>}`. `in` plays over `s`
+  seconds from the frame the kiosk first draws that id (a re-send of the
+  same id doesn't play it again); `out` over the last `s` seconds before
+  `out_at`, on the clock `until` is read on, and from `out_at` it is hidden
+  until it is taken off (an `out` without `out_at`, or the other way round,
+  is no way out). "fade" is opacity alone, linear; "slide" also comes up
+  from `dy` world units below its place (`dy * (1 - p)^3`) and goes back
+  down (`dy * q^3`), the same curves the Virtual Window and the projected
+  screens draw. Only the drawing changes, never the place, so a card and
+  its photo with the same `fx` move as one. `s` is 0.6 when left out, and
+  must be over 0 and at most 5, `dy` 0 to 20000; anything wrong in it drops
+  the whole `fx` and the entity is drawn as it always was. The status
+  reports `"sprite_fx": 1`
 - convention: sprite art lives in `<nas>/_mural/sprites/*.png` as
   **transparent PNGs** - the sprite box has no background of its own, so
   the alpha channel is what makes the creature read as a creature

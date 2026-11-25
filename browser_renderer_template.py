@@ -2571,9 +2571,30 @@ def render_browser_html(
        even after a reload with the cast still on disk. One number
        comparison per entity that has one, nothing for the rest.
 
+       An entity may carry `fx` {{in, out, s, dy, out_at}} (the client keeps
+       a whole valid one or none): how it comes in and goes out, a flyover
+       card fading or sliding. It changes only how the box is DRAWN - its
+       opacity and an offset down, folded into the same per-frame
+       transform write as its place - never the place itself, so a card
+       and the photo pinned over it with the same fx move as one, pixel
+       for pixel. `in` plays over `s` seconds from the frame its id first
+       claims a box, on the page's own monotonic clock (performance.now):
+       a re-send of the same id finds its box held and so keeps its
+       progress, and a card never comes in twice when another guest joins.
+       "fade" is opacity 0 to 1 (linear, p); "slide" also starts `dy` world
+       units below its place (scaled like h) and eases up to it
+       (dy * (1 - p)^3). `out` runs over the last `s` seconds before
+       `out_at` on the clock `until` is read on, back the same way (1 - q,
+       dy * q^3); from `out_at` the box is hidden until a re-send takes the
+       entity off. An `out` without `out_at` (or the other way round) is
+       no way out and no hiding; no `s` is 0.6. The Virtual Window and
+       the projected screens draw the same curves. No CSS transitions: one would race
+       the transform this loop writes every frame.
+
        Cheapness: per entity the loop writes only `transform` (compositor
        path), `background-position-x` when an animation frame actually
-       flips, and `visibility` - and only when the value changed; while an
+       flips, `opacity` while an fx plays, and `visibility` - and only
+       when the value changed; while an
        entity is off-window it does no DOM writes at all. Config is read
        from the LIVE polled state every frame, so a re-send with new
        parameters - including added / removed entities, a kind switch or a
@@ -2581,7 +2602,8 @@ def render_browser_html(
        ================================================================ */
     const spriteLayer = document.getElementById("spriteLayer");
     const SPRITE_MAX_ENTITIES = 256;
-    // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched, z }}.
+    // Pool slots: {{ el, id, visible, boxKey, frameIndex, isAnim, touched, z,
+    // bornMs, alpha }}.
     // id === null means the slot is free for the next new entity.
     const spriteSlots = [];
     // The slots by entity id and the free ones, so an entity finds its box
@@ -2721,12 +2743,15 @@ def render_browser_html(
       slot.isAnim = false;
     }}
 
-    function spriteClaimSlot(id) {{
+    function spriteClaimSlot(id, frameMs) {{
       const held = spriteSlotById.get(id);
       if (held) return held;
       const reused = spriteFreeSlots.pop();
       if (reused) {{
         reused.id = id;
+        // A new id: its fx `in` starts now (alpha stays what the box
+        // really has, so the first draw rewrites it only if it differs).
+        reused.bornMs = frameMs;
         spriteResetSlot(reused);
         spriteSlotById.set(id, reused);
         return reused;
@@ -2744,7 +2769,10 @@ def render_browser_html(
         frameIndex: -1,
         isAnim: false,
         touched: false,
-        z: -1
+        z: -1,
+        bornMs: frameMs,
+        // The box's opacity as written (CSS starts it at 1).
+        alpha: 1
       }};
       spriteSlots.push(slot);
       spriteSlotById.set(id, slot);
@@ -2789,7 +2817,54 @@ def render_browser_html(
       return cum;
     }}
 
-    function spriteDrawEntity(slot, sp, ent, tBase) {{
+    // What an entity's fx does to it this frame: its opacity, how far down
+    // (world units) it is drawn from its place, and whether it has gone
+    // out for good. Module scratch rather than a returned object, so the
+    // loop allocates nothing per entity.
+    let spriteFxAlpha = 1;
+    let spriteFxDown = 0;
+    let spriteFxGone = false;
+
+    function spriteFxLook(fx, bornMs, frameMs, nowS) {{
+      spriteFxAlpha = 1;
+      spriteFxDown = 0;
+      spriteFxGone = false;
+      if (!fx || typeof fx !== "object") return;
+      // No `s` is the usual 0.6 s; a wrong one is no fx at all.
+      const s = fx.s === undefined ? 0.6 : spriteNum(fx.s);
+      if (!(s > 0 && s <= 5)) return;
+      const dyRaw = spriteNum(fx.dy);
+      const dy = dyRaw > 0 ? dyRaw : 0;
+      const kin = fx.in;
+      if (kin === "fade" || kin === "slide") {{
+        const p = (frameMs - bornMs) / 1000 / s;
+        if (p < 1) {{
+          const q = p > 0 ? p : 0;
+          spriteFxAlpha = q;
+          // Eases out: quick off the edge, settling into its place.
+          if (kin === "slide") spriteFxDown = dy * Math.pow(1 - q, 3);
+        }}
+      }}
+      const kout = fx.out;
+      const outAt = spriteNum(fx.out_at);
+      if ((kout === "fade" || kout === "slide") && outAt > 0) {{
+        if (nowS >= outAt) {{
+          spriteFxGone = true;
+          return;
+        }}
+        const q = (nowS - (outAt - s)) / s;
+        if (q > 0) {{
+          // The way in played backwards: easing in, gone at out_at. A
+          // way out that starts before the way in has ended (a short
+          // show): the lower opacity wins and the two offsets add, as on
+          // every other kind of screen.
+          spriteFxAlpha = Math.min(spriteFxAlpha, 1 - q);
+          if (kout === "slide") spriteFxDown += dy * q * q * q;
+        }}
+      }}
+    }}
+
+    function spriteDrawEntity(slot, sp, ent, tBase, nowS, frameMs) {{
       const box = ent.sprite;
       const motion = ent.motion;
       const isImage = box.kind === "image";
@@ -2875,6 +2950,11 @@ def render_browser_html(
         spriteSetVisible(slot, false);
         return;
       }}
+      spriteFxLook(ent.fx, slot.bornMs, frameMs, nowS);
+      if (spriteFxGone) {{
+        spriteSetVisible(slot, false);
+        return;
+      }}
       const anim = spriteAnimOf(box);
       // Change detection covers kind + look as well as the box size, so a
       // mid-show circle <-> image switch, a swapped url or a strip whose
@@ -2934,9 +3014,18 @@ def render_browser_html(
         : (motion.mode === "path"
           ? (dirX < 0) !== (motion.flip === true)
           : (motion.reverse === true) !== (motion.flip === true));
+      // The fx's offset rides in the one transform write; the place (x, y)
+      // is the motion's alone.
+      const yDrawn = y + spriteFxDown * scaleY;
       slot.el.style.transform =
-        "translate3d(" + x.toFixed(1) + "px," + y.toFixed(1) + "px,0)" +
+        "translate3d(" + x.toFixed(1) + "px," + yDrawn.toFixed(1) + "px,0)" +
         (mirrored ? " scaleX(-1)" : "");
+      // Three decimals: smooth enough, and a steady entity writes nothing.
+      const alpha = Math.round(spriteFxAlpha * 1000) / 1000;
+      if (alpha !== slot.alpha) {{
+        slot.alpha = alpha;
+        slot.el.style.opacity = alpha === 1 ? "" : String(alpha);
+      }}
       spriteSetVisible(slot, true);
     }}
 
@@ -2959,6 +3048,9 @@ def render_browser_html(
       const spriteLatencyRaw = Number(sp.latency_ms);
       const spriteLatency = isFinite(spriteLatencyRaw) ? spriteLatencyRaw : 0;
       const tBase = nowS + spriteLatency / 1000;
+      // The page's own monotonic clock, once a frame: what an fx's way in
+      // runs on (a wall clock stepped by NTP would cut it short or hold it).
+      const frameMs = performance.now();
       for (let i = 0; i < spriteSlots.length; i++) spriteSlots[i].touched = false;
       const list = sp.entities;
       let drawn = 0;
@@ -2967,7 +3059,7 @@ def render_browser_html(
         if (!spriteEntityValid(ent)) continue;
         // Ended: left untouched, so the sweep below releases its box.
         if (spriteEnded(ent, nowS)) continue;
-        const slot = spriteClaimSlot(ent.id);
+        const slot = spriteClaimSlot(ent.id, frameMs);
         if (!slot) continue;
         slot.touched = true;
         if (slot.z !== i) {{
@@ -2975,7 +3067,7 @@ def render_browser_html(
           slot.el.style.zIndex = String(i);
         }}
         drawn += 1;
-        spriteDrawEntity(slot, sp, ent, tBase);
+        spriteDrawEntity(slot, sp, ent, tBase, nowS, frameMs);
       }}
       // Anything the live state stopped mentioning disappears this frame.
       for (let i = 0; i < spriteSlots.length; i++) {{

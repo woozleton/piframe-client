@@ -565,3 +565,114 @@ await setState(cast(7, [ent("guest", base - 1), ent("other", base)], 0));
 report({running: spriteRunning(), boxes: spriteSlots.length});
 """))
     assert out == [{"running": False, "boxes": 0}]
+
+
+# ---------------------------------------------------------------- A guest coming in and going out
+
+# A pinned circle, 100 world units on a 1920 x 1080 window of the same world, so a world unit is a pixel: its
+# place's top is 540 - 50 = 490.
+FX = SPRITES + r"""
+const fxEnt = (id, fx) => Object.assign(ent(id), fx === undefined ? {} : {fx});
+const look = (id) => { const s = spriteSlotById.get(id); if (!s) return null;
+  const m = /translate3d\(([-\d.]+)px,([-\d.]+)px/.exec(s.el.style.transform || "");
+  return {y: m ? +m[2] : null, opacity: s.el.style.opacity === undefined ? "unset" : s.el.style.opacity,
+          shown: s.visible === true}; };
+"""
+
+
+def test_a_fade_comes_in_over_s_on_the_page_clock(tmp_path):
+    out = run_page(tmp_path, scenario(FX + """
+await setState(cast(1, [fxEnt("card", {in: "fade", s: 0.6})], 0));
+const seen = [];
+spriteFrame(); seen.push(look("card"));
+await advance(300); spriteFrame(); seen.push(look("card"));
+await advance(300); spriteFrame(); seen.push(look("card"));
+await advance(300); spriteFrame(); seen.push(look("card"));
+report(seen);
+"""))
+    assert out == [[{"y": 490, "opacity": "0", "shown": True}, {"y": 490, "opacity": "0.5", "shown": True},
+                    {"y": 490, "opacity": "", "shown": True}, {"y": 490, "opacity": "", "shown": True}]]
+
+
+def test_a_slide_comes_up_from_dy_below_easing_out_and_the_photo_moves_with_it(tmp_path):
+    out = run_page(tmp_path, scenario(FX + """
+const fx = {in: "slide", out: "slide", s: 0.6, dy: 400, out_at: base + 60};
+await setState(cast(1, [fxEnt("card", fx), fxEnt("photo", fx)], 0));
+const seen = [];
+for (const ms of [0, 300, 300]) { await advance(ms); spriteFrame(); seen.push([look("card"), look("photo")]); }
+report(seen);
+"""))
+    # 400 * (1 - 0.5) ** 3 = 50 down at half way, and both drawn the same.
+    assert out == [[[{"y": 890, "opacity": "0", "shown": True}] * 2,
+                    [{"y": 540, "opacity": "0.5", "shown": True}] * 2,
+                    [{"y": 490, "opacity": "", "shown": True}] * 2]]
+
+
+def test_a_resend_keeps_the_way_in_where_it_was_and_a_new_guest_starts_its_own(tmp_path):
+    out = run_page(tmp_path, scenario(FX + """
+const fx = {in: "fade", s: 0.6};
+await setState(cast(1, [fxEnt("card", fx)], 0));
+spriteFrame();
+await advance(300);
+await setState(cast(2, [ent("fish"), fxEnt("card", fx), fxEnt("late", fx)], 0));
+spriteFrame();
+const mid = {card: look("card"), late: look("late")};
+await advance(300); spriteFrame();
+report({mid, card: look("card"), late: look("late")});
+"""))
+    assert out == [{"mid": {"card": {"y": 490, "opacity": "0.5", "shown": True},
+                            "late": {"y": 490, "opacity": "0", "shown": True}},
+                    "card": {"y": 490, "opacity": "", "shown": True},
+                    "late": {"y": 490, "opacity": "0.5", "shown": True}}]
+
+
+def test_the_way_out_ends_at_out_at_on_the_until_clock_and_it_stays_hidden(tmp_path):
+    out = run_page(tmp_path, scenario(FX + """
+const fx = {in: "slide", out: "slide", s: 0.6, dy: 400, out_at: base + 10};
+await setState(cast(1, [fxEnt("card", fx)], 60000));
+spriteFrame();
+const seen = [];
+for (const ms of [9400, 300, 300, 1000]) { await advance(ms); spriteFrame(); seen.push(look("card")); }
+const box = spriteSlotById.get("card").el;
+report({seen, hidden: box.style.visibility, held: spriteSlotById.has("card")});
+"""))
+    # Its place is untouched by latency_ms (pinned); the way out reads the plain clock: 400 * 0.5 ** 3 = 50 down.
+    assert out == [{"seen": [{"y": 490, "opacity": "", "shown": True}, {"y": 540, "opacity": "0.5", "shown": True},
+                             {"y": 540, "opacity": "0.5", "shown": False},
+                             {"y": 540, "opacity": "0.5", "shown": False}],
+                    "hidden": "hidden", "held": True}]
+
+
+@pytest.mark.parametrize("fx", ["none", {"in": "fade", "s": 9}, {"in": "wipe", "s": 0.6}, {"s": 0.6}, "fade"])
+def test_no_or_a_broken_fx_draws_it_exactly_as_before(tmp_path, fx):
+    out = run_page(tmp_path, scenario(FX + f"""
+const fx = {json.dumps(fx)};
+await setState(cast(1, [fxEnt("card", fx === "none" ? undefined : fx)], 0));
+spriteFrame();
+report(look("card"));
+"""))
+    assert out == [{"y": 490, "opacity": "unset", "shown": True}]
+
+
+def test_no_s_is_0_6_and_a_way_out_overlapping_the_way_in_adds_its_offset(tmp_path):
+    # out_at 0.3 s after it first draws: at 0.15 s p = 0.25 (no s: 0.6) and q = (0.15 - (0.3 - 0.6)) / 0.6 = 0.75.
+    out = run_page(tmp_path, scenario(FX + """
+await setState(cast(1, [fxEnt("card", {in: "slide", out: "slide", dy: 400, out_at: base + 0.3})], 0));
+spriteFrame();
+await advance(150); spriteFrame();
+report(look("card"));
+"""))
+    # Opacity min(0.25, 0.25); down 400 * (0.75 ** 3 + 0.75 ** 3) = 337.5, from 490.
+    assert out == [{"y": 827.5, "opacity": "0.25", "shown": True}]
+
+
+@pytest.mark.parametrize("fx", [{"in": "fade", "out": "fade", "s": 0.6},
+                                {"in": "fade", "s": 0.6, "out_at": 1700000001}])
+def test_out_without_out_at_or_out_at_without_out_never_hides_it(tmp_path, fx):
+    out = run_page(tmp_path, scenario(FX + f"""
+await setState(cast(1, [fxEnt("card", {json.dumps(fx)})], 0));
+spriteFrame();
+await advance(5000); spriteFrame();
+report(look("card"));
+"""))
+    assert out == [{"y": 490, "opacity": "", "shown": True}]

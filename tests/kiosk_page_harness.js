@@ -102,6 +102,8 @@ const sandbox = {
   setInterval: (fn, ms) => addTimer(fn, ms, true),
   clearTimeout: (id) => timers.delete(id),
   clearInterval: (id) => timers.delete(id),
+  // The page's monotonic clock follows the fake timers too.
+  performance: { now: () => now },
   requestAnimationFrame: () => 0,
   cancelAnimationFrame: () => {},
   addEventListener() {},

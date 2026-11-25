@@ -274,6 +274,15 @@ SPRITE_WEB = 1
 # Reported in the status: this kiosk stops drawing an entity once its own
 # `until` (epoch seconds) has passed, with no take-off from the manager.
 SPRITE_UNTIL = 1
+# An entity's `fx`: how it comes in and goes out (only how it is drawn; its
+# place is the motion's). The kinds, the most seconds one may take, and the
+# most world units a slide may travel.
+SPRITE_FX_KINDS = ("fade", "slide")
+SPRITE_FX_MAX_S = 5.0
+SPRITE_FX_DEFAULT_S = 0.6
+SPRITE_FX_MAX_DY = 20000.0
+# Reported in the status: this kiosk plays an entity's `fx`.
+SPRITE_FX = 1
 _SPRITE_WEB_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
 
 
@@ -356,6 +365,41 @@ def _finite_number(value: Any) -> Optional[float]:
     if not math.isfinite(value):
         return None
     return float(value)
+
+
+def _sprite_fx(raw: Any) -> Optional[Dict[str, Any]]:
+    """An entity's `fx`, normalized, or None for no transition at all.
+
+    {in, out: "fade" | "slide", s: seconds (0 < s <= SPRITE_FX_MAX_S, else
+    SPRITE_FX_DEFAULT_S when left out), dy: world units (0..SPRITE_FX_MAX_DY),
+    out_at: epoch seconds}. Any key may be left out; one that is there and
+    wrong drops the whole fx, so the entity is drawn as it always was. Other
+    keys are not passed on. One with neither `in` nor `out` has nothing to
+    play and is left off."""
+    if not isinstance(raw, dict):
+        return None
+    s = _finite_number(raw["s"]) if "s" in raw else SPRITE_FX_DEFAULT_S
+    if s is None or not 0 < s <= SPRITE_FX_MAX_S:
+        return None
+    fx: Dict[str, Any] = {"s": s}
+    for key in ("in", "out"):
+        if key in raw:
+            if raw[key] not in SPRITE_FX_KINDS:
+                return None
+            fx[key] = raw[key]
+    if "in" not in fx and "out" not in fx:
+        return None
+    if "dy" in raw:
+        dy = _finite_number(raw["dy"])
+        if dy is None or not 0 <= dy <= SPRITE_FX_MAX_DY:
+            return None
+        fx["dy"] = dy
+    if "out_at" in raw:
+        out_at = _finite_number(raw["out_at"])
+        if out_at is None or out_at <= 0:
+            return None
+        fx["out_at"] = out_at
+    return fx
 
 
 def _is_hex_color(value: Any) -> bool:
@@ -3834,6 +3878,12 @@ class PiFrameClient:
         until = _finite_number(raw.get("until"))
         if until is not None and until > 0:
             entity_payload["until"] = until
+        # How it comes in and goes out (a flyover card fading or sliding).
+        # All or nothing: one bad key leaves the entity drawn exactly as
+        # without it, never with half a transition.
+        fx = _sprite_fx(raw.get("fx"))
+        if fx is not None:
+            entity_payload["fx"] = fx
         return entity_payload
 
     @classmethod
@@ -4293,6 +4343,8 @@ class PiFrameClient:
                 "sprite_web": SPRITE_WEB,
                 # And stops drawing an entity once its `until` has passed.
                 "sprite_until": SPRITE_UNTIL,
+                # And plays an entity's fx (fading or sliding in and out).
+                "sprite_fx": SPRITE_FX,
                 # What videos this screen plays: the manager doesn't send
                 # it the ones it can't (see VIDEO_PLAYABLE_EXTENSIONS).
                 "video_support": _video_support(),
