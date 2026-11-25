@@ -46,7 +46,7 @@ def render_browser_html(
     _swap_dims = _rot_norm == 90 or _rot_norm == 270
     rotated_full_width = "100vh" if _swap_dims else "100vw"
     rotated_full_height = "100vw" if _swap_dims else "100vh"
-    return f"""<!doctype html>
+    return rf"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
