@@ -262,8 +262,11 @@ report(continueOnScreen(activeState, synced));
 # is floor(1.7e12 / 1e4 + t / 1e4) % length, so 170000000 + k, which is
 # k % 4 for a row of 4 and (2 + k) % 3 for a row of 3.
 
-def synced(names, *, interval=10.0) -> dict:
-    return {**slideshow(names, interval=interval), "sync": {"mode": "clock", "length": len(names)}}
+def synced(names, *, interval=10.0, name=None) -> dict:
+    row = {**slideshow(names, interval=interval), "sync": {"mode": "clock", "length": len(names)}}
+    if name is not None:
+        row["playlist_name"] = name
+    return row
 
 
 def test_a_shorter_synced_row_keeping_the_picture_paints_nothing(tmp_path):
@@ -337,8 +340,10 @@ report({paused, still, resumed, before, after: renderToken - t0, index: activeIn
 
 
 def test_another_synced_list_of_a_new_length_starts_over_and_ends_a_pause(tmp_path):
-    """Only the same list minus gone pictures swaps in place: other content
-    of another length starts the sync afresh, as it always has."""
+    """Only the same playlist swaps in place (pruned, or under the same name
+    still holding the picture on screen): other content of another length
+    starts the sync afresh, as it always has - a row under the same name
+    without the picture on screen, or a longer row under another name."""
     out = run_page(tmp_path, scenario("""
 await setState(row4);
 await loadImage(img("a.jpg"), true);
@@ -352,10 +357,119 @@ const t1 = renderToken;
 await setState(grown5);
 report({other, grown: {renders: renderToken - t1, paused: syncPaused, count: activeState.items.length}});
 """, row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]), other3=synced(["x.jpg", "y.jpg", "z.jpg"]),
-        grown5=synced(["x.jpg", "y.jpg", "z.jpg", "v.jpg", "w.jpg"])))
+        grown5=synced(["x.jpg", "y.jpg", "z.jpg", "v.jpg", "w.jpg"], name="Another Playlist")))
     assert out == [{
         "other": {"renders": 1, "paused": False, "index": 2, "count": 3},
         "grown": {"renders": 1, "paused": False, "count": 5},
+    }]
+
+
+# A longer row for the same playlist (pictures added while it plays): the
+# manager pins the picture on screen at the current clock slot. A row of 6 is
+# at slot (2 + k) % 6, a row of 5 at k % 5.
+
+def test_a_longer_synced_row_keeping_the_picture_paints_nothing(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(row4);
+await loadImage(img("a.jpg"), true);
+const t0 = renderToken;
+await advance(3000);
+await setState(row6);
+const swapped = {
+  renders: renderToken - t0, index: activeIndex, shown: lastPaintedSrc,
+  count: activeState.items.length, reported: last("slideshow_index").index,
+};
+await advance(6999);
+const before = renderToken - t0;
+await advance(1);
+report({swapped, before, after: renderToken - t0, index: activeIndex, next: !!img("b.jpg")});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]),
+        row6=synced(["x.jpg", "y.jpg", "a.jpg", "b.jpg", "c.jpg", "d.jpg"])))
+    assert out == [{
+        "swapped": {"renders": 0, "index": 2, "shown": "file:///media/a.jpg", "count": 6, "reported": 2},
+        "before": 0, "after": 1, "index": 3, "next": True,
+    }]
+
+
+def test_a_longer_synced_row_with_another_picture_cross_fades_once(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await setState(row4);
+await loadImage(img("a.jpg"), true);
+const t0 = renderToken;
+await advance(4000);
+await setState(row6);
+const swapped = {renders: renderToken - t0, index: activeIndex, y: !!img("y.jpg")};
+await loadImage(img("y.jpg"), true);
+const shown = stages[activeStageIndex].image === img("y.jpg");
+await advance(5999);
+const before = {renders: renderToken - t0, b: !!img("b.jpg")};
+await advance(2);
+report({swapped, shown, before, after: renderToken - t0, index: activeIndex, b: !!img("b.jpg")});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]),
+        row6=synced(["x.jpg", "a.jpg", "y.jpg", "b.jpg", "c.jpg", "d.jpg"])))
+    assert out == [{
+        "swapped": {"renders": 1, "index": 2, "y": True}, "shown": True,
+        "before": {"renders": 1, "b": False}, "after": 2, "index": 3, "b": True,
+    }]
+
+
+def test_a_longer_synced_row_while_paused_keeps_the_pause_and_resumes_on_the_clock(tmp_path):
+    out = run_page(tmp_path, scenario("""
+await advance(30000);
+await setState(row4);              // slot 3: d.jpg
+await loadImage(img("d.jpg"), true);
+applyControl({action: "pause", token: 1});
+const t0 = renderToken;
+await setState(row6);
+const paused = {
+  renders: renderToken - t0, paused: syncPaused, index: activeIndex, shown: lastPaintedSrc,
+  reported: last("pause_state").paused, count: activeState.items.length,
+};
+await advance(10000);
+const still = renderToken - t0;
+applyControl({action: "pause", token: 2});
+await flush();
+const resumed = {renders: renderToken - t0, paused: syncPaused, index: activeIndex, x: !!img("x.jpg")};
+await advance(9999);
+const before = renderToken - t0;
+await advance(1);
+report({paused, still, resumed, before, after: renderToken - t0, index: activeIndex});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]),
+        row6=synced(["x.jpg", "y.jpg", "a.jpg", "d.jpg", "b.jpg", "c.jpg"])))
+    assert out == [{
+        "paused": {"renders": 0, "paused": True, "index": 3, "shown": "file:///media/d.jpg",
+                   "reported": True, "count": 6},
+        "still": 0,
+        "resumed": {"renders": 1, "paused": False, "index": 0, "x": True},
+        "before": 1, "after": 2, "index": 1,
+    }]
+
+
+def test_pictures_added_and_removed_in_one_burst_keep_the_picture_on_screen(tmp_path):
+    """b.jpg leaves and x.jpg, y.jpg join in one re-send; later a.jpg, y.jpg and
+    d.jpg leave and w.jpg joins (a shorter row that is not a pruned one). Each
+    still holds the picture on screen, so neither repaints."""
+    out = run_page(tmp_path, scenario("""
+await setState(row4);
+await loadImage(img("a.jpg"), true);
+const t0 = renderToken;
+await advance(3000);
+await setState(burst5);
+const grown = {renders: renderToken - t0, index: activeIndex, shown: lastPaintedSrc, count: activeState.items.length};
+await advance(7000);               // slot 1 of 5: x.jpg
+await loadImage(img("x.jpg"), true);
+const flipped = {renders: renderToken - t0, index: activeIndex};
+await advance(3000);
+await setState(burst3);
+const shrunk = {renders: renderToken - t0, index: activeIndex, shown: lastPaintedSrc, count: activeState.items.length};
+report({grown, flipped, shrunk});
+""", row4=synced(["a.jpg", "b.jpg", "c.jpg", "d.jpg"]),
+        burst5=synced(["a.jpg", "x.jpg", "c.jpg", "y.jpg", "d.jpg"]),
+        burst3=synced(["x.jpg", "c.jpg", "w.jpg"])))
+    assert out == [{
+        "grown": {"renders": 0, "index": 0, "shown": "file:///media/a.jpg", "count": 5},
+        "flipped": {"renders": 1, "index": 1},
+        "shrunk": {"renders": 1, "index": 0, "shown": "file:///media/x.jpg", "count": 3},
     }]
 
 

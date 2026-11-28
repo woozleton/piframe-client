@@ -283,6 +283,12 @@ SPRITE_FX_DEFAULT_S = 0.6
 SPRITE_FX_MAX_DY = 20000.0
 # Reported in the status: this kiosk plays an entity's `fx`.
 SPRITE_FX = 1
+# What this client can do, sent when it registers and in every status report.
+# "grow_row": a re-sent clock-synced slideshow row that is longer but the same
+# playlist (same playlist_name, still holding the picture on screen) swaps in
+# place on the page: no repaint unless the current slot's picture changed, and
+# a pause holds. The manager sends a longer row only to frames that list it.
+CLIENT_FEATURES = ("grow_row",)
 _SPRITE_WEB_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-")
 
 
@@ -1721,6 +1727,7 @@ class BrowserController:
         *,
         shuffle: bool = False,
         sync: Optional[Dict[str, Any]] = None,
+        playlist_name: str = "",
     ) -> bool:
         if not items:
             return False
@@ -1733,7 +1740,9 @@ class BrowserController:
             random.shuffle(play_items)
         if not self._set_items_state(
             mode="playlist",
-            playlist_name="Mixed Playlist",
+            # The manager's playlist name: the page swaps a longer synced
+            # row in place only under the same name (isSameSyncPlaylist).
+            playlist_name=playlist_name or "Mixed Playlist",
             items=play_items,
             interval=interval,
             repeat=True,
@@ -2893,6 +2902,7 @@ class PiFrameClient:
             "os": self.system_info.get("os", "Unknown"),
             "mac_address": self.system_info.get("mac_address", "Unknown"),
             "ip_address": self.system_info.get("ip_address", "Unknown"),
+            "features": list(CLIENT_FEATURES),
         }
         try:
             metrics = _collect_system_metrics()
@@ -3450,7 +3460,7 @@ class PiFrameClient:
         ):
             return
         if images and self.renderer.play_slideshow(
-            images, interval, shuffle=shuffle_flag, sync=sync
+            images, interval, shuffle=shuffle_flag, sync=sync, playlist_name=playlist_name
         ):
             self.current_slideshow = list(self.renderer.slideshow_images) or images
             self.current_video = ""
@@ -3462,12 +3472,14 @@ class PiFrameClient:
             # (the renderer state now carries the slideshow clock sync, not
             # the clock_video one).
             self.current_video_sync = None
-            # A clock-sync lap re-send is the SAME synced playlist with a
-            # freshly shuffled row - the slideshow is continuous, not
-            # restarted. Preserve the start time, the reported index, and
-            # the paused flag so the manager doesn't blink to "restarted"
-            # every lap; the browser recomputes the on-screen slide from
-            # the wall clock and re-reports the index itself.
+            # A clock-sync re-send is the SAME synced playlist with a fresh
+            # row (a lap's reshuffle, or pictures removed or added: its
+            # length is deliberately not compared) - the slideshow is
+            # continuous, not restarted. Preserve the start time, the
+            # reported index, and the paused flag so the manager doesn't
+            # blink to "restarted" every lap; the browser recomputes the
+            # on-screen slide from the wall clock and re-reports the index
+            # itself (and keeps a pause; see isSameSyncPlaylist).
             is_sync_resend = (
                 bool(sync)
                 and bool(prev_sync)
@@ -4327,6 +4339,8 @@ class PiFrameClient:
                 # yet (older kiosk template, or no slideshow active).
                 "slideshow_index": BROWSER_EVENT_STATE.slideshow_index(),
                 "client_version": self.client_version,
+                # What this client can do (see CLIENT_FEATURES).
+                "features": list(CLIENT_FEATURES),
                 "last_update": self.last_update,
                 # Bundle-curated visualizer preset names so the
                 # orchestrator can populate a per-playlist picker.

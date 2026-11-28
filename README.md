@@ -130,9 +130,21 @@ wall-clock lockstep instead of free-running:
 - when a picture leaves the playlist (deleted or archived) the server
   sends the same list without it: a shorter row, built so each screen's
   current slot holds the picture it is showing. The client swaps that in
-  place too (`isPrunedSyncRow`: every item was in the previous row), so
-  the picture on screen stays and the next flip is on time. Any other row
-  of a new length is other content and starts the sync afresh
+  place too, so the picture on screen stays and the next flip is on time
+- when pictures join the playlist while it plays, the server sends a
+  longer row, again with each screen's current slot holding the picture
+  it is showing (only to frames whose status lists `"grow_row"` in
+  `features`). The client swaps that in place as well
+- the rule (`isSameSyncPlaylist`): a re-sent row at the same interval is
+  the same playlist when it has the same length, is pruned (shorter, every
+  item was in the previous row), or carries the same non-empty
+  `playlist_name` as the row before and still holds the picture on screen
+  (pictures added, or added and removed in one burst). A swapped-in row
+  repaints only if the picture at the current slot changed, and a paused
+  frame stays paused (resume snaps to the clock slot in the new row). Any
+  other row of a new length is other content: it starts the sync afresh
+  and ends a pause. The page's `playlist_name` is the manager's
+  (`Mixed Playlist` when the command names none)
 - `shuffle` is always `false` in sync mode - the row order is
   authoritative and is never reordered client-side
 - `next`/`previous` show the adjacent item as a momentary "peek"; the next
@@ -863,6 +875,9 @@ Update script log (every run, even silent failures):
 Heartbeat fields the server cares about:
 
 - `client_version` - short SHA, computed once at boot
+- `features` - what this client can do (`CLIENT_FEATURES`), also sent
+  in `register`: `grow_row` (a longer synced row for the same playlist
+  swaps in place; see the clock-synced slideshow above)
 - `last_update` - whatever the marker contained, echoed every tick
   until the server's TTL clears the result UI-side
 

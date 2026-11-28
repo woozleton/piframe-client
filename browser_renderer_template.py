@@ -2246,24 +2246,37 @@ def render_browser_html(
       scheduleSyncFlip();
     }}
 
-    function isPrunedSyncRow(prevState, state) {{
-      // The same synced playlist minus the pictures that left it: a
-      // shorter row whose every item the previous row had. Any other row
-      // of a new length is other content and takes startFromState(),
-      // which also ends a pause (as the client does for new content).
-      if (state.items.length >= prevState.items.length) return false;
-      const had = new Set(prevState.items.map((i) => i && i.src));
-      return state.items.every((i) => i && had.has(i.src));
+    function isSameSyncPlaylist(prevState, state) {{
+      // A re-sent row of a new length that is still the same synced
+      // playlist:
+      // - a pruned row: shorter, every item one the previous row had
+      //   (pictures left the playlist), or
+      // - a row under the same non-empty playlist_name that still holds
+      //   the picture on screen (pictures were added, or added and
+      //   removed in one burst; the manager pins the on-screen picture
+      //   at the current clock slot).
+      // Any other row of a new length is other content and takes
+      // startFromState(), which also ends a pause (as the client does
+      // for new content).
+      if (state.items.length < prevState.items.length) {{
+        const had = new Set(prevState.items.map((i) => i && i.src));
+        if (state.items.every((i) => i && had.has(i.src))) return true;
+      }}
+      const name = state.playlist_name;
+      if (typeof name !== "string" || !name || name !== prevState.playlist_name) return false;
+      if (!lastPaintedSrc) return false;
+      return state.items.some((i) => i && i.src === lastPaintedSrc);
     }}
 
     function softSwapSyncRow(state) {{
-      // Lap rollover or a pruned list: the server re-sent the synced
-      // playlist at the same interval with a fresh row, of the same
-      // length or (a picture left the playlist) a shorter one. Swap the row
-      // in place and recompute the clock slot against the NEW row (its
-      // own length) - no restart at 0, no white flash. paintSyncSlot
-      // repaints only if the current slot's image actually changed, using
-      // the normal cross-fade.
+      // Lap rollover or the same playlist changed: the server re-sent the
+      // synced playlist at the same interval with a fresh row, of the
+      // same length, a shorter one (pictures left the playlist) or a
+      // longer one (pictures were added). Swap the row in place and
+      // recompute the clock slot against the NEW row (its own length) -
+      // no restart at 0, no white flash. paintSyncSlot repaints only if
+      // the current slot's image actually changed, using the normal
+      // cross-fade.
       activeState = state;
       showBanner(
         state.banner ? state.banner.message : "",
@@ -2271,9 +2284,10 @@ def render_browser_html(
       );
       if (syncPaused) {{
         // Frozen: keep the new row for when we resume but don't repaint
-        // or re-arm. Resume snaps to the clock slot in this new row. A
-        // shorter row must not leave the held index past its end (a
-        // manual next/prev while paused steps from it).
+        // or re-arm. Resume snaps to the clock slot in this new row. The
+        // held index must stay inside the new row (a manual next/prev
+        // while paused steps from it): a shorter row must not leave it
+        // past its end.
         if (activeIndex >= state.items.length) {{
           activeIndex = activeIndex % state.items.length;
         }}
@@ -3212,17 +3226,19 @@ def render_browser_html(
           const prevState = activeState;
           currentSignature = signature;
           currentControlToken = state.control ? state.control.token : -1;
-          // A clock-sync re-send (a lap's freshly shuffled row, or the
-          // same list minus pictures that left the playlist) at the same
-          // interval: swap the row in place instead of restarting at
-          // index 0, so the clock index carries over and the picture on
-          // screen changes only if the new row's current slot differs
-          // (then with a normal soft cross-fade).
+          // A clock-sync re-send of the same playlist at the same interval
+          // (a lap's freshly shuffled row, the list minus pictures that
+          // left it, or the list with pictures added; see
+          // isSameSyncPlaylist): swap the row in place instead of
+          // restarting at index 0, so the clock index carries over, a
+          // pause holds, and the picture on screen changes only if the
+          // new row's current slot differs (then with a normal soft
+          // cross-fade).
           if (
             syncConfigValid(state) &&
             syncConfigValid(prevState) &&
             Number(prevState.interval) === Number(state.interval) &&
-            (prevState.sync.length === state.sync.length || isPrunedSyncRow(prevState, state))
+            (prevState.sync.length === state.sync.length || isSameSyncPlaylist(prevState, state))
           ) {{
             softSwapSyncRow(state);
           }} else if (
